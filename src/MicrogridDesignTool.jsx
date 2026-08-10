@@ -91,6 +91,74 @@ export const CONSTANTS = {
   SHAPE_GAMMA_MAX: 25,                  // -       upper bound of the shape exponent search
   SHAPE_GAMMA_TOL_MWH: 0.05,            // MWh     bisection tolerance on annual energy
 
+  /* --- PV plant (Phase 2) ------------------------------------------------ */
+  PV_DCAC_RATIO_DEFAULT: 1.25,          // -       DC kWp per AC kW of inverter
+  PV_SOILING_PCT: 2,                    // %       annual average soiling loss
+  PV_BIFACIAL_GAIN_PCT: 0,              // %       rear-side gain, 0 for monofacial
+  PV_DEGRADATION_PCT_PER_YR: 0.5,       // %/yr    linear power degradation
+  PV_AVAILABILITY_PCT: 99,              // %       plant availability
+  PV_OTHER_LOSSES_PCT: 6,               // %       wiring, mismatch, inverter, transformer
+
+  /* --- Wind plant (Phase 2) ---------------------------------------------
+     Hourly wind speed is synthesised from the site Weibull distribution with
+     an AR(1) memory so that calm and windy spells persist realistically. The
+     sequence is seeded, so the same site always produces the same year.      */
+  WIND_SHEAR_EXPONENT: 0.14,            // -       power-law shear, open terrain
+  WIND_REFERENCE_HEIGHT_M: 100,         // m       height of the library mean speed
+  WIND_AR1_RHO: 0.88,                   // -       hour-to-hour autocorrelation
+  WIND_SEASONAL_AMPLITUDE: 0.15,        // ±       fraction, peak in mid-January
+  WIND_SEASON_PEAK_DOY: 15,             // d       day of year of the windiest period
+  WIND_RANDOM_SEED: 20260810,           // -       fixes the synthetic year
+  WIND_CUT_IN_M_S: 3,                   // m/s
+  WIND_RATED_M_S: 12,                   // m/s
+  WIND_CUT_OUT_M_S: 25,                 // m/s
+  WIND_AVAILABILITY_PCT: 96,            // %
+  WIND_WAKE_AND_ARRAY_LOSS_PCT: 5,      // %       wake, electrical, blade soiling
+  AIR_DENSITY_REF_KG_M3: 1.225,         // kg/m³   ISO standard air
+  AIR_GAS_CONSTANT_J_KG_K: 287.05,      // J/(kg·K)
+  AIR_PRESSURE_PA: 101325,              // Pa      sea-level, altitude ignored
+
+  /* --- BESS (Phase 2) ---------------------------------------------------- */
+  BESS_RTE_PCT: 88,                     // %       round-trip AC–AC including PCS
+  BESS_SOC_MIN_PCT: 5,                  // %       bottom of the usable window
+  BESS_SOC_MAX_PCT: 95,                 // %       top of the usable window
+  BESS_RESERVE_SOC_PCT: 30,             // %       held for resilience — hard constraint
+  BESS_AUX_PCT_OF_RATING: 1.0,          // %       HVAC and controls, of rated power
+  BESS_C_RATE: 0.5,                     // 1/h     max power ÷ energy
+  BESS_CALENDAR_FADE_PCT_PER_YR: 1.5,   // %/yr    capacity loss, calendar
+  BESS_CYCLE_FADE_PCT_PER_EFC: 0.0035,  // %/EFC   capacity loss per equivalent full cycle
+  BESS_GRID_FORMING_STEP_PCT: 50,       // %       of rating, instantaneous load step capability
+
+  /* --- Reciprocating engines (Phase 2) -----------------------------------
+     Specific fuel consumption is quoted at 25/50/75/100 % load and
+     interpolated linearly between those points. Part-load efficiency
+     collapse is the whole reason minimum stable load matters.               */
+  ENGINE_MIN_STABLE_LOAD_PCT: 35,       // %       of unit rating
+  ENGINE_STEP_ACCEPTANCE_PCT: 25,       // %       of unit rating, single load step
+  ENGINE_START_TIME_MIN_DIESEL: 0.5,    // min     standby diesel, off to on load
+  ENGINE_START_TIME_MIN_GAS: 5,         // min     gas reciprocating engine
+  ENGINE_MIN_UP_TIME_H: 1,              // h
+  ENGINE_MIN_DOWN_TIME_H: 1,            // h
+  ENGINE_DERATE_PCT_PER_C_ABOVE_25: 0.5,// %/°C    site derating above 25 °C
+  DIESEL_SFC_L_PER_KWH: [0.36, 0.29, 0.27, 0.28],  // l/kWh at 25/50/75/100 % load
+  GAS_ENGINE_EFF_PCT: [32, 38, 41, 42], // %       electrical efficiency at 25/50/75/100 %
+  ENGINE_LOAD_POINTS_PCT: [25, 50, 75, 100], // %  load points for both curves above
+
+  /* --- Gas turbine (Phase 2) --------------------------------------------- */
+  TURBINE_MIN_LOAD_PCT: 50,             // %       of site rating
+  TURBINE_EFF_PCT: [24, 30, 34, 36],    // %       electrical efficiency at 25/50/75/100 %
+  TURBINE_START_TIME_MIN: 10,           // min
+  TURBINE_DERATE_PCT_PER_C_ABOVE_15: 0.7, // %/°C  ambient derating, above ISO 15 °C
+  TURBINE_MIN_UP_TIME_H: 4,             // h
+  TURBINE_MIN_DOWN_TIME_H: 2,           // h
+
+  /* --- Tariff (Phase 2) --------------------------------------------------- */
+  TOU_PEAK_START_HOUR: 8,               // h       local, weekdays only
+  TOU_PEAK_END_HOUR: 20,                // h
+  TOU_PEAK_MULTIPLIER: 1.5,             // ×       of the base import tariff
+  TOU_OFFPEAK_MULTIPLIER: 0.6,          // ×       of the base import tariff
+  ARBITRAGE_CHARGE_THRESHOLD: 0.8,      // ×       charge from grid below this × mean price
+
   /* --- Cost defaults library (EUR, EU markets) — surfaced in Phase 4 -----
      Held here so that every coefficient in the tool sits in one place.     */
   COST_DEFAULTS: {
@@ -594,6 +662,430 @@ function dayLabel(dayIndex) {
 }
 
 /* ============================================================================
+   PHASE 2 ENGINE — generation profiles and the dispatch
+   ========================================================================== */
+
+/* --- Deterministic pseudo-random sequence (so a site always gives the same year) */
+function lcg(seed) {
+  let s = seed >>> 0;
+  return () => { s = (1664525 * s + 1013904223) >>> 0; return s / 4294967296; };
+}
+/** Abramowitz & Stegun 26.2.17 normal CDF. */
+function normCdf(x) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989422804014327 * Math.exp(-x * x / 2);
+  const p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  return x >= 0 ? 1 - p : p;
+}
+/** Lanczos gamma, needed for the Weibull scale parameter. */
+function gammaFn(z) {
+  const g = [676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059,
+    12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+  if (z < 0.5) return Math.PI / (Math.sin(Math.PI * z) * gammaFn(1 - z));
+  z -= 1;
+  let x = 0.99999999999980993;
+  for (let i = 0; i < g.length; i++) x += g[i] / (z + i + 1);
+  const t = z + g.length - 0.5;
+  return Math.sqrt(2 * Math.PI) * Math.pow(t, z + 0.5) * Math.exp(-t) * x;
+}
+
+/**
+ * Hourly wind speed at hub height (m/s).
+ * Weibull marginal distribution with an AR(1) memory, plus a seasonal factor.
+ * Deterministic: the same site and hub height always return the same year.
+ */
+function buildWindSpeed(loc, cal, hubHeightM) {
+  const shear = Math.pow(hubHeightM / CONSTANTS.WIND_REFERENCE_HEIGHT_M, CONSTANTS.WIND_SHEAR_EXPONENT);
+  const meanHub = loc.windMean_m_s_100m * shear;
+  const k = loc.weibullK;
+  const c = meanHub / gammaFn(1 + 1 / k);          // Weibull scale, m/s
+  const rnd = lcg(CONSTANTS.WIND_RANDOM_SEED + Math.round(loc.lat * 100));
+  const rho = CONSTANTS.WIND_AR1_RHO, sd = Math.sqrt(1 - rho * rho);
+  const v = new Float32Array(H);
+  let x = 0;
+  for (let i = 0; i < H; i++) {
+    // Box–Muller
+    const u1 = Math.max(1e-9, rnd()), u2 = rnd();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    x = rho * x + sd * z;
+    const u = Math.min(0.9999, Math.max(0.0001, normCdf(x)));
+    const season = 1 + CONSTANTS.WIND_SEASONAL_AMPLITUDE *
+      Math.cos(2 * Math.PI * (cal.doy[i] - CONSTANTS.WIND_SEASON_PEAK_DOY) / 365);
+    v[i] = c * Math.pow(-Math.log(1 - u), 1 / k) * season;
+  }
+  return v;
+}
+
+/**
+ * Wind farm output (kW) from the hourly speed.
+ * Cubic between cut-in and rated, flat to cut-out, zero outside.
+ * Air density is corrected for ambient temperature — a hot site produces less.
+ */
+function buildWindGen(speed, temp, w) {
+  const out = new Float32Array(H);
+  const vin = w.cutInMs, vr = w.ratedMs, vout = w.cutOutMs;
+  const lossFactor = (w.availabilityPct / 100) * (1 - CONSTANTS.WIND_WAKE_AND_ARRAY_LOSS_PCT / 100);
+  for (let i = 0; i < H; i++) {
+    const v = speed[i];
+    let f = 0;
+    if (v >= vin && v < vr) f = (v * v * v - vin * vin * vin) / (vr * vr * vr - vin * vin * vin);
+    else if (v >= vr && v <= vout) f = 1;
+    const rho = CONSTANTS.AIR_PRESSURE_PA / (CONSTANTS.AIR_GAS_CONSTANT_J_KG_K * (temp[i] + 273.15));
+    const densityFactor = v < vr ? rho / CONSTANTS.AIR_DENSITY_REF_KG_M3 : 1; // above rated the turbine pitches back
+    out[i] = w.ratedKW * f * densityFactor * lossFactor;
+  }
+  return out;
+}
+
+/** PV plant output (kW) — specific yield profile × kWp, with losses, degradation and inverter clipping. */
+function buildPVGen(pvUnit, pv, year) {
+  const out = new Float32Array(H);
+  const acLimitKW = pv.kWp / pv.dcacRatio;
+  const derate = (1 - pv.soilingPct / 100) * (1 + pv.bifacialGainPct / 100)
+    * (pv.availabilityPct / 100) * (1 - pv.otherLossesPct / 100)
+    * (1 - pv.degradationPctPerYr / 100 * (year - 1));
+  let clippedH = 0;
+  for (let i = 0; i < H; i++) {
+    const dc = pvUnit[i] * pv.kWp * derate;
+    if (dc > acLimitKW) { out[i] = acLimitKW; clippedH++; } else out[i] = dc;
+  }
+  return { gen: out, clippedHours: clippedH, acLimitKW };
+}
+
+/** Hourly import price (€/MWh) from the selected tariff structure. */
+function buildTariff(loc, cal, tariff) {
+  const p = new Float32Array(H);
+  const base = loc.importTariff_EUR_per_MWh + loc.gridFee_EUR_per_MWh;
+  for (let i = 0; i < H; i++) {
+    if (tariff.structure === "flat") p[i] = base;
+    else {
+      const weekday = cal.dow[i] !== 0 && cal.dow[i] !== 6;
+      const peak = weekday && cal.hourOfDay[i] >= tariff.peakStartHour && cal.hourOfDay[i] < tariff.peakEndHour;
+      p[i] = base * (peak ? tariff.peakMultiplier : tariff.offPeakMultiplier);
+    }
+  }
+  return p;
+}
+
+/** Interpolate a part-load curve given at 25/50/75/100 % of rating. */
+function partLoadValue(curve, loadPct) {
+  const pts = CONSTANTS.ENGINE_LOAD_POINTS_PCT;
+  if (loadPct <= pts[0]) return curve[0];
+  if (loadPct >= pts[pts.length - 1]) return curve[curve.length - 1];
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (loadPct >= pts[i] && loadPct <= pts[i + 1]) {
+      const f = (loadPct - pts[i]) / (pts[i + 1] - pts[i]);
+      return curve[i] + f * (curve[i + 1] - curve[i]);
+    }
+  }
+  return curve[curve.length - 1];
+}
+
+export const REASON_CODES = [
+  "RENEWABLE",       //  0  load fully covered by renewables
+  "GRID",            //  1  grid import, nothing binding
+  "IMPORT_CAP",      //  2  import limited by the connection cap
+  "CURTAIL_SCHED",   //  3  non-firm connection curtailed this hour
+  "BESS_DISCHARGE",  //  4  battery discharging, nothing binding
+  "SOC_RESERVE",     //  5  battery held at the resilience reserve — energy exists but is ring-fenced
+  "BESS_EMPTY",      //  5b battery at its floor, no energy left — a different problem from the reserve
+  "PEAK_SHAVE",      //  5c battery discharging to hold import below the demand-charge target
+  "BESS_POWER",      //  6  battery limited by rated power or C-rate
+  "ENGINE_ON",       //  7  engines running, loaded normally
+  "ENGINE_MIN_LOAD", //  8  engine held at minimum stable load, surplus dumped
+  "ENGINE_START",    //  9  engine committed but still starting
+  "ENGINE_HOURS",    // 10  annual running-hour budget exhausted
+  "MIN_UP_DOWN",     // 11  minimum up or down time blocked the change
+  "TURBINE_ON",      // 12  gas turbine carrying the residual
+  "CHARGE",          // 13  charging the battery
+  "EXPORT",          // 14  exporting surplus
+  "CURTAIL",         // 15  renewable surplus curtailed
+  "SHED_T2",         // 16  tier 2 load shed
+  "SHED_T1",         // 17  tier 1 load shed
+  "UNSERVED",        // 18  critical load not served
+];
+const RC = Object.fromEntries(REASON_CODES.map((c, i) => [c, i]));
+
+/* Severity ranking. The hour's reason code is the HIGHEST-severity constraint
+   that bound that hour, so a battery discharging because the import cap is
+   full still reports IMPORT_CAP — the cap is why the battery ran. */
+const SEVERITY = {
+  // Normal operation
+  RENEWABLE: 0, GRID: 1, EXPORT: 2, CHARGE: 2, BESS_DISCHARGE: 2,
+  ENGINE_ON: 3, TURBINE_ON: 3, PEAK_SHAVE: 3, CURTAIL: 4,
+  // Asset state — an asset ran out of room or energy
+  BESS_POWER: 5, BESS_EMPTY: 5, SOC_RESERVE: 5, MIN_UP_DOWN: 6, ENGINE_START: 6,
+  // Structural limits — these are WHY the other assets had to run, so they outrank
+  // asset state. A battery sitting at its floor behind a full import cap is a
+  // consequence of the cap, and the cap is the finding worth reporting.
+  IMPORT_CAP: 7, CURTAIL_SCHED: 7,
+  // Waste and permit limits
+  ENGINE_HOURS: 8, ENGINE_MIN_LOAD: 8,
+  // Failure to serve
+  SHED_T2: 9, SHED_T1: 10, UNSERVED: 11,
+};
+const SEV = REASON_CODES.map((c) => SEVERITY[c]);
+
+/**
+ * DISPATCH — hourly, deterministic, priority merit order. Not an optimiser.
+ *
+ * Every hour, in this fixed order:
+ *   1  serve load from renewables
+ *   2  import from the grid up to the cap, subject to the curtailment schedule
+ *   3  discharge the battery, never below the reserve SOC when islanding is required
+ *   4  commit engines, then the turbine, respecting minimum stable load,
+ *      minimum up/down time, start time and the annual running-hour budget
+ *   5  charge the battery from surplus renewables, then from cheap grid hours
+ *   6  curtail or export what is left
+ *   7  record unserved energy and shed load by tier
+ *
+ * One reason code per hour records the constraint that actually bound the
+ * outcome, chosen by severity. Every array below is retained for the audit table.
+ */
+function dispatch(cfg) {
+  const { load, pvGen, windGen, price, temp, cal, hoursOfYear = H } = cfg;
+  const g = cfg.grid, b = cfg.bess, e = cfg.engine, t = cfg.turbine;
+
+  const out = {
+    pv: new Float32Array(H), wind: new Float32Array(H), imp: new Float32Array(H),
+    exp: new Float32Array(H), bess: new Float32Array(H), soc: new Float32Array(H),
+    engine: new Float32Array(H), turbine: new Float32Array(H), curtail: new Float32Array(H),
+    unserved: new Float32Array(H), shed1: new Float32Array(H), shed2: new Float32Array(H),
+    enginesOn: new Uint8Array(H), reason: new Uint8Array(H), fuelL: new Float32Array(H),
+    fuelTh: new Float32Array(H),
+  };
+
+  // Battery state
+  const usableKWh = b.enabled ? b.energyKWh * (b.socMaxPct - b.socMinPct) / 100 : 0;
+  const reserveFloorPct = b.reserveApplies ? Math.max(b.socMinPct, b.reserveSocPct) : b.socMinPct;
+  let soc = b.enabled ? b.startSocPct : 0;                       // % of nameplate
+  const powerLimitKW = b.enabled ? Math.min(b.powerKW, b.energyKWh * b.cRate) : 0;
+  const effOneWay = Math.sqrt(b.rteFraction);
+  let throughputKWh = 0;
+
+  // Engine fleet state
+  let unitsOn = 0, lastChangeH = -999, engineRunHours = 0, startingUntil = -1;
+  const unitMinKW = e.unitKW * e.minStableLoadPct / 100;
+  // Turbine state
+  let turbOn = false, turbLastChangeH = -999, turbRunHours = 0;
+
+  const meanPrice = price.reduce((a, v) => a + v, 0) / H;
+  let curtailRenewTotal = 0, renewServedTotal = 0;
+
+  for (let i = 0; i < hoursOfYear; i++) {
+    let reason = RC.RENEWABLE;
+    const mark = (code) => { if (SEV[code] >= SEV[reason]) reason = code; };
+    const loadKW = load[i];
+
+    /* --- 1. Renewables ---------------------------------------------------- */
+    const pvAvail = pvGen ? pvGen[i] : 0;
+    const windAvail = windGen ? windGen[i] : 0;
+    const renewAvail = pvAvail + windAvail;
+    let residual = loadKW;
+    const renewToLoad = Math.min(renewAvail, residual);
+    residual -= renewToLoad;
+    renewServedTotal += renewToLoad;
+    let surplus = renewAvail - renewToLoad;
+    out.pv[i] = pvAvail; out.wind[i] = windAvail;
+
+    // Battery auxiliary load is part of the site load, not free
+    const auxKW = b.enabled ? b.powerKW * CONSTANTS.BESS_AUX_PCT_OF_RATING / 100 : 0;
+    if (auxKW > 0) { const fromSurplus = Math.min(surplus, auxKW); surplus -= fromSurplus; residual += auxKW - fromSurplus; }
+
+    /* --- 2. Grid import --------------------------------------------------- */
+    let capKW = 0, curtailedHour = false;
+    if (g.enabled) {
+      capKW = g.importCapKW;
+      if (g.nonFirm && g.curtailFlags[i]) { capKW = g.reducedCapKW; curtailedHour = true; }
+    }
+    // Peak shaving holds import below a demand-charge target. The full cap stays
+    // available as a backstop in step 3b, after the battery has done what it can.
+    const shaveCap = (g.enabled && g.shaveEnabled && g.shaveTargetKW > 0) ? Math.min(capKW, g.shaveTargetKW) : capKW;
+    const imp = Math.min(residual, shaveCap);
+    if (imp > 0) { out.imp[i] = imp; residual -= imp; mark(RC.GRID); }
+    if (g.enabled && residual > 0.001 && shaveCap < capKW) mark(RC.PEAK_SHAVE);
+    else if (g.enabled && residual > 0.001 && capKW > 0) mark(curtailedHour ? RC.CURTAIL_SCHED : RC.IMPORT_CAP);
+    else if (g.enabled && residual > 0.001 && capKW === 0 && curtailedHour) mark(RC.CURTAIL_SCHED);
+
+    /* --- 3. Battery discharge --------------------------------------------- */
+    if (b.enabled && residual > 0.001) {
+      const availKWh = Math.max(0, (soc - reserveFloorPct) / 100 * b.energyKWh) * effOneWay;
+      const dis = Math.min(residual, powerLimitKW, availKWh);
+      if (dis > 0.001) {
+        out.bess[i] = dis; residual -= dis;
+        soc -= (dis / effOneWay) / b.energyKWh * 100;
+        throughputKWh += dis;
+        mark(RC.BESS_DISCHARGE);
+      }
+      if (residual > 0.001) {
+        if (soc <= reserveFloorPct + 0.01) {
+          // Ring-fenced by the resilience reserve, or genuinely flat — not the same finding
+          mark(reserveFloorPct > b.socMinPct + 0.01 ? RC.SOC_RESERVE : RC.BESS_EMPTY);
+        } else if (dis >= powerLimitKW - 0.001 && powerLimitKW > 0) mark(RC.BESS_POWER);
+      }
+    }
+
+    /* --- 3b. Backstop import ------------------------------------------------
+       If shaving was active and the battery could not hold the peak, import the
+       remainder up to the real connection cap before starting any engine. */
+    if (g.enabled && residual > 0.001 && capKW > out.imp[i]) {
+      const extraImp = Math.min(residual, capKW - out.imp[i]);
+      if (extraImp > 0.001) { out.imp[i] += extraImp; residual -= extraImp; }
+      if (residual > 0.001) mark(curtailedHour ? RC.CURTAIL_SCHED : RC.IMPORT_CAP);
+    }
+
+    /* --- 4. Engines -------------------------------------------------------- */
+    let engineExcess = 0;
+    if (e.enabled && e.units > 0) {
+      // Ambient derating — never use the ISO rating for on-site plant
+      const derate = 1 - Math.max(0, temp[i] - 25) * CONSTANTS.ENGINE_DERATE_PCT_PER_C_ABOVE_25 / 100;
+      const unitKW = e.unitKW * derate;
+      const unitMin = unitKW * e.minStableLoadPct / 100;
+
+      // Off-grid systems need a spinning source unless the battery is grid-forming
+      const needSpinning = !g.enabled && !(b.enabled && b.gridForming && soc > reserveFloorPct + 1) && loadKW > 0;
+      let desired = residual > 0.001 ? Math.ceil(residual / unitKW) : 0;
+      if (needSpinning && desired === 0) desired = 1;
+      desired = Math.min(desired, e.units);
+
+      const budgetLeft = engineRunHours < e.annualHourLimit;
+      if (!budgetLeft && desired > unitsOn) { desired = unitsOn; if (residual > 0.001) mark(RC.ENGINE_HOURS); }
+
+      if (desired > unitsOn) {
+        if (i - lastChangeH >= e.minDownTimeH) {
+          unitsOn = desired; lastChangeH = i;
+          if (e.startTimeMin > 60) { startingUntil = i + Math.ceil(e.startTimeMin / 60); mark(RC.ENGINE_START); }
+        } else if (residual > 0.001) mark(RC.MIN_UP_DOWN);
+      } else if (desired < unitsOn) {
+        if (i - lastChangeH >= e.minUpTimeH) { unitsOn = desired; lastChangeH = i; }
+      }
+
+      const online = i < startingUntil ? 0 : unitsOn;
+      if (online > 0) {
+        const fleetMax = online * unitKW, fleetMin = online * unitMin;
+        let outKW = Math.min(Math.max(residual, fleetMin), fleetMax);
+        if (outKW > residual + 0.001) { engineExcess = outKW - residual; mark(RC.ENGINE_MIN_LOAD); }
+        else if (reason !== RC.ENGINE_START && reason !== RC.ENGINE_HOURS && reason !== RC.MIN_UP_DOWN) mark(RC.ENGINE_ON);
+        out.engine[i] = outKW;
+        out.enginesOn[i] = online;
+        residual = Math.max(0, residual - outKW);
+        engineRunHours++;
+
+        // Fuel — specific consumption at the actual part load, not the rated point
+        const loadPct = 100 * (outKW / online) / unitKW;
+        if (e.fuelType === "diesel") out.fuelL[i] = outKW * partLoadValue(e.sfcDiesel, loadPct);
+        else { const eff = partLoadValue(e.effGas, loadPct) / 100; out.fuelTh[i] = eff > 0 ? outKW / eff : 0; }
+      }
+    }
+
+    /* --- 4b. Gas turbine ---------------------------------------------------- */
+    if (t.enabled && residual > 0.001) {
+      const derate = 1 - Math.max(0, temp[i] - 15) * CONSTANTS.TURBINE_DERATE_PCT_PER_C_ABOVE_15 / 100;
+      const ratedKW = t.ratedKW * derate, minKW = ratedKW * t.minLoadPct / 100;
+      const want = residual > 0.001;
+      if (want && !turbOn && i - turbLastChangeH >= t.minDownTimeH) { turbOn = true; turbLastChangeH = i; }
+      else if (!want && turbOn && i - turbLastChangeH >= t.minUpTimeH) { turbOn = false; turbLastChangeH = i; }
+      if (turbOn) {
+        const outKW = Math.min(Math.max(residual, minKW), ratedKW);
+        if (outKW > residual + 0.001) { engineExcess += outKW - residual; mark(RC.ENGINE_MIN_LOAD); }
+        else mark(RC.TURBINE_ON);
+        out.turbine[i] = outKW;
+        residual = Math.max(0, residual - outKW);
+        turbRunHours++;
+        const eff = partLoadValue(t.effCurve, 100 * outKW / ratedKW) / 100;
+        out.fuelTh[i] += eff > 0 ? outKW / eff : 0;
+      }
+    }
+
+    /* --- 5. Charge the battery --------------------------------------------- */
+    if (b.enabled) {
+      const roomKWh = Math.max(0, (b.socMaxPct - soc) / 100 * b.energyKWh);
+      let chargeKW = 0;
+      // (a) surplus renewables, then any excess forced out by engine minimum load
+      const fromSite = Math.min(surplus + engineExcess, powerLimitKW, roomKWh / effOneWay);
+      if (fromSite > 0.001) {
+        chargeKW = fromSite;
+        const fromSurplus = Math.min(surplus, fromSite);
+        surplus -= fromSurplus;
+        engineExcess = Math.max(0, engineExcess - (fromSite - fromSurplus));
+      }
+      // (b) cheap grid hours, if arbitrage is enabled and the cap allows it
+      if (b.arbitrage && g.enabled && chargeKW < powerLimitKW && price[i] < meanPrice * CONSTANTS.ARBITRAGE_CHARGE_THRESHOLD) {
+        const headroom = Math.max(0, capKW - out.imp[i]);
+        const extra = Math.min(powerLimitKW - chargeKW, headroom, Math.max(0, roomKWh / effOneWay - chargeKW));
+        if (extra > 0.001) { chargeKW += extra; out.imp[i] += extra; if (reason === RC.RENEWABLE || reason === RC.GRID) mark(RC.CHARGE); }
+      }
+      if (chargeKW > 0.001) {
+        out.bess[i] = -chargeKW;
+        soc += (chargeKW * effOneWay) / b.energyKWh * 100;
+        throughputKWh += chargeKW * effOneWay;
+        if (reason === RC.RENEWABLE) mark(RC.CHARGE);
+      }
+      out.soc[i] = soc;
+    }
+
+    /* --- 6. Export or curtail ---------------------------------------------- */
+    if (surplus > 0.001) {
+      const exp = g.enabled ? Math.min(surplus, g.exportCapKW) : 0;
+      if (exp > 0.001) { out.exp[i] = exp; surplus -= exp; if (reason === RC.RENEWABLE) mark(RC.EXPORT); }
+      if (surplus > 0.001) { out.curtail[i] = surplus; curtailRenewTotal += surplus; mark(RC.CURTAIL); }
+    }
+    if (engineExcess > 0.001) { out.curtail[i] += engineExcess; mark(RC.ENGINE_MIN_LOAD); }
+
+    /* --- 7. Shedding and unserved energy ------------------------------------ */
+    if (residual > 0.001) {
+      const t2 = Math.min(residual, loadKW * cfg.shed2Pct / 100);
+      out.shed2[i] = t2; residual -= t2; if (t2 > 0.001) mark(RC.SHED_T2);
+      const t1 = Math.min(residual, loadKW * cfg.shed1Pct / 100);
+      out.shed1[i] = t1; residual -= t1; if (t1 > 0.001) mark(RC.SHED_T1);
+      if (residual > 0.001) { out.unserved[i] = residual; mark(RC.UNSERVED); }
+    }
+
+    out.reason[i] = reason;
+  }
+
+  /* --- Summary -------------------------------------------------------------- */
+  const sum = (a) => { let s = 0; for (let i = 0; i < H; i++) s += a[i]; return s; };
+  const loadTotal = sum(load);
+  // Renewable energy that reached the load, directly or through the battery.
+  const renewToLoadTotal = sum(out.pv) + sum(out.wind) - curtailRenewTotal - sum(out.exp);
+  const engineHours = out.enginesOn.reduce((a, v) => a + (v > 0 ? 1 : 0), 0);
+  const engineUnitHours = out.enginesOn.reduce((a, v) => a + v, 0);
+  const reasonCount = new Array(REASON_CODES.length).fill(0);
+  for (let i = 0; i < H; i++) reasonCount[out.reason[i]]++;
+
+  return {
+    ...out,
+    summary: {
+      loadMWh: loadTotal / 1000,
+      pvMWh: sum(out.pv) / 1000,
+      windMWh: sum(out.wind) / 1000,
+      importMWh: sum(out.imp) / 1000,
+      exportMWh: sum(out.exp) / 1000,
+      engineMWh: sum(out.engine) / 1000,
+      turbineMWh: sum(out.turbine) / 1000,
+      curtailMWh: sum(out.curtail) / 1000,
+      unservedMWh: sum(out.unserved) / 1000,
+      shed1MWh: sum(out.shed1) / 1000,
+      shed2MWh: sum(out.shed2) / 1000,
+      fuelLitres: sum(out.fuelL),
+      fuelMWhTh: sum(out.fuelTh) / 1000,
+      engineHours, engineUnitHours,
+      renewableFraction: loadTotal > 0 ? Math.max(0, renewToLoadTotal) / loadTotal : 0,
+      curtailmentRate: (sum(out.pv) + sum(out.wind)) > 0 ? curtailRenewTotal / (sum(out.pv) + sum(out.wind)) : 0,
+      curtailRenewMWh: curtailRenewTotal / 1000,
+      curtailEngineMWh: (sum(out.curtail) - curtailRenewTotal) / 1000,
+      renewDirectMWh: renewServedTotal / 1000,
+      equivalentFullCycles: b.enabled && b.energyKWh > 0 ? throughputKWh / 2 / b.energyKWh : 0,
+      minSoc: b.enabled ? Math.min(...Array.from(out.soc)) : 0,
+      peakImportKW: Math.max(...Array.from(out.imp)),
+      hoursAboveShaveTarget: g.shaveEnabled && g.shaveTargetKW > 0 ? out.imp.reduce((a, v) => a + (v > g.shaveTargetKW + 0.001 ? 1 : 0), 0) : 0,
+      reasonCount,
+    },
+  };
+}
+
+/* ============================================================================
    THEME
    Two palettes. Tailwind's dark: variant needs a build-config change, so the
    palette is resolved in JS instead and passed down through context. Every
@@ -629,7 +1121,7 @@ export const THEMES = {
     critRule: "border-cyan-600",
     critLabel: "text-slate-100",
     advLabel: "text-slate-500",
-    chart: { grid: "#1e293b", axis: "#475569", tipBg: "#020617", tipBorder: "#1e293b", load: "#22d3ee", loadFill: "#0e7490", temp: "#f59e0b", pv: "#a78bfa", bar1: "#0e7490", bar2: "#f59e0b", ref: "#64748b", refWarn: "#f43f5e" },
+    chart: { grid: "#1e293b", axis: "#475569", tipBg: "#020617", tipBorder: "#1e293b", load: "#22d3ee", loadFill: "#0e7490", temp: "#f59e0b", pv: "#a78bfa", bar1: "#0e7490", bar2: "#f59e0b", ref: "#64748b", refWarn: "#f43f5e", wind: "#38bdf8", imp: "#06b6d4", bessC: "#a78bfa", engineC: "#fb923c", turbineC: "#f472b6", socC: "#94a3b8", unservedC: "#f43f5e" },
   },
   light: {
     key: "light",
@@ -659,7 +1151,7 @@ export const THEMES = {
     critRule: "border-cyan-600",
     critLabel: "text-slate-900",
     advLabel: "text-slate-500",
-    chart: { grid: "#e2e8f0", axis: "#64748b", tipBg: "#ffffff", tipBorder: "#cbd5e1", load: "#0891b2", loadFill: "#a5f3fc", temp: "#d97706", pv: "#7c3aed", bar1: "#0891b2", bar2: "#f59e0b", ref: "#94a3b8", refWarn: "#e11d48" },
+    chart: { grid: "#e2e8f0", axis: "#64748b", tipBg: "#ffffff", tipBorder: "#cbd5e1", load: "#0891b2", loadFill: "#a5f3fc", temp: "#d97706", pv: "#7c3aed", bar1: "#0891b2", bar2: "#f59e0b", ref: "#94a3b8", refWarn: "#e11d48", wind: "#0284c7", imp: "#0e7490", bessC: "#7c3aed", engineC: "#ea580c", turbineC: "#db2777", socC: "#64748b", unservedC: "#e11d48" },
   },
 };
 
@@ -807,7 +1299,7 @@ function Seg({ value, onChange, options }) {
 
 const PHASES = [
   { n: 1, label: "Context · resource · load", done: true },
-  { n: 2, label: "Resources · dispatch engine", done: false },
+  { n: 2, label: "Resources · dispatch engine", done: true },
   { n: 3, label: "Adequacy · BOM", done: false },
   { n: 4, label: "Costs · LCOE", done: false },
   { n: 5, label: "Auto-size · AIDC ramp", done: false },
@@ -831,7 +1323,7 @@ export default function MicrogridDesignTool() {
   const [mode, setMode] = useState("aidc"); // "standard" | "aidc"
 
   const [ctx, setCtx] = useState({
-    useCase: "deferral", gridStatus: "firm", importCapKW: 8000, exportCapKW: 0,
+    useCase: "deferral", gridStatus: "phased", importCapKW: 8000, exportCapKW: 0,
     flexPctHours: 20, flexReducedCapKW: 4000,
     phases: [{ year: 1, capKW: 8000 }, { year: 3, capKW: 20000 }],
     islanding: "planned", autonomyH: 4, locationId: "FR_PARIS", lifeYears: 20, discountPct: 7,
@@ -875,6 +1367,26 @@ export default function MicrogridDesignTool() {
   });
 
   const [view, setView] = useState({ span: "week", startDay: 172 });
+  const [reasonFilter, setReasonFilter] = useState(-1);
+
+  const [res, setRes] = useState({
+    pv: { enabled: true, kWp: 10000, dcacRatio: CONSTANTS.PV_DCAC_RATIO_DEFAULT, soilingPct: CONSTANTS.PV_SOILING_PCT,
+      bifacialGainPct: CONSTANTS.PV_BIFACIAL_GAIN_PCT, availabilityPct: CONSTANTS.PV_AVAILABILITY_PCT,
+      otherLossesPct: CONSTANTS.PV_OTHER_LOSSES_PCT, degradationPctPerYr: CONSTANTS.PV_DEGRADATION_PCT_PER_YR },
+    wind: { enabled: false, ratedKW: 3000, hubHeightM: 100, cutInMs: CONSTANTS.WIND_CUT_IN_M_S, ratedMs: CONSTANTS.WIND_RATED_M_S,
+      cutOutMs: CONSTANTS.WIND_CUT_OUT_M_S, availabilityPct: CONSTANTS.WIND_AVAILABILITY_PCT },
+    bess: { enabled: true, powerKW: 8000, energyKWh: 16000, cRate: CONSTANTS.BESS_C_RATE, rtePct: CONSTANTS.BESS_RTE_PCT,
+      socMinPct: CONSTANTS.BESS_SOC_MIN_PCT, socMaxPct: CONSTANTS.BESS_SOC_MAX_PCT, reserveSocPct: CONSTANTS.BESS_RESERVE_SOC_PCT,
+      startSocPct: 60, gridForming: true, gridFormingStepPct: CONSTANTS.BESS_GRID_FORMING_STEP_PCT, arbitrage: true },
+    engine: { enabled: true, units: 6, unitKW: 2500, fuelType: "gas", minStableLoadPct: CONSTANTS.ENGINE_MIN_STABLE_LOAD_PCT,
+      stepAcceptancePct: CONSTANTS.ENGINE_STEP_ACCEPTANCE_PCT, startTimeMin: CONSTANTS.ENGINE_START_TIME_MIN_GAS,
+      minUpTimeH: CONSTANTS.ENGINE_MIN_UP_TIME_H, minDownTimeH: CONSTANTS.ENGINE_MIN_DOWN_TIME_H, annualHourLimit: 500 },
+    turbine: { enabled: false, ratedKW: 10000, minLoadPct: CONSTANTS.TURBINE_MIN_LOAD_PCT,
+      minUpTimeH: CONSTANTS.TURBINE_MIN_UP_TIME_H, minDownTimeH: CONSTANTS.TURBINE_MIN_DOWN_TIME_H },
+    tariff: { structure: "tou", peakStartHour: CONSTANTS.TOU_PEAK_START_HOUR, peakEndHour: CONSTANTS.TOU_PEAK_END_HOUR,
+      peakMultiplier: CONSTANTS.TOU_PEAK_MULTIPLIER, offPeakMultiplier: CONSTANTS.TOU_OFFPEAK_MULTIPLIER },
+    shave: { enabled: false, targetKW: 0 },
+  });
 
   /* --- Derived ------------------------------------------------------------ */
   const loc = useMemo(() => ({ ...LOCATION_LIBRARY[ctx.locationId], ...locOverride }), [ctx.locationId, locOverride]);
@@ -979,6 +1491,95 @@ export default function MicrogridDesignTool() {
     }
     return out;
   }, [view, load, temp, pvUnit, cal]);
+
+  /* --- Phase 2: generation profiles ------------------------------------- */
+  const simYear = mode === "aidc" ? aidc.analysisYear : 1;
+  const pvOut = useMemo(() => (res.pv.enabled ? buildPVGen(pvUnit, res.pv, simYear)
+    : { gen: new Float32Array(H), clippedHours: 0, acLimitKW: 0 }), [pvUnit, res.pv, simYear]);
+  const windSpeed = useMemo(() => (res.wind.enabled ? buildWindSpeed(loc, cal, res.wind.hubHeightM) : null), [loc, cal, res.wind.enabled, res.wind.hubHeightM]);
+  const windGen = useMemo(() => (windSpeed ? buildWindGen(windSpeed, temp, res.wind) : new Float32Array(H)), [windSpeed, temp, res.wind]);
+  const windMeanHub = useMemo(() => { if (!windSpeed) return 0; let s2 = 0; for (let i = 0; i < H; i++) s2 += windSpeed[i]; return s2 / H; }, [windSpeed]);
+  const windCF = useMemo(() => { if (!res.wind.enabled || !res.wind.ratedKW) return 0; let s2 = 0; for (let i = 0; i < H; i++) s2 += windGen[i]; return s2 / (res.wind.ratedKW * H); }, [windGen, res.wind]);
+  const price = useMemo(() => buildTariff(loc, cal, res.tariff), [loc, cal, res.tariff]);
+
+  // Non-firm connections: the worst-case reading is that curtailment lands on the
+  // highest-load hours of the year, so those are the hours flagged.
+  const curtailFlags = useMemo(() => {
+    const f = new Uint8Array(H);
+    if (ctx.gridStatus !== "flexible" || !ctx.flexPctHours) return f;
+    const idx = Array.from(load.keys()).sort((a, b) => load[b] - load[a]);
+    const n = Math.round(H * ctx.flexPctHours / 100);
+    for (let i = 0; i < n; i++) f[idx[i]] = 1;
+    return f;
+  }, [ctx.gridStatus, ctx.flexPctHours, load]);
+
+  const reserveApplies = ctx.islanding !== "none" && ctx.gridStatus !== "none";
+
+  // A phased connection steps up over time. The cap in force is the last step
+  // whose year has been reached — using the base cap in every year would
+  // misreport exactly the ramp the AIDC case is about.
+  const effectiveImportCapKW = useMemo(() => {
+    if (ctx.gridStatus !== "phased" || !ctx.phases.length) return ctx.importCapKW;
+    const sorted = [...ctx.phases].sort((a, b) => a.year - b.year);
+    let cap = sorted[0].capKW;
+    for (const p of sorted) if (simYear >= p.year) cap = p.capKW;
+    return cap;
+  }, [ctx.gridStatus, ctx.phases, ctx.importCapKW, simYear]);
+
+  const dispPack = useMemo(() => {
+    const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const r = dispatch({
+      load, pvGen: pvOut.gen, windGen, price, temp, cal,
+      shed1Pct: char.shed1Pct, shed2Pct: char.shed2Pct,
+      grid: {
+        enabled: ctx.gridStatus !== "none" && !(mode === "aidc" && aidc.gridStrategy === "offgrid"),
+        importCapKW: effectiveImportCapKW, exportCapKW: ctx.exportCapKW,
+        nonFirm: ctx.gridStatus === "flexible", reducedCapKW: ctx.flexReducedCapKW, curtailFlags,
+        shaveEnabled: res.shave.enabled, shaveTargetKW: res.shave.targetKW,
+      },
+      bess: { ...res.bess, rteFraction: res.bess.rtePct / 100, reserveApplies },
+      engine: { ...res.engine, sfcDiesel: CONSTANTS.DIESEL_SFC_L_PER_KWH, effGas: CONSTANTS.GAS_ENGINE_EFF_PCT },
+      turbine: { ...res.turbine, effCurve: CONSTANTS.TURBINE_EFF_PCT },
+    });
+    const ms = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+    return { r, ms };
+  }, [load, pvOut, windGen, price, temp, cal, char.shed1Pct, char.shed2Pct, ctx, mode, aidc.gridStrategy, curtailFlags, res, reserveApplies, effectiveImportCapKW]);
+  const disp = dispPack.r, dispatchMs = dispPack.ms;
+
+  const dispSeries = useMemo(() => {
+    const days = view.span === "day" ? 1 : view.span === "week" ? 7 : 30;
+    const start = view.startDay * 24, out = [];
+    for (let k = 0; k < days * 24; k++) {
+      const i = (start + k) % H;
+      out.push({
+        t: `${dayLabel(cal.doy[i])} ${String(cal.hourOfDay[i]).padStart(2, "0")}h`,
+        load: +load[i].toFixed(0), pv: +(disp.pv[i] - Math.min(disp.pv[i], disp.curtail[i])).toFixed(0),
+        wind: +disp.wind[i].toFixed(0), imp: +disp.imp[i].toFixed(0),
+        bessDis: +Math.max(0, disp.bess[i]).toFixed(0), engine: +disp.engine[i].toFixed(0),
+        turbine: +disp.turbine[i].toFixed(0), unserved: +disp.unserved[i].toFixed(0),
+        soc: +disp.soc[i].toFixed(1),
+      });
+    }
+    return out;
+  }, [view, disp, load, cal]);
+
+  const tableRows = useMemo(() => {
+    const rows = [];
+    const push = (i) => rows.push({
+      i, date: `${dayLabel(cal.doy[i])} ${String(cal.hourOfDay[i]).padStart(2, "0")}h`,
+      load: load[i], pv: disp.pv[i], wind: disp.wind[i], imp: disp.imp[i], bess: disp.bess[i],
+      soc: disp.soc[i], engine: disp.engine[i], on: disp.enginesOn[i], turbine: disp.turbine[i],
+      curtail: disp.curtail[i], shed: disp.shed1[i] + disp.shed2[i], unserved: disp.unserved[i],
+      reason: REASON_CODES[disp.reason[i]],
+    });
+    if (reasonFilter >= 0) { for (let i = 0; i < H && rows.length < 1000; i++) if (disp.reason[i] === reasonFilter) push(i); }
+    else {
+      const days = view.span === "day" ? 1 : view.span === "week" ? 7 : 30;
+      const start = view.startDay * 24;
+      for (let k = 0; k < days * 24; k++) push((start + k) % H);
+    }
+    return rows;
+  }, [disp, load, cal, view, reasonFilter]);
 
   const monthlyChart = useMemo(() => stats.monthlyMWh.map((v, i) => ({
     m: MONTHS[i], load: +v.toFixed(0),
@@ -1121,8 +1722,13 @@ export default function MicrogridDesignTool() {
                     { value: "phased", label: "Phased connection (stepped caps)" },
                   ]} />
               </Field>
-              {ctx.gridStatus !== "none" && (
+              {ctx.gridStatus !== "none" && ctx.gridStatus !== "phased" && (
                 <Field tier="critical" label="Import cap" unit="kW"><Num value={ctx.importCapKW} step={100} onChange={(v) => setCtx((s) => ({ ...s, importCapKW: v }))} /></Field>
+              )}
+              {ctx.gridStatus === "phased" && (
+                <Field tier="critical" label={`Import cap in force, year ${simYear}`} unit="kW" hint="steps are set in the advanced group below">
+                  <Txt value={fmt(effectiveImportCapKW, 0)} readOnly />
+                </Field>
               )}
               <Field tier="critical" label="Islanding requirement" unit="—">
                 <Sel value={ctx.islanding} onChange={(v) => setCtx((s) => ({ ...s, islanding: v }))}
@@ -1514,7 +2120,7 @@ export default function MicrogridDesignTool() {
                       <Tooltip contentStyle={tip} />
                       <ReferenceLine y={stats.meanKW} stroke={T.chart.ref} strokeDasharray="3 3" label={{ value: "mean", fill: T.chart.ref, fontSize: 10 }} />
                       {ctx.gridStatus !== "none" && (
-                        <ReferenceLine y={ctx.importCapKW} stroke={T.chart.refWarn} strokeDasharray="4 2" label={{ value: "import cap", fill: T.chart.refWarn, fontSize: 10 }} />
+                        <ReferenceLine y={effectiveImportCapKW} stroke={T.chart.refWarn} strokeDasharray="4 2" label={{ value: "import cap", fill: T.chart.refWarn, fontSize: 10 }} />
                       )}
                       <Line type="monotone" dataKey="kW" stroke={T.chart.load} dot={false} strokeWidth={1.5} />
                     </LineChart>
@@ -1550,8 +2156,311 @@ export default function MicrogridDesignTool() {
             </div>
           </Panel>
 
+          {/* ================= PHASE 2 — RESOURCES ================= */}
+          <Panel title="Resources" step="3" sub="what the dispatch has available"
+            right={<span className={`font-mono text-xs ${T.faint}`}>
+              {[res.pv.enabled && "PV", res.wind.enabled && "wind", res.bess.enabled && "BESS",
+                res.engine.enabled && "engines", res.turbine.enabled && "turbine",
+                ctx.gridStatus !== "none" && "grid"].filter(Boolean).join(" · ")}
+            </span>}>
+
+            {/* PV */}
+            <div className={`rounded border p-2 ${T.tile}`}>
+              <div className="mb-2 flex items-center justify-between">
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Photovoltaic</span>
+                <Seg value={res.pv.enabled ? "on" : "off"} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, enabled: v === "on" } }))}
+                  options={[{ value: "on", label: "In" }, { value: "off", label: "Out" }]} />
+              </div>
+              {res.pv.enabled && (<>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field tier="critical" label="Installed DC capacity" unit="kWp"
+                    flag={mode === "aidc" && aidcOut && res.pv.kWp > aidcOut.maxKWp ? `exceeds the ${fmt(aidcOut.maxKWp / 1000, 2)} MWp land cap` : null}>
+                    <Num value={res.pv.kWp} step={100} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, kWp: v } }))} />
+                  </Field>
+                  <Field tier="critical" label="DC/AC ratio" unit="kWp/kW" hint={`inverter AC limit ${fmt(pvOut.acLimitKW / 1000, 2)} MW`}>
+                    <Num value={res.pv.dcacRatio} step={0.05} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, dcacRatio: v } }))} />
+                  </Field>
+                  <Field label="Annual degradation" unit="%/yr"><Num value={res.pv.degradationPctPerYr} step={0.1} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, degradationPctPerYr: v } }))} /></Field>
+                  <Field label="Clipped hours" unit="h/yr"><Txt value={fmt(pvOut.clippedHours, 0)} readOnly /></Field>
+                </div>
+                <Advanced key={`pv-${density}`} title="Advanced — soiling, bifacial gain, availability, other losses" count={4} defaultOpen={showAll}>
+                  <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                    <Field label="Soiling loss" unit="%"><Num value={res.pv.soilingPct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, soilingPct: v } }))} /></Field>
+                    <Field label="Bifacial gain" unit="%"><Num value={res.pv.bifacialGainPct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, bifacialGainPct: v } }))} /></Field>
+                    <Field label="Availability" unit="%"><Num value={res.pv.availabilityPct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, availabilityPct: v } }))} /></Field>
+                    <Field label="Other losses (wiring, mismatch, inverter)" unit="%"><Num value={res.pv.otherLossesPct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, otherLossesPct: v } }))} /></Field>
+                  </div>
+                </Advanced>
+              </>)}
+            </div>
+
+            {/* Wind */}
+            <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+              <div className="mb-2 flex items-center justify-between">
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Wind</span>
+                <Seg value={res.wind.enabled ? "on" : "off"} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, enabled: v === "on" } }))}
+                  options={[{ value: "on", label: "In" }, { value: "off", label: "Out" }]} />
+              </div>
+              {res.wind.enabled && (<>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field tier="critical" label="Rated capacity" unit="kW"><Num value={res.wind.ratedKW} step={100} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, ratedKW: v } }))} /></Field>
+                  <Field tier="critical" label="Hub height" unit="m" hint={`site mean ${fmt(loc.windMean_m_s_100m, 1)} m/s at 100 m`}>
+                    <Num value={res.wind.hubHeightM} step={5} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, hubHeightM: v } }))} />
+                  </Field>
+                  <Field label="Capacity factor achieved" unit="%"><Txt value={fmt(windCF * 100, 1)} readOnly /></Field>
+                  <Field label="Mean speed at hub" unit="m/s"><Txt value={fmt(windMeanHub, 2)} readOnly /></Field>
+                </div>
+                <Advanced key={`wind-${density}`} title="Advanced — power curve and availability" count={4} defaultOpen={showAll}>
+                  <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                    <Field label="Cut-in speed" unit="m/s"><Num value={res.wind.cutInMs} step={0.5} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, cutInMs: v } }))} /></Field>
+                    <Field label="Rated speed" unit="m/s"><Num value={res.wind.ratedMs} step={0.5} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, ratedMs: v } }))} /></Field>
+                    <Field label="Cut-out speed" unit="m/s"><Num value={res.wind.cutOutMs} step={1} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, cutOutMs: v } }))} /></Field>
+                    <Field label="Availability" unit="%"><Num value={res.wind.availabilityPct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, availabilityPct: v } }))} /></Field>
+                  </div>
+                </Advanced>
+              </>)}
+            </div>
+
+            {/* BESS */}
+            <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+              <div className="mb-2 flex items-center justify-between">
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Battery storage</span>
+                <Seg value={res.bess.enabled ? "on" : "off"} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, enabled: v === "on" } }))}
+                  options={[{ value: "on", label: "In" }, { value: "off", label: "Out" }]} />
+              </div>
+              {res.bess.enabled && (<>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field tier="critical" label="Rated power" unit="kW"><Num value={res.bess.powerKW} step={100} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, powerKW: v } }))} /></Field>
+                  <Field tier="critical" label="Energy capacity" unit="kWh" hint={`${fmt(res.bess.energyKWh / Math.max(1, res.bess.powerKW), 2)} h at rated power`}>
+                    <Num value={res.bess.energyKWh} step={100} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, energyKWh: v } }))} />
+                  </Field>
+                  <Field tier="critical" label="Reserve SOC held for resilience" unit="%"
+                    hint={reserveApplies ? "hard constraint — dispatch may not go below" : "islanding not required, so not enforced"}>
+                    <Num value={res.bess.reserveSocPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, reserveSocPct: v } }))} />
+                  </Field>
+                  <Field tier="critical" label="Grid-forming" unit="—" hint="carries the island and the load step">
+                    <Sel value={res.bess.gridForming ? "yes" : "no"} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, gridForming: v === "yes" } }))}
+                      options={[{ value: "yes", label: "Grid-forming" }, { value: "no", label: "Grid-following" }]} />
+                  </Field>
+                </div>
+                <Advanced key={`bess-${density}`} title="Advanced — efficiency, SOC window, C-rate, arbitrage" count={6} defaultOpen={showAll}>
+                  <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                    <Field label="Round-trip efficiency (AC–AC)" unit="%"><Num value={res.bess.rtePct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, rtePct: v } }))} /></Field>
+                    <Field label="C-rate limit" unit="1/h"><Num value={res.bess.cRate} step={0.05} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, cRate: v } }))} /></Field>
+                    <Field label="SOC window, minimum" unit="%"><Num value={res.bess.socMinPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, socMinPct: v } }))} /></Field>
+                    <Field label="SOC window, maximum" unit="%"><Num value={res.bess.socMaxPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, socMaxPct: v } }))} /></Field>
+                    <Field label="Starting SOC" unit="%"><Num value={res.bess.startSocPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, startSocPct: v } }))} /></Field>
+                    <Field label="Grid-forming step capability" unit="% of rating"><Num value={res.bess.gridFormingStepPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, gridFormingStepPct: v } }))} /></Field>
+                    <Field label="Charge from cheap grid hours" unit="—">
+                      <Sel value={res.bess.arbitrage ? "yes" : "no"} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, arbitrage: v === "yes" } }))}
+                        options={[{ value: "no", label: "No" }, { value: "yes", label: "Yes" }]} />
+                    </Field>
+                  </div>
+                </Advanced>
+              </>)}
+            </div>
+
+            {/* Engines */}
+            <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+              <div className="mb-2 flex items-center justify-between">
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Reciprocating engines</span>
+                <Seg value={res.engine.enabled ? "on" : "off"} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, enabled: v === "on" } }))}
+                  options={[{ value: "on", label: "In" }, { value: "off", label: "Out" }]} />
+              </div>
+              {res.engine.enabled && (<>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field tier="critical" label="Number of units" unit="—"><Num value={res.engine.units} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, units: v } }))} /></Field>
+                  <Field tier="critical" label="Unit rating" unit="kW" hint={`fleet ${fmt(res.engine.units * res.engine.unitKW / 1000, 1)} MW`}>
+                    <Num value={res.engine.unitKW} step={100} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, unitKW: v } }))} />
+                  </Field>
+                  <Field tier="critical" label="Minimum stable load" unit="% of unit"
+                    hint={`one unit will not run below ${fmt(res.engine.unitKW * res.engine.minStableLoadPct / 100, 0)} kW`}>
+                    <Num value={res.engine.minStableLoadPct} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, minStableLoadPct: v } }))} />
+                  </Field>
+                  <Field tier="critical" label="Fuel" unit="—">
+                    <Sel value={res.engine.fuelType} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, fuelType: v, startTimeMin: v === "gas" ? CONSTANTS.ENGINE_START_TIME_MIN_GAS : CONSTANTS.ENGINE_START_TIME_MIN_DIESEL } }))}
+                      options={[{ value: "diesel", label: "Diesel" }, { value: "gas", label: "Natural gas" }]} />
+                  </Field>
+                </div>
+                <Advanced key={`eng-${density}`} title="Advanced — step acceptance, start time, minimum up/down, hour budget" count={5} defaultOpen={showAll}>
+                  <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                    <Field label="Single-step load acceptance" unit="% of unit"><Num value={res.engine.stepAcceptancePct} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, stepAcceptancePct: v } }))} /></Field>
+                    <Field label="Start time" unit="min"><Num value={res.engine.startTimeMin} step={0.5} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, startTimeMin: v } }))} /></Field>
+                    <Field label="Minimum up time" unit="h"><Num value={res.engine.minUpTimeH} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, minUpTimeH: v } }))} /></Field>
+                    <Field label="Minimum down time" unit="h"><Num value={res.engine.minDownTimeH} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, minDownTimeH: v } }))} /></Field>
+                    <Field label="Permitted running hours" unit="h/yr"><Num value={res.engine.annualHourLimit} step={50} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, annualHourLimit: v } }))} /></Field>
+                    <Field label={res.engine.fuelType === "diesel" ? "Specific consumption at 25/50/75/100 %" : "Electrical efficiency at 25/50/75/100 %"}
+                      unit={res.engine.fuelType === "diesel" ? "l/kWh" : "%"}>
+                      <Txt value={(res.engine.fuelType === "diesel" ? CONSTANTS.DIESEL_SFC_L_PER_KWH : CONSTANTS.GAS_ENGINE_EFF_PCT).join(" / ")} readOnly />
+                    </Field>
+                  </div>
+                </Advanced>
+              </>)}
+            </div>
+
+            {/* Turbine */}
+            <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+              <div className="mb-2 flex items-center justify-between">
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Gas turbine</span>
+                <Seg value={res.turbine.enabled ? "on" : "off"} onChange={(v) => setRes((s) => ({ ...s, turbine: { ...s.turbine, enabled: v === "on" } }))}
+                  options={[{ value: "on", label: "In" }, { value: "off", label: "Out" }]} />
+              </div>
+              {res.turbine.enabled && (
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field tier="critical" label="Site rating (not ISO)" unit="kW"><Num value={res.turbine.ratedKW} step={100} onChange={(v) => setRes((s) => ({ ...s, turbine: { ...s.turbine, ratedKW: v } }))} /></Field>
+                  <Field tier="critical" label="Minimum load" unit="% of rating"><Num value={res.turbine.minLoadPct} onChange={(v) => setRes((s) => ({ ...s, turbine: { ...s.turbine, minLoadPct: v } }))} /></Field>
+                  <Field label="Minimum up time" unit="h"><Num value={res.turbine.minUpTimeH} onChange={(v) => setRes((s) => ({ ...s, turbine: { ...s.turbine, minUpTimeH: v } }))} /></Field>
+                  <Field label="Ambient derating" unit="%/°C above 15" ><Txt value={fmt(CONSTANTS.TURBINE_DERATE_PCT_PER_C_ABOVE_15, 2)} readOnly /></Field>
+                </div>
+              )}
+            </div>
+
+            {/* Grid and tariff */}
+            <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+              <div className="mb-2 flex items-center justify-between">
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Grid and tariff</span>
+                <span className={`font-mono text-xs ${T.ghost}`}>{ctx.gridStatus === "none" ? "no connection" : `cap ${fmt(ctx.importCapKW / 1000, 1)} MW`}</span>
+              </div>
+              {ctx.gridStatus !== "none" && (
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field tier="critical" label="Tariff structure" unit="—">
+                    <Sel value={res.tariff.structure} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, structure: v } }))}
+                      options={[{ value: "flat", label: "Flat" }, { value: "tou", label: "Time of use" }]} />
+                  </Field>
+                  <Field tier="critical" label="Peak-shaving target" unit="kW" hint="0 = no shaving; drives the demand charge">
+                    <Num value={res.shave.enabled ? res.shave.targetKW : 0} step={50}
+                      onChange={(v) => setRes((s) => ({ ...s, shave: { enabled: v > 0, targetKW: v } }))} />
+                  </Field>
+                  <Field label="Peak multiplier" unit="× base"><Num value={res.tariff.peakMultiplier} step={0.05} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, peakMultiplier: v } }))} /></Field>
+                  <Field label="Off-peak multiplier" unit="× base"><Num value={res.tariff.offPeakMultiplier} step={0.05} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, offPeakMultiplier: v } }))} /></Field>
+                </div>
+              )}
+            </div>
+          </Panel>
+
+          {/* ================= DISPATCH ================= */}
+          <Panel title="Dispatch" step="4" sub="deterministic priority merit order — every hour is readable"
+            right={
+              <div className="flex flex-wrap items-center gap-2">
+                <Seg value={view.span} onChange={(v) => setView((s) => ({ ...s, span: v }))}
+                  options={[{ value: "day", label: "Day" }, { value: "week", label: "Week" }, { value: "month", label: "Month" }]} />
+                <input type="range" min={0} max={364} value={view.startDay} className="w-40"
+                  onChange={(e) => setView((s) => ({ ...s, startDay: Number(e.target.value) }))} />
+                <span className={`font-mono text-xs ${T.faint}`}>from {dayLabel(view.startDay)}</span>
+              </div>
+            }>
+            <div className={`mb-2 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
+              Order every hour: renewables → grid import to the cap → battery above the reserve → engines at or above minimum
+              stable load → turbine → charge from surplus, then from cheap grid hours → export or curtail → shed by tier, then unserved.
+              The reason code names the highest-severity constraint that bound the hour.
+            </div>
+
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={dispSeries} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
+                  <CartesianGrid stroke={T.chart.grid} vertical={false} />
+                  <XAxis dataKey="t" tick={axis} minTickGap={40} />
+                  <YAxis yAxisId="l" tick={axis} label={{ value: "kW", angle: -90, position: "insideLeft", fill: T.chart.axis, fontSize: 10 }} />
+                  <YAxis yAxisId="r" orientation="right" tick={axis} domain={[0, 100]} label={{ value: "SOC %", angle: 90, position: "insideRight", fill: T.chart.axis, fontSize: 10 }} />
+                  <Tooltip contentStyle={tip} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Area yAxisId="l" type="step" stackId="s" dataKey="pv" name="PV" stroke={T.chart.temp} fill={T.chart.temp} fillOpacity={0.55} />
+                  <Area yAxisId="l" type="step" stackId="s" dataKey="wind" name="Wind" stroke={T.chart.wind} fill={T.chart.wind} fillOpacity={0.55} />
+                  <Area yAxisId="l" type="step" stackId="s" dataKey="imp" name="Grid import" stroke={T.chart.imp} fill={T.chart.imp} fillOpacity={0.45} />
+                  <Area yAxisId="l" type="step" stackId="s" dataKey="bessDis" name="BESS discharge" stroke={T.chart.bessC} fill={T.chart.bessC} fillOpacity={0.55} />
+                  <Area yAxisId="l" type="step" stackId="s" dataKey="engine" name="Engines" stroke={T.chart.engineC} fill={T.chart.engineC} fillOpacity={0.55} />
+                  <Area yAxisId="l" type="step" stackId="s" dataKey="turbine" name="Turbine" stroke={T.chart.turbineC} fill={T.chart.turbineC} fillOpacity={0.55} />
+                  <Area yAxisId="l" type="step" stackId="s" dataKey="unserved" name="Unserved" stroke={T.chart.unservedC} fill={T.chart.unservedC} fillOpacity={0.8} />
+                  <Line yAxisId="l" type="step" dataKey="load" name="Load" stroke={T.chart.load} dot={false} strokeWidth={1.5} />
+                  <Line yAxisId="r" type="monotone" dataKey="soc" name="SOC (%)" stroke={T.chart.socC} dot={false} strokeWidth={1} strokeDasharray="3 2" />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-6">
+              <Stat label="Renewable fraction" value={fmt(disp.summary.renewableFraction * 100, 1)} unit="%" tone="emerald" />
+              <Stat label="Grid import" value={fmt(disp.summary.importMWh, 0)} unit="MWh/yr" tone="cyan" />
+              <Stat label="Engine energy" value={fmt(disp.summary.engineMWh + disp.summary.turbineMWh, 0)} unit="MWh/yr" tone="amber" />
+              <Stat label="Engine running hours" value={fmt(disp.summary.engineHours, 0)} unit="h/yr" tone={disp.summary.engineHours > res.engine.annualHourLimit ? "rose" : "amber"} />
+              <Stat label="Fuel" value={res.engine.fuelType === "diesel" ? fmt(disp.summary.fuelLitres / 1000, 0) : fmt(disp.summary.fuelMWhTh, 0)}
+                unit={res.engine.fuelType === "diesel" ? "kl/yr" : "MWh th/yr"} />
+              <Stat label="Unserved energy" value={fmt(disp.summary.unservedMWh, 2)} unit="MWh/yr" tone={disp.summary.unservedMWh > 0 ? "rose" : "emerald"} />
+              <Stat label="Renewable curtailed" value={fmt(disp.summary.curtailRenewMWh, 0)} unit="MWh/yr" tone="rose" />
+              <Stat label="Curtailment rate" value={fmt(disp.summary.curtailmentRate * 100, 1)} unit="% of gen" />
+              <Stat label="Engine surplus dumped" value={fmt(disp.summary.curtailEngineMWh, 0)} unit="MWh/yr" tone="rose" />
+              <Stat label="Battery cycles" value={fmt(disp.summary.equivalentFullCycles, 0)} unit="EFC/yr" tone="violet" />
+              <Stat label="Minimum SOC reached" value={fmt(disp.summary.minSoc, 0)} unit="%" tone="violet" />
+              <Stat label="Peak import" value={fmt(disp.summary.peakImportKW / 1000, 2)} unit="MW" tone="cyan" />
+            </div>
+
+            {/* Reason code distribution */}
+            <div className="mt-3">
+              <div className={`mb-1 text-xs ${T.faint}`}>Binding constraint by hour count — click a code to filter the table</div>
+              <div className="flex flex-wrap gap-1">
+                {disp.summary.reasonCount.map((c, i) => c > 0 && (
+                  <button key={i} onClick={() => setReasonFilter(reasonFilter === i ? -1 : i)}
+                    className={`rounded border px-2 py-0.5 font-mono text-xs ${reasonFilter === i ? T.btnOn : T.btn}`}>
+                    {REASON_CODES[i]} <span className={reasonFilter === i ? "" : T.ghost}>{c} h</span>
+                  </button>
+                ))}
+                {reasonFilter >= 0 && (
+                  <button onClick={() => setReasonFilter(-1)} className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chip}`}>clear filter</button>
+                )}
+              </div>
+            </div>
+
+            {/* Hourly audit table */}
+            <div className="mt-3">
+              <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2">
+                <span className={`text-xs ${T.faint}`}>
+                  Hourly table — {tableRows.length} row{tableRows.length === 1 ? "" : "s"}
+                  {reasonFilter >= 0 ? ` matching ${REASON_CODES[reasonFilter]} across the whole year` : ` in the selected window`}
+                </span>
+                <span className={`font-mono text-xs ${T.ghost}`}>kW unless stated</span>
+              </div>
+              <div className={`max-h-96 overflow-auto rounded border ${T.tile}`}>
+                <table className="w-full border-collapse text-right font-mono text-xs">
+                  <thead className={`sticky top-0 ${T.panel}`}>
+                    <tr className={`border-b ${T.rule}`}>
+                      {["h", "date", "load", "PV", "wind", "import", "BESS", "SOC %", "engine", "on", "turbine", "curtail", "shed", "unserved", "reason"].map((h) => (
+                        <th key={h} className={`px-1.5 py-1 ${T.faint} ${h === "date" || h === "reason" ? "text-left" : ""}`}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tableRows.map((r) => (
+                      <tr key={r.i} className={`border-b ${T.divide} ${r.unserved > 0 ? T.notice.fail : ""}`}>
+                        <td className={`px-1.5 py-0.5 ${T.ghost}`}>{r.i}</td>
+                        <td className={`px-1.5 py-0.5 text-left ${T.muted}`}>{r.date}</td>
+                        <td className="px-1.5 py-0.5">{fmt(r.load, 0)}</td>
+                        <td className={`px-1.5 py-0.5 ${T.tone.amber}`}>{fmt(r.pv, 0)}</td>
+                        <td className="px-1.5 py-0.5">{fmt(r.wind, 0)}</td>
+                        <td className={`px-1.5 py-0.5 ${T.tone.cyan}`}>{fmt(r.imp, 0)}</td>
+                        <td className={`px-1.5 py-0.5 ${T.tone.violet}`}>{fmt(r.bess, 0)}</td>
+                        <td className="px-1.5 py-0.5">{fmt(r.soc, 0)}</td>
+                        <td className="px-1.5 py-0.5">{fmt(r.engine, 0)}</td>
+                        <td className={`px-1.5 py-0.5 ${T.ghost}`}>{r.on}</td>
+                        <td className="px-1.5 py-0.5">{fmt(r.turbine, 0)}</td>
+                        <td className="px-1.5 py-0.5">{fmt(r.curtail, 0)}</td>
+                        <td className="px-1.5 py-0.5">{fmt(r.shed, 0)}</td>
+                        <td className={`px-1.5 py-0.5 ${r.unserved > 0 ? "" : T.ghost}`}>{fmt(r.unserved, 0)}</td>
+                        <td className={`px-1.5 py-0.5 text-left ${T.tone.cyan}`}>{r.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className={`mt-1 text-xs ${T.faint}`}>
+                Energy balance check: load {fmt(disp.summary.loadMWh, 0)} MWh = PV {fmt(disp.summary.pvMWh - disp.summary.curtailRenewMWh - disp.summary.exportMWh, 0)}
+                {" "}+ wind + import {fmt(disp.summary.importMWh, 0)} + engines {fmt(disp.summary.engineMWh + disp.summary.turbineMWh, 0)}
+                {" "}± storage, less {fmt(disp.summary.unservedMWh + disp.summary.shed1MWh + disp.summary.shed2MWh, 1)} MWh not served.
+                Dispatch runs in {fmt(dispatchMs, 0)} ms.
+              </p>
+            </div>
+          </Panel>
+
           <footer className={`border-t pt-2 text-xs ${T.rule} ${T.faint}`}>
-            Phase 1 of 6 complete. Next — Phase 2: PV, wind, BESS, engine and turbine inputs, generation profiles, the priority-based dispatch engine, and the hourly table with reason codes.
+            Phases 1 and 2 complete. Next — Phase 3: the three adequacy checks (energy, power, dynamic) reported separately, and the sizing bill of materials.
           </footer>
         </div>
       </div>
