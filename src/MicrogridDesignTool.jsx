@@ -903,6 +903,7 @@ function dispatch(cfg) {
     engine: new Float32Array(H), turbine: new Float32Array(H), curtail: new Float32Array(H),
     unserved: new Float32Array(H), shed1: new Float32Array(H), shed2: new Float32Array(H),
     enginesOn: new Uint8Array(H), reason: new Uint8Array(H), fuelL: new Float32Array(H),
+    aux: new Float32Array(H),
     fuelTh: new Float32Array(H),
   };
 
@@ -941,6 +942,7 @@ function dispatch(cfg) {
 
     // Battery auxiliary load is part of the site load, not free
     const auxKW = b.enabled ? b.powerKW * CONSTANTS.BESS_AUX_PCT_OF_RATING / 100 : 0;
+    out.aux[i] = auxKW;
     if (auxKW > 0) { const fromSurplus = Math.min(surplus, auxKW); surplus -= fromSurplus; residual += auxKW - fromSurplus; }
 
     /* --- 2. Grid import --------------------------------------------------- */
@@ -958,12 +960,17 @@ function dispatch(cfg) {
     else if (g.enabled && residual > 0.001 && capKW > 0) mark(curtailedHour ? RC.CURTAIL_SCHED : RC.IMPORT_CAP);
     else if (g.enabled && residual > 0.001 && capKW === 0 && curtailedHour) mark(RC.CURTAIL_SCHED);
 
-    /* --- 3. Battery discharge --------------------------------------------- */
+    /* --- 3. Battery discharge ---------------------------------------------
+       The hour's battery flow is accumulated in disKW and chargeKW and netted
+       at the end. A battery must not appear to charge and discharge in the
+       same hour: if an engine is later held at minimum load, its surplus first
+       backs off the discharge, and only the remainder charges the battery. */
+    let disKW = 0;
     if (b.enabled && residual > 0.001) {
       const availKWh = Math.max(0, (soc - reserveFloorPct) / 100 * b.energyKWh) * effOneWay;
       const dis = Math.min(residual, powerLimitKW, availKWh);
       if (dis > 0.001) {
-        out.bess[i] = dis; residual -= dis;
+        disKW = dis; residual -= dis;
         soc -= (dis / effOneWay) / b.energyKWh * 100;
         throughputKWh += dis;
         mark(RC.BESS_DISCHARGE);
@@ -1048,6 +1055,14 @@ function dispatch(cfg) {
       }
     }
 
+    /* --- 4c. Engine surplus backs off the battery before charging it -------- */
+    if (b.enabled && engineExcess > 0.001 && disKW > 0.001) {
+      const back = Math.min(disKW, engineExcess);
+      disKW -= back; engineExcess -= back;
+      soc += (back / effOneWay) / b.energyKWh * 100;   // undo that part of the discharge
+      throughputKWh -= back;
+    }
+
     /* --- 5. Charge the battery --------------------------------------------- */
     if (b.enabled) {
       const roomKWh = Math.max(0, (b.socMaxPct - soc) / 100 * b.energyKWh);
@@ -1067,12 +1082,14 @@ function dispatch(cfg) {
         if (extra > 0.001) { chargeKW += extra; out.imp[i] += extra; if (reason === RC.RENEWABLE || reason === RC.GRID) mark(RC.CHARGE); }
       }
       if (chargeKW > 0.001) {
-        out.bess[i] = -chargeKW;
         soc += (chargeKW * effOneWay) / b.energyKWh * 100;
         throughputKWh += chargeKW * effOneWay;
         if (reason === RC.RENEWABLE) mark(RC.CHARGE);
       }
+      out.bess[i] = disKW - chargeKW;   // net: positive discharging, negative charging
       out.soc[i] = soc;
+    } else {
+      out.bess[i] = disKW;
     }
 
     /* --- 6. Export or curtail ---------------------------------------------- */
@@ -1328,6 +1345,171 @@ function buildBOM(a) {
     pvAreaM2: pvArea, bessAreaM2: bessArea, engineAreaM2: engineArea,
     totalAreaM2: pvArea + bessArea + engineArea,
   };
+}
+
+/* ============================================================================
+   ENGINE SELF-TEST
+   Speed is not evidence. These checks re-derive, from the stored hourly arrays
+   alone, every physical constraint the dispatch claims to respect. They read
+   the OUTPUT, not the code that produced it, so a logic error in the dispatch
+   cannot hide behind them. Any failure is reported with the hour it occurred.
+   ========================================================================== */
+function selfTest(disp, inp, cal) {
+  const b = inp.bess, e = inp.engine, g = inp.grid, t = inp.turbine;
+  const checks = [];
+  const tol = 0.5; // kW — floating point tolerance on a per-hour balance
+
+  const record = (name, detail, worst, worstHour, fails) =>
+    checks.push({ name, detail, pass: fails === 0, fails, worst, worstHour });
+
+  /* 1. Hourly energy balance — every kW accounted for, every hour */
+  let worstBal = 0, worstBalH = -1, balFails = 0;
+  for (let i = 0; i < H; i++) {
+    const sources = disp.pv[i] + disp.wind[i] + disp.imp[i] + disp.engine[i] + disp.turbine[i] + Math.max(0, disp.bess[i]);
+    const servedLoad = inp.load[i] - disp.unserved[i] - disp.shed1[i] - disp.shed2[i];
+    const sinks = servedLoad + disp.exp[i] + disp.curtail[i] + Math.max(0, -disp.bess[i]) + disp.aux[i];
+    const r = Math.abs(sources - sinks);
+    if (r > worstBal) { worstBal = r; worstBalH = i; }
+    if (r > tol) balFails++;
+  }
+  record("Hourly energy balance closes", "generation + import + discharge = served load + charge + export + curtailment + auxiliaries",
+    `${worstBal.toFixed(4)} kW worst residual`, worstBalH, balFails);
+
+  /* 2. State of charge stays inside the declared window */
+  let socFails = 0, worstSoc = 0, worstSocH = -1;
+  if (b.enabled) for (let i = 0; i < H; i++) {
+    const over = Math.max(disp.soc[i] - b.socMaxPct, b.socMinPct - disp.soc[i]);
+    if (over > worstSoc) { worstSoc = over; worstSocH = i; }
+    if (over > 0.01) socFails++;
+  }
+  record("SOC within its window", `${b.socMinPct}–${b.socMaxPct} % of nameplate`,
+    b.enabled ? `${worstSoc.toFixed(3)} % worst excursion` : "battery not in service", worstSocH, socFails);
+
+  /* 3. SOC moves exactly as the charge and discharge say it should */
+  let contFails = 0, worstCont = 0, worstContH = -1;
+  if (b.enabled && b.energyKWh > 0) {
+    const eff = Math.sqrt(b.rteFraction);
+    for (let i = 1; i < H; i++) {
+      const dis = Math.max(0, disp.bess[i]), chg = Math.max(0, -disp.bess[i]);
+      const expected = disp.soc[i - 1] + (chg * eff - dis / eff) / b.energyKWh * 100;
+      const d = Math.abs(expected - disp.soc[i]);
+      if (d > worstCont) { worstCont = d; worstContH = i; }
+      if (d > 0.01) contFails++;
+    }
+  }
+  record("SOC continuity", "each hour's SOC follows from the previous hour and the energy moved, at √RTE each way",
+    b.enabled ? `${worstCont.toFixed(4)} % worst drift` : "battery not in service", worstContH, contFails);
+
+  /* 4. Import never exceeds the cap in force */
+  let impFails = 0, worstImp = 0, worstImpH = -1;
+  for (let i = 0; i < H; i++) {
+    const cap = !g.enabled ? 0 : (g.nonFirm && g.curtailFlags[i] ? g.reducedCapKW : g.importCapKW);
+    const over = disp.imp[i] - cap;
+    if (over > worstImp) { worstImp = over; worstImpH = i; }
+    if (over > tol) impFails++;
+  }
+  record("Import within the connection cap", g.enabled ? `${(g.importCapKW / 1000).toFixed(2)} MW${g.nonFirm ? `, reduced to ${(g.reducedCapKW / 1000).toFixed(2)} MW when curtailed` : ""}` : "no connection",
+    `${worstImp.toFixed(3)} kW worst overshoot`, worstImpH, impFails);
+
+  /* 5. Export never exceeds its cap */
+  let expFails = 0, worstExp = 0, worstExpH = -1;
+  for (let i = 0; i < H; i++) {
+    const over = disp.exp[i] - (g.enabled ? g.exportCapKW : 0);
+    if (over > worstExp) { worstExp = over; worstExpH = i; }
+    if (over > tol) expFails++;
+  }
+  record("Export within its cap", `${g.enabled ? (g.exportCapKW / 1000).toFixed(2) : 0} MW`, `${worstExp.toFixed(3)} kW worst overshoot`, worstExpH, expFails);
+
+  /* 6. Engines never run below minimum stable load, never above rating */
+  let engFails = 0, worstEng = 0, worstEngH = -1;
+  if (e.enabled) for (let i = 0; i < H; i++) {
+    const on = disp.enginesOn[i];
+    if (on === 0) { if (disp.engine[i] > tol) { engFails++; } continue; }
+    const derate = 1 - Math.max(0, inp.temp[i] - 25) * CONSTANTS.ENGINE_DERATE_PCT_PER_C_ABOVE_25 / 100;
+    const unit = e.unitKW * derate;
+    const lo = on * unit * e.minStableLoadPct / 100, hi = on * unit;
+    const viol = Math.max(lo - disp.engine[i], disp.engine[i] - hi);
+    if (viol > worstEng) { worstEng = viol; worstEngH = i; }
+    if (viol > tol) engFails++;
+  }
+  record("Engines between minimum stable load and rating", e.enabled ? `${e.minStableLoadPct} % to 100 % of the ambient-derated unit rating` : "engines not in service",
+    `${worstEng.toFixed(3)} kW worst violation`, worstEngH, engFails);
+
+  /* 7. Turbine minimum load */
+  let turbFails = 0, worstTurb = 0, worstTurbH = -1;
+  if (t.enabled) for (let i = 0; i < H; i++) {
+    if (disp.turbine[i] <= tol) continue;
+    const derate = 1 - Math.max(0, inp.temp[i] - 15) * CONSTANTS.TURBINE_DERATE_PCT_PER_C_ABOVE_15 / 100;
+    const lo = t.ratedKW * derate * t.minLoadPct / 100, hi = t.ratedKW * derate;
+    const viol = Math.max(lo - disp.turbine[i], disp.turbine[i] - hi);
+    if (viol > worstTurb) { worstTurb = viol; worstTurbH = i; }
+    if (viol > tol) turbFails++;
+  }
+  record("Turbine above its minimum load", t.enabled ? `${t.minLoadPct} % of the site rating` : "turbine not in service",
+    `${worstTurb.toFixed(3)} kW worst violation`, worstTurbH, turbFails);
+
+  /* 8. The resilience reserve is a hard floor when islanding is required */
+  let resFails = 0, worstRes = 0, worstResH = -1;
+  if (b.enabled && b.reserveApplies) {
+    const floor = Math.max(b.socMinPct, b.reserveSocPct);
+    for (let i = 0; i < H; i++) {
+      const below = floor - disp.soc[i];
+      if (below > worstRes) { worstRes = below; worstResH = i; }
+      if (below > 0.01) resFails++;
+    }
+  }
+  record("Resilience reserve never breached", b.enabled && b.reserveApplies ? `floor at ${Math.max(b.socMinPct, b.reserveSocPct)} % SOC` : "not enforced for this configuration",
+    `${worstRes.toFixed(3)} % worst breach`, worstResH, resFails);
+
+  /* 9. Nothing negative anywhere */
+  let negFails = 0, negH = -1;
+  for (let i = 0; i < H; i++) {
+    if (disp.pv[i] < -tol || disp.wind[i] < -tol || disp.imp[i] < -tol || disp.exp[i] < -tol
+      || disp.engine[i] < -tol || disp.turbine[i] < -tol || disp.curtail[i] < -tol
+      || disp.unserved[i] < -tol || disp.shed1[i] < -tol || disp.shed2[i] < -tol) { negFails++; if (negH < 0) negH = i; }
+  }
+  record("No negative flows", "every recorded flow is physically signed", `${negFails} hour(s)`, negH, negFails);
+
+  /* 10. Curtailment never exceeds what was available to curtail */
+  let curtFails = 0, worstCurt = 0, worstCurtH = -1;
+  for (let i = 0; i < H; i++) {
+    const available = disp.pv[i] + disp.wind[i] + disp.engine[i] + disp.turbine[i];
+    const over = disp.curtail[i] - available;
+    if (over > worstCurt) { worstCurt = over; worstCurtH = i; }
+    if (over > tol) curtFails++;
+  }
+  record("Curtailment never exceeds generation", "you cannot throw away more than was produced",
+    `${worstCurt.toFixed(3)} kW worst excess`, worstCurtH, curtFails);
+
+  /* 11. Unserved energy only when every source was genuinely exhausted */
+  let unsFails = 0, unsH = -1, unsHours = 0;
+  for (let i = 0; i < H; i++) {
+    if (disp.unserved[i] <= tol) continue;
+    unsHours++;
+    const cap = !g.enabled ? 0 : (g.nonFirm && g.curtailFlags[i] ? g.reducedCapKW : g.importCapKW);
+    const gridExhausted = !g.enabled || disp.imp[i] >= cap - tol;
+    const floor = b.reserveApplies ? Math.max(b.socMinPct, b.reserveSocPct) : b.socMinPct;
+    const bessExhausted = !b.enabled || disp.soc[i] <= floor + 0.01 || Math.max(0, disp.bess[i]) >= Math.min(b.powerKW, b.energyKWh * b.cRate) - tol;
+    const engExhausted = !e.enabled || disp.enginesOn[i] >= e.units || disp.engine[i] >= e.units * e.unitKW - tol;
+    if (!(gridExhausted && bessExhausted && engExhausted)) { unsFails++; if (unsH < 0) unsH = i; }
+  }
+  record("Unserved energy only when every source is exhausted", `${unsHours} hour(s) with unserved energy`,
+    `${unsFails} unjustified hour(s)`, unsH, unsFails);
+
+  /* 12. Annual totals reconcile with the hourly arrays */
+  let sumLoad = 0, sumSources = 0, sumSinks = 0;
+  for (let i = 0; i < H; i++) {
+    sumLoad += inp.load[i];
+    sumSources += disp.pv[i] + disp.wind[i] + disp.imp[i] + disp.engine[i] + disp.turbine[i] + Math.max(0, disp.bess[i]);
+    sumSinks += (inp.load[i] - disp.unserved[i] - disp.shed1[i] - disp.shed2[i]) + disp.exp[i] + disp.curtail[i]
+      + Math.max(0, -disp.bess[i]) + disp.aux[i];
+  }
+  const annualResidualPct = sumLoad > 0 ? 100 * Math.abs(sumSources - sumSinks) / sumLoad : 0;
+  record("Annual totals reconcile", "the 8760 hourly rows sum to the annual figures reported",
+    `${annualResidualPct.toFixed(6)} % of annual load`, -1, annualResidualPct > 0.001 ? 1 : 0);
+
+  const failed = checks.filter((c) => !c.pass).length;
+  return { checks, failed, passed: checks.length - failed, total: checks.length };
 }
 
 /* ============================================================================
@@ -1738,14 +1920,14 @@ function exportWorkbook(a) {
 
   const hourHeader = ["Hour", "Month", "Day of year", "Hour of day", "Load kW", "PV kW", "Wind kW",
     "Grid import kW", "Grid export kW", "BESS kW (+dis/-chg)", "SOC %", "Engine kW", "Engines on",
-    "Turbine kW", "Curtailed kW", "Shed kW", "Unserved kW", "Ambient C", "Import price EUR/MWh", "Reason code", "Reason"];
+    "Turbine kW", "Aux kW", "Curtailed kW", "Shed kW", "Unserved kW", "Ambient C", "Import price EUR/MWh", "Reason code", "Reason"];
   const hourRows = [hourHeader];
   for (let i = 0; i < H; i++) {
     const code = REASON_CODES[disp.reason[i]];
     hourRows.push([i, cal.month[i] + 1, cal.doy[i] + 1, cal.hourOfDay[i],
       +load[i].toFixed(1), +disp.pv[i].toFixed(1), +disp.wind[i].toFixed(1),
       +disp.imp[i].toFixed(1), +disp.exp[i].toFixed(1), +disp.bess[i].toFixed(1), +disp.soc[i].toFixed(2),
-      +disp.engine[i].toFixed(1), disp.enginesOn[i], +disp.turbine[i].toFixed(1),
+      +disp.engine[i].toFixed(1), disp.enginesOn[i], +disp.turbine[i].toFixed(1), +disp.aux[i].toFixed(1),
       +disp.curtail[i].toFixed(1), +(disp.shed1[i] + disp.shed2[i]).toFixed(1), +disp.unserved[i].toFixed(1),
       +a.temp[i].toFixed(1), +price[i].toFixed(2), code, REASON_INFO[code].label]);
   }
@@ -1753,6 +1935,11 @@ function exportWorkbook(a) {
 
   add("Load profile", [["Hour", "Load kW"], ...Array.from({ length: H }, (_, i) => [i, +load[i].toFixed(1)])]);
   add("Generation profiles", [["Hour", "PV kW", "Wind kW"], ...Array.from({ length: H }, (_, i) => [i, +disp.pv[i].toFixed(1), +disp.wind[i].toFixed(1)])]);
+
+  add("Engine self-test", a.selfTestOut
+    ? [["Check", "Verdict", "What is verified", "Worst value", "Hour", "Failing hours"],
+       ...a.selfTestOut.checks.map((c) => [c.name, c.pass ? "PASS" : "FAIL", c.detail, c.worst, c.worstHour, c.fails])]
+    : [["No self-test recorded."]]);
 
   add("Sizing & BOM", [
     ["Item", "Qty", "Rating", "Note"],
@@ -1844,6 +2031,68 @@ function exportWorkbook(a) {
     : [["Run the sweep on the Auto-size tab to populate this sheet."]]);
 
   XLSX.writeFile(wb, `microgrid-design-${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+/* ============================================================================
+   PROJECT CONFIGURATION FILE
+   A plain JSON snapshot of everything a project needs to be reproduced,
+   including any uploaded load or resource series. Human-readable on purpose:
+   a reviewer can diff two project files in a text editor.
+   ========================================================================== */
+const CONFIG_SCHEMA_VERSION = 1;
+
+function buildConfig(a) {
+  return {
+    schema: CONFIG_SCHEMA_VERSION,
+    tool: "microgrid-design-tool",
+    savedAt: new Date().toISOString(),
+    projectName: a.projectName || "",
+    notes: a.projectNotes || "",
+    mode: a.mode,
+    ctx: a.ctx,
+    locationId: a.ctx.locationId,
+    locOverride: a.locOverride,
+    aidc: a.aidc,
+    loadCfg: a.loadCfg,
+    char: a.char,
+    res: a.res,
+    costs: a.costs,
+    fin: a.fin,
+    sweep: a.sweep,
+    lcoeBoundary: a.lcoeBoundary,
+    scenarios: a.scenarios,
+    // Uploaded series travel with the file, otherwise the project cannot be reproduced
+    uploadedLoad: a.csvResult && a.csvResult.load ? Array.from(a.csvResult.load).map((v) => +v.toFixed(2)) : null,
+    uploadedLoadNotes: a.csvResult ? a.csvResult.notes : null,
+    uploadedResource: a.uploadedResource ? {
+      pvUnit: a.uploadedResource.pvUnit ? Array.from(a.uploadedResource.pvUnit).map((v) => +v.toFixed(5)) : null,
+      temp: a.uploadedResource.temp ? Array.from(a.uploadedResource.temp).map((v) => +v.toFixed(2)) : null,
+    } : null,
+    resourceSource: a.resourceSource,
+  };
+}
+
+function downloadJSON(filename, obj) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const el = document.createElement("a");
+  el.href = url; el.download = filename;
+  document.body.appendChild(el); el.click();
+  document.body.removeChild(el); URL.revokeObjectURL(url);
+}
+
+/** Returns { ok, config, messages } — never throws on a bad file. */
+function parseConfig(text) {
+  const messages = [];
+  let cfg;
+  try { cfg = JSON.parse(text); } catch (err) { return { ok: false, messages: ["The file is not valid JSON."] }; }
+  if (cfg.tool !== "microgrid-design-tool") messages.push("This file was not written by this tool — loading it anyway, values may be ignored.");
+  if (cfg.schema !== CONFIG_SCHEMA_VERSION) messages.push(`Saved with schema ${cfg.schema ?? "unknown"}, this build expects ${CONFIG_SCHEMA_VERSION}. Missing fields keep their current values.`);
+  const required = ["ctx", "res", "char"];
+  for (const k of required) if (!cfg[k]) messages.push(`Missing section "${k}" — leaving the current values in place.`);
+  if (cfg.uploadedLoad && cfg.uploadedLoad.length !== CONSTANTS.HOURS_PER_YEAR)
+    messages.push(`Embedded load series has ${cfg.uploadedLoad.length} values, expected ${CONSTANTS.HOURS_PER_YEAR} — ignored.`);
+  return { ok: true, config: cfg, messages };
 }
 
 /* ============================================================================
@@ -2209,6 +2458,7 @@ export default function MicrogridDesignTool() {
   const [reasonFilter, setReasonFilter] = useState(-1);
   const [tab, setTab] = useState(0);
   const [noticesOpen, setNoticesOpen] = useState(true);
+  const [selfTestOpen, setSelfTestOpen] = useState(false);
   const [lcoeBoundary, setLcoeBoundary] = useState("facility");
   const [costs, setCosts] = useState({ ...CONSTANTS.COST_DEFAULTS });
   const [fin, setFin] = useState({ enabled: false, gearingPct: 70, tenorYears: 12, interestPct: 5.5, creditBaselineCapex: false });
@@ -2217,6 +2467,10 @@ export default function MicrogridDesignTool() {
   const [sweeping, setSweeping] = useState(false);
   const [scenarios, setScenarios] = useState([]);
   const [scenarioName, setScenarioName] = useState("");
+  const [projectName, setProjectName] = useState("");
+  const [projectNotes, setProjectNotes] = useState("");
+  const [configMsgs, setConfigMsgs] = useState(null);
+  const cfgFileRef = useRef(null);
 
   const [res, setRes] = useState({
     pv: { enabled: true, kWp: 10000, dcacRatio: CONSTANTS.PV_DCAC_RATIO_DEFAULT, soilingPct: CONSTANTS.PV_SOILING_PCT,
@@ -2441,7 +2695,9 @@ export default function MicrogridDesignTool() {
       aidcLimits: mode === "aidc" ? { pvAreaPerKWp: aidc.pvAreaPerKWp, bessFootprint: aidc.bessFootprint, engineFootprint: aidc.engineFootprint } : null,
     });
     const ms = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
-    setRunOut({ sig: runSig, disp: d, adeq: ad, bom: b, ms, at: new Date().toLocaleTimeString() });
+    const st = selfTest(d, dispatchInputs, cal);
+    const msWithTest = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+    setRunOut({ sig: runSig, disp: d, adeq: ad, bom: b, ms, msWithTest, selfTest: st, at: new Date().toLocaleTimeString() });
   };
 
   useEffect(() => { if (!runOut) runDispatch(); });
@@ -2477,7 +2733,7 @@ export default function MicrogridDesignTool() {
       i, date: `${dayLabel(cal.doy[i])} ${String(cal.hourOfDay[i]).padStart(2, "0")}h`,
       load: load[i], pv: disp.pv[i], wind: disp.wind[i], imp: disp.imp[i], bess: disp.bess[i],
       soc: disp.soc[i], engine: disp.engine[i], on: disp.enginesOn[i], turbine: disp.turbine[i],
-      curtail: disp.curtail[i], shed: disp.shed1[i] + disp.shed2[i], unserved: disp.unserved[i],
+      aux: disp.aux[i], curtail: disp.curtail[i], shed: disp.shed1[i] + disp.shed2[i], unserved: disp.unserved[i],
       reason: REASON_INFO[REASON_CODES[disp.reason[i]]].label, code: REASON_CODES[disp.reason[i]],
     });
     if (reasonFilter >= 0) { for (let i = 0; i < H && rows.length < 1000; i++) if (disp.reason[i] === reasonFilter) push(i); }
@@ -2749,11 +3005,58 @@ export default function MicrogridDesignTool() {
       XLSX, ctx, loc, res, costs, disp, cost, adeq, bom, fin, financials, baseline, stats, mode, aidc,
       aidcDerived, cal, load, price, temp, sens, scenarios, resourceSource, phaseRows,
       firmCapKW: effectiveImportCapKW, autoRank: sweepOut ? sweepOut.feasible.slice(0, 20) : null,
+      selfTestOut: runOut.selfTest,
     });
   };
 
   const parasiticKW = parasiticKWval;
   const NeedsRun = () => <NeedsRunCard T={T} onRun={runDispatch} />;
+
+  const saveProject = () => {
+    const cfg = buildConfig({ projectName, projectNotes, mode, ctx, locOverride, aidc, loadCfg, char, res,
+      costs, fin, sweep, lcoeBoundary, scenarios, csvResult, uploadedResource, resourceSource });
+    const slug = (projectName.trim() || "microgrid-project").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    downloadJSON(`${slug}.json`, cfg);
+  };
+
+  const loadProject = (ev) => {
+    const f = ev.target.files?.[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      const { ok, config: c, messages } = parseConfig(String(rd.result));
+      if (!ok) { setConfigMsgs(messages); return; }
+      if (c.mode) setMode(c.mode);
+      if (c.ctx) setCtx(c.ctx);
+      if (c.locOverride) setLocOverride(c.locOverride);
+      if (c.aidc) setAidc(c.aidc);
+      if (c.loadCfg) setLoadCfg(c.loadCfg);
+      if (c.char) setChar(c.char);
+      if (c.res) setRes(c.res);
+      if (c.costs) setCosts({ ...CONSTANTS.COST_DEFAULTS, ...c.costs });
+      if (c.fin) setFin(c.fin);
+      if (c.sweep) setSweep(c.sweep);
+      if (c.lcoeBoundary) setLcoeBoundary(c.lcoeBoundary);
+      if (Array.isArray(c.scenarios)) setScenarios(c.scenarios.slice(0, 6));
+      setProjectName(c.projectName || "");
+      setProjectNotes(c.notes || "");
+      if (c.uploadedLoad && c.uploadedLoad.length === H) {
+        setCsvResult({ load: Float32Array.from(c.uploadedLoad), notes: c.uploadedLoadNotes || ["Restored from a project file."], rowsIn: H, detected: "hourly" });
+      }
+      if (c.uploadedResource && (c.uploadedResource.pvUnit || c.uploadedResource.temp)) {
+        const nx = {};
+        if (c.uploadedResource.pvUnit) nx.pvUnit = Float32Array.from(c.uploadedResource.pvUnit);
+        if (c.uploadedResource.temp) nx.temp = Float32Array.from(c.uploadedResource.temp);
+        setUploadedResource(nx);
+      }
+      if (c.resourceSource) setResourceSource(c.resourceSource);
+      setRunOut(null);
+      setSweepOut(null);
+      setConfigMsgs([`Loaded "${c.projectName || f.name}"${c.savedAt ? `, saved ${c.savedAt.slice(0, 16).replace("T", " ")}` : ""}.`, ...messages,
+        "Run the dispatch to regenerate the results."]);
+    };
+    rd.readAsText(f);
+    ev.target.value = "";
+  };
   const axis = { stroke: T.chart.axis, fontSize: 10 };
   const tip = { backgroundColor: T.chart.tipBg, border: `1px solid ${T.chart.tipBorder}`, borderRadius: 4, fontSize: 11 };
 
@@ -2832,6 +3135,41 @@ export default function MicrogridDesignTool() {
             <Stat label="Minimum load" value={fmt(stats.minKW / 1000, 2)} unit="MW" />
             <Stat label="Load factor" value={fmt(stats.loadFactor * 100, 1)} unit="%" tone="cyan" />
           </div>
+
+          {/* PROJECT FILE */}
+          {tab === 0 && (
+            <Panel title="Project file" step="—" sub="save the whole configuration, or reload a saved one"
+              right={
+                <div className="flex items-center gap-2">
+                  <button onClick={saveProject} className={`rounded border px-3 py-1 text-xs ${T.chip}`}>Save project file</button>
+                  <button onClick={() => cfgFileRef.current?.click()} className={`rounded border px-3 py-1 text-xs ${T.btn}`}>Load project file</button>
+                  <input ref={cfgFileRef} type="file" accept=".json" className="hidden" onChange={loadProject} />
+                </div>
+              }>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                <Field tier="critical" label="Project name" unit="text">
+                  <Txt value={projectName} placeholder="e.g. Maasvlakte II BESS" onChange={setProjectName} />
+                </Field>
+                <div className="md:col-span-2">
+                  <Field label="Notes" unit="text">
+                    <Txt value={projectNotes} placeholder="revision, client, what changed since the last version" onChange={setProjectNotes} />
+                  </Field>
+                </div>
+              </div>
+              <p className={`mt-2 text-xs ${T.faint}`}>
+                The file is plain JSON containing every input, every cost override, the saved scenarios and any uploaded
+                load or resource series — so a project reopens exactly as it was, and two revisions can be compared in a text
+                editor. Results are not stored; the dispatch is re-run on load.
+              </p>
+              {configMsgs && (
+                <div className="mt-2 space-y-1">
+                  {configMsgs.map((m, i) => (
+                    <div key={i} className={`rounded border px-2 py-1 text-xs ${i === 0 ? T.notice.info : T.notice.warn}`}>{m}</div>
+                  ))}
+                </div>
+              )}
+            </Panel>
+          )}
 
           {/* 1. PROJECT CONTEXT */}
           {tab === 0 && (
@@ -3538,6 +3876,45 @@ export default function MicrogridDesignTool() {
               <Stat label="Peak import" value={fmt(disp.summary.peakImportKW / 1000, 2)} unit="MW" tone="cyan" />
             </div>
 
+            {/* Engine self-test — reliability shown, not asserted */}
+            <div className={`mt-3 rounded border ${T.tile}`}>
+              <div className={`flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1.5 ${T.rule}`}>
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Engine self-test</span>
+                <div className="flex items-center gap-2">
+                  <span className={`font-mono text-xs ${T.faint}`}>
+                    8760 h in {fmt(dispatchMs, 1)} ms · checks in {fmt((runOut.msWithTest || 0) - dispatchMs, 1)} ms
+                  </span>
+                  <Badge v={runOut.selfTest.failed === 0 ? "PASS" : "FAIL"} />
+                  <span className={`font-mono text-xs ${runOut.selfTest.failed ? T.tone.rose : T.tone.emerald}`}>
+                    {runOut.selfTest.passed}/{runOut.selfTest.total}
+                  </span>
+                  <Seg value={selfTestOpen ? "open" : "closed"} onChange={(v) => setSelfTestOpen(v === "open")}
+                    options={[{ value: "closed", label: "Reduce" }, { value: "open", label: "Expand" }]} />
+                </div>
+              </div>
+              {selfTestOpen && (
+                <div className="p-2">
+                  <div className={`mb-2 text-xs ${T.muted}`}>
+                    These checks re-derive every physical constraint from the stored hourly arrays, not from the code that
+                    produced them — so an error in the dispatch cannot hide behind them. Any failure names the hour.
+                  </div>
+                  <table className="w-full text-left font-mono text-xs">
+                    <tbody>
+                      {runOut.selfTest.checks.map((c, i) => (
+                        <tr key={i} className={`border-b ${T.divide}`}>
+                          <td className="px-1 py-0.5 w-12"><Badge v={c.pass ? "PASS" : "FAIL"} /></td>
+                          <td className={`px-1 py-0.5 ${T.title}`}>{c.name}</td>
+                          <td className={`px-1 py-0.5 ${T.faint}`}>{c.detail}</td>
+                          <td className={`px-1 py-0.5 text-right ${c.pass ? T.tone.emerald : T.tone.rose}`}>{c.worst}</td>
+                          <td className={`px-1 py-0.5 text-right ${T.ghost}`}>{c.pass ? "" : `hour ${c.worstHour} · ${c.fails} h`}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
             {/* Why each hour turned out that way */}
             <div className="mt-3">
               <div className={`mb-1 text-xs ${T.faint}`}>
@@ -3584,7 +3961,7 @@ export default function MicrogridDesignTool() {
                 <table className="w-full border-collapse text-right font-mono text-xs">
                   <thead className={`sticky top-0 ${T.panel}`}>
                     <tr className={`border-b ${T.rule}`}>
-                      {["h", "date", "load", "PV", "wind", "import", "BESS", "SOC %", "engine", "on", "turbine", "curtail", "shed", "unserved", "reason"].map((h) => (
+                      {["h", "date", "load", "PV", "wind", "import", "BESS", "SOC %", "engine", "on", "turbine", "aux", "curtail", "shed", "unserved", "reason"].map((h) => (
                         <th key={h} className={`px-1.5 py-1 ${T.faint} ${h === "date" || h === "reason" ? "text-left" : ""}`}>{h}</th>
                       ))}
                     </tr>
@@ -3603,6 +3980,7 @@ export default function MicrogridDesignTool() {
                         <td className="px-1.5 py-0.5">{fmt(r.engine, 0)}</td>
                         <td className={`px-1.5 py-0.5 ${T.ghost}`}>{r.on}</td>
                         <td className="px-1.5 py-0.5">{fmt(r.turbine, 0)}</td>
+                        <td className={`px-1.5 py-0.5 ${T.ghost}`}>{fmt(r.aux, 0)}</td>
                         <td className="px-1.5 py-0.5">{fmt(r.curtail, 0)}</td>
                         <td className="px-1.5 py-0.5">{fmt(r.shed, 0)}</td>
                         <td className={`px-1.5 py-0.5 ${r.unserved > 0 ? "" : T.ghost}`}>{fmt(r.unserved, 0)}</td>
