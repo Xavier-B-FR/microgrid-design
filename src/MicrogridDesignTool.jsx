@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from "react";
+import React, { useState, useMemo, useRef, useContext, createContext } from "react";
 import Papa from "papaparse";
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar, ComposedChart,
@@ -594,17 +594,94 @@ function dayLabel(dayIndex) {
 }
 
 /* ============================================================================
+   THEME
+   Two palettes. Tailwind's dark: variant needs a build-config change, so the
+   palette is resolved in JS instead and passed down through context. Every
+   colour in the UI comes from here — no colour class is written inline.
+   ========================================================================== */
+
+export const THEMES = {
+  dark: {
+    key: "dark",
+    app: "bg-slate-950 text-slate-200",
+    panel: "border-slate-800 bg-slate-900",
+    rule: "border-slate-800",
+    tile: "border-slate-800 bg-slate-950",
+    input: "border-slate-700 bg-slate-950 text-slate-100 focus:border-cyan-500",
+    micro: "border-slate-800 bg-slate-950 text-slate-300",
+    title: "text-slate-50",
+    muted: "text-slate-400",
+    faint: "text-slate-500",
+    ghost: "text-slate-600",
+    divide: "divide-slate-900",
+    btn: "border-slate-700 bg-slate-900 text-slate-400",
+    btnOn: "bg-cyan-900 text-cyan-200",
+    chip: "border-cyan-800 bg-cyan-950 text-cyan-300",
+    chipWarn: "bg-amber-950 text-amber-300",
+    chipOk: "bg-emerald-950 text-emerald-300",
+    chipIdle: "border-slate-800 bg-slate-900 text-slate-600",
+    notice: {
+      warn: "border-amber-700 bg-amber-950 text-amber-200",
+      info: "border-slate-700 bg-slate-950 text-slate-300",
+      fail: "border-rose-700 bg-rose-950 text-rose-200",
+    },
+    tone: { slate: "text-slate-100", cyan: "text-cyan-300", amber: "text-amber-300", emerald: "text-emerald-300", rose: "text-rose-300", violet: "text-violet-300" },
+    critRule: "border-cyan-600",
+    critLabel: "text-slate-100",
+    advLabel: "text-slate-500",
+    chart: { grid: "#1e293b", axis: "#475569", tipBg: "#020617", tipBorder: "#1e293b", load: "#22d3ee", loadFill: "#0e7490", temp: "#f59e0b", pv: "#a78bfa", bar1: "#0e7490", bar2: "#f59e0b", ref: "#64748b", refWarn: "#f43f5e" },
+  },
+  light: {
+    key: "light",
+    app: "bg-slate-100 text-slate-800",
+    panel: "border-slate-300 bg-white",
+    rule: "border-slate-200",
+    tile: "border-slate-200 bg-slate-50",
+    input: "border-slate-300 bg-white text-slate-900 focus:border-cyan-600",
+    micro: "border-slate-200 bg-white text-slate-700",
+    title: "text-slate-900",
+    muted: "text-slate-600",
+    faint: "text-slate-500",
+    ghost: "text-slate-400",
+    divide: "divide-slate-100",
+    btn: "border-slate-300 bg-white text-slate-600",
+    btnOn: "bg-cyan-700 text-white",
+    chip: "border-cyan-300 bg-cyan-50 text-cyan-800",
+    chipWarn: "bg-amber-100 text-amber-800",
+    chipOk: "bg-emerald-100 text-emerald-800",
+    chipIdle: "border-slate-200 bg-slate-50 text-slate-400",
+    notice: {
+      warn: "border-amber-300 bg-amber-50 text-amber-900",
+      info: "border-slate-300 bg-slate-50 text-slate-700",
+      fail: "border-rose-300 bg-rose-50 text-rose-900",
+    },
+    tone: { slate: "text-slate-900", cyan: "text-cyan-700", amber: "text-amber-700", emerald: "text-emerald-700", rose: "text-rose-700", violet: "text-violet-700" },
+    critRule: "border-cyan-600",
+    critLabel: "text-slate-900",
+    advLabel: "text-slate-500",
+    chart: { grid: "#e2e8f0", axis: "#64748b", tipBg: "#ffffff", tipBorder: "#cbd5e1", load: "#0891b2", loadFill: "#a5f3fc", temp: "#d97706", pv: "#7c3aed", bar1: "#0891b2", bar2: "#f59e0b", ref: "#94a3b8", refWarn: "#e11d48" },
+  },
+};
+
+const ThemeCtx = createContext(THEMES.dark);
+const useT = () => useContext(ThemeCtx);
+
+/* ============================================================================
    UI PRIMITIVES
+   Input tiers:
+     critical — must be set and checked; carries a rule and a bright label
+     advanced — has a defensible default; dimmed, and folded away by default
    ========================================================================== */
 
 function Panel({ title, step, right, children, sub }) {
+  const T = useT();
   return (
-    <section className="border border-slate-800 bg-slate-900 rounded">
-      <header className="flex items-center justify-between gap-3 border-b border-slate-800 px-3 py-2">
+    <section className={`rounded border ${T.panel}`}>
+      <header className={`flex items-center justify-between gap-3 border-b px-3 py-2 ${T.rule}`}>
         <div className="flex items-baseline gap-2 min-w-0">
-          {step && <span className="font-mono text-xs text-cyan-500 shrink-0">{step}</span>}
-          <h2 className="text-sm font-semibold text-slate-100 truncate">{title}</h2>
-          {sub && <span className="text-xs text-slate-500 truncate hidden sm:inline">{sub}</span>}
+          {step && <span className={`font-mono text-xs shrink-0 ${T.tone.cyan}`}>{step}</span>}
+          <h2 className={`text-sm font-semibold truncate ${T.title}`}>{title}</h2>
+          {sub && <span className={`text-xs truncate hidden sm:inline ${T.faint}`}>{sub}</span>}
         </div>
         <div className="shrink-0">{right}</div>
       </header>
@@ -613,59 +690,88 @@ function Panel({ title, step, right, children, sub }) {
   );
 }
 
-function Field({ label, unit, children, hint, flag }) {
+function Field({ label, unit, children, hint, flag, tier = "advanced" }) {
+  const T = useT();
+  const crit = tier === "critical";
   return (
-    <label className="block">
+    <label className={`block border-l-2 pl-2 ${crit ? T.critRule : "border-transparent"}`}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs text-slate-400">{label}</span>
-        <span className="font-mono text-xs text-slate-600">{unit}</span>
+        <span className={`text-xs ${crit ? `font-medium ${T.critLabel}` : T.advLabel}`}>{label}</span>
+        <span className={`font-mono text-xs ${T.ghost}`}>{unit}</span>
       </div>
       {children}
-      {hint && <div className="mt-0.5 text-xs text-slate-500">{hint}</div>}
-      {flag && <div className="mt-0.5 font-mono text-xs text-amber-500">{flag}</div>}
+      {hint && <div className={`mt-0.5 text-xs ${T.faint}`}>{hint}</div>}
+      {flag && <div className={`mt-0.5 font-mono text-xs ${T.tone.amber}`}>{flag}</div>}
     </label>
   );
 }
 
-const inputCls = "mt-0.5 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-sm text-slate-100 focus:border-cyan-500 focus:outline-none";
+const inpCls = (T) => `mt-0.5 w-full rounded border px-2 py-1 font-mono text-sm focus:outline-none ${T.input}`;
 
 function Num({ value, onChange, step = 1, min, max, disabled }) {
+  const T = useT();
   return (
-    <input type="number" className={inputCls} value={value === "" || value === null ? "" : value}
+    <input type="number" className={inpCls(T)} value={value === "" || value === null ? "" : value}
       step={step} min={min} max={max} disabled={disabled}
       onChange={(e) => onChange(e.target.value === "" ? "" : Number(e.target.value))} />
   );
 }
 
+function Txt({ value, onChange, placeholder, readOnly }) {
+  const T = useT();
+  return <input className={inpCls(T)} value={value} placeholder={placeholder} readOnly={readOnly}
+    onChange={onChange ? (e) => onChange(e.target.value) : undefined} />;
+}
+
 function Sel({ value, onChange, options, disabled }) {
+  const T = useT();
   return (
-    <select className={inputCls} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+    <select className={inpCls(T)} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
       {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
     </select>
   );
 }
 
-function Stat({ label, value, unit, tone = "slate" }) {
-  const tones = { slate: "text-slate-100", cyan: "text-cyan-300", amber: "text-amber-300", emerald: "text-emerald-300", rose: "text-rose-300", violet: "text-violet-300" };
+/** A folded group of advanced parameters. Remounted when the global density
+ *  switch changes, so "Show every parameter" opens all of them at once. */
+function Advanced({ title, count, defaultOpen, children }) {
+  const T = useT();
+  const [open, setOpen] = useState(!!defaultOpen);
   return (
-    <div className="rounded border border-slate-800 bg-slate-950 px-2 py-1.5">
-      <div className="text-xs text-slate-500 truncate">{label}</div>
-      <div className={`font-mono text-sm ${tones[tone]}`}>{value} <span className="text-xs text-slate-500">{unit}</span></div>
+    <div className={`mt-3 rounded border ${T.tile}`}>
+      <button onClick={() => setOpen(!open)} className="flex w-full items-center justify-between gap-2 px-2 py-1.5">
+        <span className={`text-xs uppercase tracking-wide ${T.faint}`}>
+          <span className="font-mono mr-1">{open ? "−" : "+"}</span>{title}
+        </span>
+        <span className={`font-mono text-xs ${T.ghost}`}>{count} parameter{count === 1 ? "" : "s"} on default</span>
+      </button>
+      {open && <div className={`border-t p-2 ${T.rule}`}>{children}</div>}
+    </div>
+  );
+}
+
+function Stat({ label, value, unit, tone = "slate" }) {
+  const T = useT();
+  return (
+    <div className={`rounded border px-2 py-1.5 ${T.tile}`}>
+      <div className={`text-xs truncate ${T.faint}`}>{label}</div>
+      <div className={`font-mono text-sm ${T.tone[tone]}`}>{value} <span className={`text-xs ${T.ghost}`}>{unit}</span></div>
     </div>
   );
 }
 
 /** The derivation trace: every computed number shown as the equation that produced it. */
 function Trace({ lines }) {
+  const T = useT();
   return (
-    <div className="rounded border border-slate-800 bg-slate-950">
-      <div className="border-b border-slate-800 px-2 py-1 text-xs uppercase tracking-wide text-slate-500">Derivation trace</div>
-      <div className="divide-y divide-slate-900">
+    <div className={`rounded border ${T.tile}`}>
+      <div className={`border-b px-2 py-1 text-xs uppercase tracking-wide ${T.rule} ${T.faint}`}>Derivation trace</div>
+      <div className={`divide-y ${T.divide}`}>
         {lines.map((l, i) => (
           <div key={i} className="flex flex-wrap items-baseline gap-x-2 px-2 py-1">
-            <span className="w-40 shrink-0 text-xs text-slate-500">{l.label}</span>
-            <span className="font-mono text-xs text-slate-400">{l.expr}</span>
-            <span className="ml-auto font-mono text-xs text-cyan-300">{l.result}</span>
+            <span className={`w-40 shrink-0 text-xs ${T.faint}`}>{l.label}</span>
+            <span className={`font-mono text-xs ${T.muted}`}>{l.expr}</span>
+            <span className={`ml-auto font-mono text-xs ${T.tone.cyan}`}>{l.result}</span>
           </div>
         ))}
       </div>
@@ -674,12 +780,12 @@ function Trace({ lines }) {
 }
 
 function Notices({ items }) {
+  const T = useT();
   if (!items.length) return null;
-  const tone = { warn: "border-amber-700 bg-amber-950 text-amber-200", info: "border-slate-700 bg-slate-950 text-slate-300", fail: "border-rose-700 bg-rose-950 text-rose-200" };
   return (
     <div className="space-y-1">
       {items.map((n, i) => (
-        <div key={i} className={`rounded border px-2 py-1 text-xs ${tone[n.level]}`}>
+        <div key={i} className={`rounded border px-2 py-1 text-xs ${T.notice[n.level]}`}>
           <span className="font-mono uppercase mr-2">{n.level === "warn" ? "check" : n.level === "fail" ? "blocker" : "note"}</span>{n.text}
         </div>
       ))}
@@ -687,8 +793,26 @@ function Notices({ items }) {
   );
 }
 
-const chartAxis = { stroke: "#475569", fontSize: 10 };
-const tipStyle = { backgroundColor: "#020617", border: "1px solid #1e293b", borderRadius: 4, fontSize: 11 };
+function Seg({ value, onChange, options }) {
+  const T = useT();
+  return (
+    <div className={`flex overflow-hidden rounded border ${T.btn}`}>
+      {options.map((o) => (
+        <button key={o.value} onClick={() => onChange(o.value)}
+          className={`px-2 py-1 text-xs ${value === o.value ? T.btnOn : ""}`}>{o.label}</button>
+      ))}
+    </div>
+  );
+}
+
+const PHASES = [
+  { n: 1, label: "Context · resource · load", done: true },
+  { n: 2, label: "Resources · dispatch engine", done: false },
+  { n: 3, label: "Adequacy · BOM", done: false },
+  { n: 4, label: "Costs · LCOE", done: false },
+  { n: 5, label: "Auto-size · AIDC ramp", done: false },
+  { n: 6, label: "Financials · scenarios · Excel", done: false },
+];
 
 /* ============================================================================
    APP
@@ -699,102 +823,72 @@ export default function MicrogridDesignTool() {
   const fileRef = useRef(null);
   const resFileRef = useRef(null);
 
+  const [themeKey, setThemeKey] = useState("dark");
+  const T = THEMES[themeKey];
+  const [density, setDensity] = useState("essential"); // "essential" | "full"
+  const showAll = density === "full";
+
   const [mode, setMode] = useState("aidc"); // "standard" | "aidc"
 
   const [ctx, setCtx] = useState({
-    useCase: "deferral",
-    gridStatus: "firm",
-    importCapKW: 8000,
-    exportCapKW: 0,
-    flexPctHours: 20,
-    flexReducedCapKW: 4000,
+    useCase: "deferral", gridStatus: "firm", importCapKW: 8000, exportCapKW: 0,
+    flexPctHours: 20, flexReducedCapKW: 4000,
     phases: [{ year: 1, capKW: 8000 }, { year: 3, capKW: 20000 }],
-    islanding: "planned",
-    autonomyH: 4,
-    locationId: "FR_PARIS",
-    lifeYears: 20,
-    discountPct: 7,
+    islanding: "planned", autonomyH: 4, locationId: "FR_PARIS", lifeYears: 20, discountPct: 7,
   });
 
   const [locOverride, setLocOverride] = useState({});
   const [resourceSource, setResourceSource] = useState({ pv: "library", temp: "library", note: null });
-  const [uploadedResource, setUploadedResource] = useState(null); // { pvUnit?, temp? }
+  const [uploadedResource, setUploadedResource] = useState(null);
 
   const [aidc, setAidc] = useState({
     targetMWIT: 20,
     ramp: [{ year: 1, mwIT: 4 }, { year: 2, mwIT: 12 }, { year: 3, mwIT: 20 }],
     analysisYear: 3,
-    coolingType: "liquid",
-    designPUE: 1.20,
-    freeCoolingBelowC: CONSTANTS.COOLING.liquid.freeCoolingBelowC, // 22 °C
+    coolingType: "liquid", designPUE: 1.20,
+    freeCoolingBelowC: CONSTANTS.COOLING.liquid.freeCoolingBelowC,
     designAmbientC: CONSTANTS.COOLING.liquid.designAmbientC,
     itUtilisationPct: CONSTANTS.IT_UTILISATION_PCT_DEFAULT,
-    redundancy: "NPLUS1",
-    topology: "Dual radial, single EMS",
-    upsPresent: true,
-    upsAutonomyMin: 5,
+    redundancy: "NPLUS1", topology: "Dual radial, single EMS",
+    upsPresent: true, upsAutonomyMin: 5,
     loadSwingPct: CONSTANTS.LOAD_SWING_PCT_DEFAULT,
     loadSwingSeconds: CONSTANTS.LOAD_SWING_SECONDS_DEFAULT,
     antiRecycleMin: CONSTANTS.ANTI_RECYCLE_TIMER_MIN_DEFAULT,
-    landPV_ha: 12,
-    pvAreaPerKWp: CONSTANTS.PV_AREA_M2_PER_KWP,
-    landBESS_m2: 6000,
-    bessFootprint: CONSTANTS.BESS_FOOTPRINT_M2_PER_MW,
-    landEngine_m2: 5000,
-    engineFootprint: CONSTANTS.ENGINE_FOOTPRINT_M2_PER_MW,
-    gridStrategy: "capped",
-    engineHoursLimit: 500,
-    noiseLimitNote: "",
-    waterAvailable: false,
+    landPV_ha: 12, pvAreaPerKWp: CONSTANTS.PV_AREA_M2_PER_KWP,
+    landBESS_m2: 6000, bessFootprint: CONSTANTS.BESS_FOOTPRINT_M2_PER_MW,
+    landEngine_m2: 5000, engineFootprint: CONSTANTS.ENGINE_FOOTPRINT_M2_PER_MW,
+    gridStrategy: "capped", engineHoursLimit: 500, noiseLimitNote: "", waterAvailable: false,
     pueTouched: false,
   });
 
   const [loadCfg, setLoadCfg] = useState({
-    path: "parametric",
-    annualEnergyMWh: 21000,
-    peakKW: 3000,
-    baseKW: 900,
-    shapeKey: "two_shift",
-    seasonality: 12,
-    seasonalPeak: "winter",
-    weekendFactor: 1.0,
-    customWeekday: [...LOAD_SHAPES.custom.weekday],
-    customWeekend: [...LOAD_SHAPES.custom.weekend],
+    path: "parametric", annualEnergyMWh: 12000, peakKW: 3000, baseKW: 400,
+    shapeKey: "two_shift", seasonality: 12, seasonalPeak: "winter", weekendFactor: 1.0,
+    customWeekday: [...LOAD_SHAPES.custom.weekday], customWeekend: [...LOAD_SHAPES.custom.weekend],
   });
   const [csvResult, setCsvResult] = useState(null);
 
   const [char, setChar] = useState({
     critPct: 85, shed1Pct: 10, shed2Pct: 5,
     stepKW: 800, motorKW: 400, motorMethod: "VSD",
-    parasiticMode: "pct", parasiticPct: 5, parasiticKW: 0,
-    touched: false,
+    parasiticMode: "pct", parasiticPct: 5, parasiticKW: 0, touched: false,
   });
 
   const [view, setView] = useState({ span: "week", startDay: 172 });
 
-  /* --- Resolved location ------------------------------------------------- */
+  /* --- Derived ------------------------------------------------------------ */
   const loc = useMemo(() => ({ ...LOCATION_LIBRARY[ctx.locationId], ...locOverride }), [ctx.locationId, locOverride]);
   const temp = useMemo(() => uploadedResource?.temp || buildTemperature(loc, cal), [loc, cal, uploadedResource]);
   const pvUnit = useMemo(() => uploadedResource?.pvUnit || buildPVUnit(loc, cal, temp), [loc, cal, temp, uploadedResource]);
   const annualMeanT = useMemo(() => { let s = 0; for (let i = 0; i < H; i++) s += temp[i]; return s / H; }, [temp]);
 
-  /* --- Load ---------------------------------------------------------------- */
   const aidcYearMW = useMemo(() => {
     const r = aidc.ramp.find((x) => x.year === aidc.analysisYear);
     return r ? r.mwIT : aidc.targetMWIT;
   }, [aidc]);
 
-  const aidcDerived = useMemo(
-    () => (mode === "aidc" ? deriveAIDCLoad(aidc, temp, aidcYearMW) : null),
-    [mode, aidc, temp, aidcYearMW]
-  );
-
-  const synth = useMemo(
-    () => (mode === "standard" && loadCfg.path === "parametric"
-      ? synthesiseLoad({ ...loadCfg, cal })
-      : null),
-    [mode, loadCfg, cal]
-  );
+  const aidcDerived = useMemo(() => (mode === "aidc" ? deriveAIDCLoad(aidc, temp, aidcYearMW) : null), [mode, aidc, temp, aidcYearMW]);
+  const synth = useMemo(() => (mode === "standard" && loadCfg.path === "parametric" ? synthesiseLoad({ ...loadCfg, cal }) : null), [mode, loadCfg, cal]);
 
   const load = useMemo(() => {
     if (mode === "aidc") return aidcDerived.load;
@@ -805,7 +899,6 @@ export default function MicrogridDesignTool() {
   const stats = useMemo(() => loadStats(load, cal), [load, cal]);
   const ldc = useMemo(() => durationCurve(load), [load]);
 
-  /* --- Load source banner --------------------------------------------------- */
   const loadSource = useMemo(() => {
     if (mode === "aidc") return { kind: "Derived", text: `AIDC model · year ${aidc.analysisYear} · ${fmt(aidcYearMW, 1)} MW IT · annualised PUE ${fmt(aidcDerived.annualisedPUE, 3)}` };
     if (loadCfg.path === "csv" && csvResult?.load) return { kind: "Measured", text: `Uploaded CSV · ${csvResult.rowsIn} rows · ${csvResult.detected} → 8760 h` };
@@ -813,12 +906,11 @@ export default function MicrogridDesignTool() {
     return { kind: "Synthetic", text: `Parametric synthesis · ${LOAD_SHAPES[loadCfg.shapeKey].label} · shape exponent γ = ${fmt(synth?.gamma, 3)}` };
   }, [mode, loadCfg, csvResult, synth, aidc.analysisYear, aidcYearMW, aidcDerived]);
 
-  /* --- AIDC engineering outputs -------------------------------------------- */
   const aidcOut = useMemo(() => {
     if (mode !== "aidc" || !aidcDerived) return null;
     const red = CONSTANTS.REDUNDANCY[aidc.redundancy];
-    const peakMW = stats.peakKW / 1000;                          // simulated, typical year
-    const designPeakMW = aidcDerived.designConditionKW / 1000;   // at design ambient
+    const peakMW = stats.peakKW / 1000;
+    const designPeakMW = aidcDerived.designConditionKW / 1000;
     const sizingBasisMW = Math.max(peakMW, designPeakMW);
     const firmMW = sizingBasisMW * red.firmFactor;
     const stepKW = aidcDerived.itKW * (aidc.loadSwingPct / 100);
@@ -829,7 +921,6 @@ export default function MicrogridDesignTool() {
     return { red, peakMW, designPeakMW, sizingBasisMW, firmMW, stepKW, maxKWp, maxBessMW, maxEngineMW, critPct: Math.min(99, critPct) };
   }, [mode, aidc, aidcDerived, stats]);
 
-  /* --- Warnings, never blockers -------------------------------------------- */
   const notices = useMemo(() => {
     const n = [];
     if (resourceSource.pv === "library") {
@@ -857,17 +948,16 @@ export default function MicrogridDesignTool() {
       if (aidcDerived.aboveDesignHours > 0) {
         n.push({ level: "warn", text: `${aidcDerived.aboveDesignHours} h/yr above the ${fmt(aidc.designAmbientC, 0)} °C design ambient. Cooling power is extrapolated to a maximum of ${fmt(CONSTANTS.COOLING[aidc.coolingType].overloadCap * 100, 0)} % of design in those hours.` });
       }
+      if (aidcOut.designPeakMW > aidcOut.peakMW * 1.02) {
+        n.push({ level: "info", text: `Firm capacity is sized on the ${fmt(aidcOut.designPeakMW, 2)} MW design-ambient load, not the ${fmt(aidcOut.peakMW, 2)} MW peak of the typical year. A typical year never reaches the design ambient at this site — sizing on it would undersize the plant.` });
+      }
       if (aidc.gridStrategy === "capped" && ctx.importCapKW < stats.peakKW) {
         n.push({ level: "info", text: `Import cap ${fmt(ctx.importCapKW / 1000, 1)} MW is below the ${fmt(stats.peakKW / 1000, 1)} MW facility peak. On-site generation must cover ${fmt((stats.peakKW - ctx.importCapKW) / 1000, 1)} MW at coincident peak.` });
-      }
-      if (aidc.waterAvailable === false && aidc.coolingType === "air") {
-        n.push({ level: "info", text: "No water available and air cooling selected — evaporative assist is excluded, so the design PUE should reflect dry-cooler performance at the design ambient." });
       }
     }
     return n;
   }, [resourceSource, loc, mode, char, synth, loadCfg, stats, aidc, aidcOut, aidcDerived, ctx.importCapKW]);
 
-  /* --- Chart series --------------------------------------------------------- */
   const series = useMemo(() => {
     const out = [];
     if (view.span === "year") {
@@ -896,7 +986,7 @@ export default function MicrogridDesignTool() {
     temp: +Number(loc.tempMeanC[i]).toFixed(1),
   })), [stats, loc]);
 
-  /* --- Handlers ------------------------------------------------------------- */
+  /* --- Handlers ------------------------------------------------------------ */
   const onLoadFile = (e) => {
     const f = e.target.files?.[0]; if (!f) return;
     const r = new FileReader();
@@ -915,14 +1005,12 @@ export default function MicrogridDesignTool() {
       const findKey = (re) => Object.keys(rows[0])[keys.findIndex((k) => re.test(k))];
       const gk = findKey(/ghi|irrad|g\(i\)|production|kwh|kw\b|p_pv|specific/);
       const tk = findKey(/temp|t2m|ambient|dry/);
-      const next = {};
-      const notes = [];
+      const next = {}; const notes = [];
       if (gk) {
         const v = rows.map((r0) => Number(r0[gk]) || 0);
         const arr = new Float32Array(H);
         for (let i = 0; i < H; i++) arr[i] = v[i % v.length];
         let s = 0; for (let i = 0; i < H; i++) s += arr[i];
-        // Normalise an irradiance column (W/m²) into kW/kWp using the stated yield.
         if (s > 5000) { const k = loc.specificYield_kWh_per_kWp / s; for (let i = 0; i < H; i++) arr[i] *= k; notes.push("Resource column scaled to the stated specific yield."); }
         next.pvUnit = arr;
       }
@@ -951,7 +1039,6 @@ export default function MicrogridDesignTool() {
     if (!char.touched) setChar((s) => ({ ...s, critPct: d.critPct, shed1Pct: Math.round((100 - d.critPct) * 0.6), shed2Pct: 100 - d.critPct - Math.round((100 - d.critPct) * 0.6) }));
   };
 
-  /* --- Traces --------------------------------------------------------------- */
   const aidcTrace = aidcDerived && aidcOut ? [
     { label: "IT draw", expr: `${fmt(aidcYearMW, 1)} MW IT × ${fmt(aidc.itUtilisationPct, 0)} % utilisation`, result: `${fmt(aidcDerived.itKW / 1000, 2)} MW` },
     { label: "Non-cooling overhead", expr: `IT × ${fmt(aidcDerived.otherPct, 1)} % (UPS ${aidc.upsPresent ? CONSTANTS.UPS_LOSS_PCT_OF_IT : 0} + dist ${CONSTANTS.DISTRIBUTION_LOSS_PCT_OF_IT} + misc ${CONSTANTS.MISC_LOAD_PCT_OF_IT})`, result: `${fmt(aidcDerived.otherKW / 1000, 2)} MW` },
@@ -960,7 +1047,7 @@ export default function MicrogridDesignTool() {
     { label: "Annualised PUE", expr: `facility energy ÷ IT energy over 8760 h at ${loc.label}`, result: fmt(aidcDerived.annualisedPUE, 3) },
     { label: "Peak, typical year", expr: `max of hourly IT + cooling(T) + overhead over 8760 h`, result: `${fmt(aidcOut.peakMW, 2)} MW` },
     { label: "Load at design ambient", expr: `IT + cooling at 100 % of design + overhead, at ${fmt(aidc.designAmbientC, 0)} °C`, result: `${fmt(aidcOut.designPeakMW, 2)} MW` },
-    { label: "Firm capacity req.", expr: `max(typical-year peak, design-ambient load) ${fmt(aidcOut.sizingBasisMW, 2)} MW × ${fmt(aidcOut.red.firmFactor, 2)} (${aidcOut.red.label})${aidcOut.red.spareUnits ? ` + ${aidcOut.red.spareUnits} spare unit` : ""}`, result: `${fmt(aidcOut.firmMW, 2)} MW` },
+    { label: "Firm capacity req.", expr: `max(typical peak, design load) ${fmt(aidcOut.sizingBasisMW, 2)} MW × ${fmt(aidcOut.red.firmFactor, 2)} (${aidcOut.red.label})`, result: `${fmt(aidcOut.firmMW, 2)} MW` },
     { label: "Largest load step", expr: `IT ${fmt(aidcDerived.itKW / 1000, 2)} MW × ${fmt(aidc.loadSwingPct, 0)} % swing over ${fmt(aidc.loadSwingSeconds, 0)} s`, result: `${fmt(aidcOut.stepKW / 1000, 2)} MW` },
     { label: "PV cap from land", expr: `${fmt(aidc.landPV_ha, 1)} ha × 10 000 m²/ha ÷ ${fmt(aidc.pvAreaPerKWp, 1)} m²/kWp`, result: `${fmt(aidcOut.maxKWp / 1000, 2)} MWp max` },
     { label: "BESS cap from area", expr: `${fmt(aidc.landBESS_m2, 0)} m² ÷ ${fmt(aidc.bessFootprint, 0)} m²/MW`, result: `${fmt(aidcOut.maxBessMW, 1)} MW max` },
@@ -968,505 +1055,506 @@ export default function MicrogridDesignTool() {
   ] : [];
 
   const parasiticKW = char.parasiticMode === "pct" ? stats.meanKW * char.parasiticPct / 100 : char.parasiticKW;
+  const axis = { stroke: T.chart.axis, fontSize: 10 };
+  const tip = { backgroundColor: T.chart.tipBg, border: `1px solid ${T.chart.tipBorder}`, borderRadius: 4, fontSize: 11 };
 
   /* ========================================================================= */
   return (
-    <div className="min-h-screen bg-slate-950 p-3 text-slate-200">
-      <div className="mx-auto max-w-7xl space-y-3">
+    <ThemeCtx.Provider value={T}>
+      <div className={`min-h-screen p-3 ${T.app}`}>
+        <div className="mx-auto max-w-7xl space-y-3">
 
-        {/* Header */}
-        <header className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-800 pb-3">
-          <div>
-            <h1 className="text-lg font-semibold tracking-tight text-slate-50">Microgrid design tool</h1>
-            <p className="text-xs text-slate-500">Pre-feasibility sizing, dispatch and LCOE. Not a substitute for a protection study, an EMT study or a contractor's price.</p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded border border-cyan-800 bg-cyan-950 px-2 py-1 font-mono text-xs text-cyan-300">Phase 1 of 6 · context, resource, load</span>
-            <div className="flex overflow-hidden rounded border border-slate-700">
-              {[["standard", "Standard project"], ["aidc", "AIDC design"]].map(([k, l]) => (
-                <button key={k} onClick={() => setMode(k)}
-                  className={`px-3 py-1 text-xs ${mode === k ? "bg-cyan-900 text-cyan-200" : "bg-slate-900 text-slate-400"}`}>{l}</button>
-              ))}
+          {/* Header */}
+          <header className={`flex flex-wrap items-end justify-between gap-3 border-b pb-3 ${T.rule}`}>
+            <div>
+              <h1 className={`text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
+              <p className={`text-xs ${T.faint}`}>Pre-feasibility sizing, dispatch and LCOE. Not a substitute for a protection study, an EMT study or a contractor's price.</p>
             </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} />
+              <Seg value={density} onChange={setDensity} options={[{ value: "essential", label: "Essentials" }, { value: "full", label: "Every parameter" }]} />
+              <Seg value={mode} onChange={setMode} options={[{ value: "standard", label: "Standard project" }, { value: "aidc", label: "AIDC design" }]} />
+            </div>
+          </header>
+
+          {/* Build progress + input key */}
+          <div className="flex flex-wrap items-center gap-2">
+            {PHASES.map((p) => (
+              <span key={p.n} className={`rounded border px-2 py-0.5 font-mono text-xs ${p.done ? T.chip : T.chipIdle}`}>
+                {p.n}. {p.label}{p.done ? " ✓" : ""}
+              </span>
+            ))}
           </div>
-        </header>
-
-        {/* Load source banner + headline stats */}
-        <div className="grid grid-cols-2 gap-2 md:grid-cols-6">
-          <div className="col-span-2 rounded border border-slate-800 bg-slate-900 px-2 py-1.5 md:col-span-2">
-            <div className="text-xs text-slate-500">Load in use</div>
-            <div className="font-mono text-xs text-cyan-300">{loadSource.kind}</div>
-            <div className="text-xs text-slate-400">{loadSource.text}</div>
+          <div className={`flex flex-wrap items-center gap-4 rounded border px-2 py-1.5 ${T.tile}`}>
+            <span className={`border-l-2 pl-2 text-xs ${T.critRule} ${T.critLabel}`}>Critical input — set it and check it</span>
+            <span className={`text-xs ${T.advLabel}`}>Advanced parameter — defensible default, folded away</span>
+            <span className={`ml-auto font-mono text-xs ${T.ghost}`}>{showAll ? "all parameters shown" : "advanced parameters folded"}</span>
           </div>
-          <Stat label="Annual energy" value={fmt(stats.annualMWh, 0)} unit="MWh/yr" />
-          <Stat label="Peak demand" value={fmt(stats.peakKW / 1000, 2)} unit="MW" tone="amber" />
-          <Stat label="Minimum load" value={fmt(stats.minKW / 1000, 2)} unit="MW" />
-          <Stat label="Load factor" value={fmt(stats.loadFactor * 100, 1)} unit="%" tone="cyan" />
-        </div>
 
-        <Notices items={notices} />
+          {/* Headline */}
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-6">
+            <div className={`col-span-2 rounded border px-2 py-1.5 ${T.panel}`}>
+              <div className={`text-xs ${T.faint}`}>Load in use</div>
+              <div className={`font-mono text-xs ${T.tone.cyan}`}>{loadSource.kind}</div>
+              <div className={`text-xs ${T.muted}`}>{loadSource.text}</div>
+            </div>
+            <Stat label="Annual energy" value={fmt(stats.annualMWh, 0)} unit="MWh/yr" />
+            <Stat label="Peak demand" value={fmt(stats.peakKW / 1000, 2)} unit="MW" tone="amber" />
+            <Stat label="Minimum load" value={fmt(stats.minKW / 1000, 2)} unit="MW" />
+            <Stat label="Load factor" value={fmt(stats.loadFactor * 100, 1)} unit="%" tone="cyan" />
+          </div>
 
-        {/* 1. PROJECT CONTEXT */}
-        <Panel title="Project context" step="1" sub="drives defaults and which adequacy check binds">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
-            <Field label="Use-case family" unit="—" hint={USE_CASE_FAMILIES[ctx.useCase].binding}>
-              <Sel value={ctx.useCase} onChange={applyUseCase}
-                options={Object.entries(USE_CASE_FAMILIES).map(([k, v]) => ({ value: k, label: v.label }))} />
-            </Field>
-            <Field label="Grid status" unit="—">
-              <Sel value={ctx.gridStatus} onChange={(v) => setCtx((s) => ({ ...s, gridStatus: v }))}
-                options={[
-                  { value: "none", label: "No connection (off-grid)" },
-                  { value: "firm", label: "Firm connection, import cap" },
-                  { value: "flexible", label: "Flexible / non-firm (curtailable)" },
-                  { value: "phased", label: "Phased connection (stepped caps)" },
-                ]} />
-            </Field>
-            <Field label="Islanding requirement" unit="—">
-              <Sel value={ctx.islanding} onChange={(v) => setCtx((s) => ({ ...s, islanding: v }))}
-                options={[
-                  { value: "none", label: "None" },
-                  { value: "planned", label: "Planned islanding" },
-                  { value: "unplanned", label: "Unplanned islanding" },
-                ]} />
-            </Field>
-            <Field label="Required autonomy at critical load" unit="h">
-              <Num value={ctx.autonomyH} onChange={(v) => setCtx((s) => ({ ...s, autonomyH: v }))} disabled={ctx.islanding === "none"} />
-            </Field>
+          <Notices items={notices} />
 
-            {ctx.gridStatus === "firm" && (<>
-              <Field label="Import cap" unit="kW"><Num value={ctx.importCapKW} onChange={(v) => setCtx((s) => ({ ...s, importCapKW: v }))} step={100} /></Field>
-              <Field label="Export cap" unit="kW" hint="0 = no export allowed"><Num value={ctx.exportCapKW} onChange={(v) => setCtx((s) => ({ ...s, exportCapKW: v }))} step={100} /></Field>
-            </>)}
-            {ctx.gridStatus === "flexible" && (<>
-              <Field label="Import cap, normal" unit="kW"><Num value={ctx.importCapKW} onChange={(v) => setCtx((s) => ({ ...s, importCapKW: v }))} step={100} /></Field>
-              <Field label="Reduced cap when curtailed" unit="kW"><Num value={ctx.flexReducedCapKW} onChange={(v) => setCtx((s) => ({ ...s, flexReducedCapKW: v }))} step={100} /></Field>
-              <Field label="Hours at reduced cap" unit="% of year"><Num value={ctx.flexPctHours} onChange={(v) => setCtx((s) => ({ ...s, flexPctHours: v }))} /></Field>
-            </>)}
-            {ctx.gridStatus === "phased" && (
-              <div className="md:col-span-2">
-                <div className="mb-1 flex items-baseline justify-between"><span className="text-xs text-slate-400">Connection steps</span><span className="font-mono text-xs text-slate-600">year → kW</span></div>
-                <div className="space-y-1">
-                  {ctx.phases.map((p, i) => (
-                    <div key={i} className="flex gap-2">
-                      <Num value={p.year} onChange={(v) => setCtx((s) => { const ph = [...s.phases]; ph[i] = { ...ph[i], year: v }; return { ...s, phases: ph }; })} />
-                      <Num value={p.capKW} onChange={(v) => setCtx((s) => { const ph = [...s.phases]; ph[i] = { ...ph[i], capKW: v }; return { ...s, phases: ph }; })} step={100} />
-                      <button className="rounded border border-slate-700 px-2 text-xs text-slate-400"
-                        onClick={() => setCtx((s) => ({ ...s, phases: s.phases.filter((_, j) => j !== i) }))}>−</button>
+          {/* 1. PROJECT CONTEXT */}
+          <Panel title="Project context" step="1" sub="drives defaults and which adequacy check binds">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+              <Field tier="critical" label="Use-case family" unit="—" hint={USE_CASE_FAMILIES[ctx.useCase].binding}>
+                <Sel value={ctx.useCase} onChange={applyUseCase} options={Object.entries(USE_CASE_FAMILIES).map(([k, v]) => ({ value: k, label: v.label }))} />
+              </Field>
+              <Field tier="critical" label="Grid status" unit="—">
+                <Sel value={ctx.gridStatus} onChange={(v) => setCtx((s) => ({ ...s, gridStatus: v }))}
+                  options={[
+                    { value: "none", label: "No connection (off-grid)" },
+                    { value: "firm", label: "Firm connection, import cap" },
+                    { value: "flexible", label: "Flexible / non-firm (curtailable)" },
+                    { value: "phased", label: "Phased connection (stepped caps)" },
+                  ]} />
+              </Field>
+              {ctx.gridStatus !== "none" && (
+                <Field tier="critical" label="Import cap" unit="kW"><Num value={ctx.importCapKW} step={100} onChange={(v) => setCtx((s) => ({ ...s, importCapKW: v }))} /></Field>
+              )}
+              <Field tier="critical" label="Islanding requirement" unit="—">
+                <Sel value={ctx.islanding} onChange={(v) => setCtx((s) => ({ ...s, islanding: v }))}
+                  options={[{ value: "none", label: "None" }, { value: "planned", label: "Planned islanding" }, { value: "unplanned", label: "Unplanned islanding" }]} />
+              </Field>
+              <Field tier="critical" label="Required autonomy at critical load" unit="h">
+                <Num value={ctx.autonomyH} onChange={(v) => setCtx((s) => ({ ...s, autonomyH: v }))} disabled={ctx.islanding === "none"} />
+              </Field>
+              <Field tier="critical" label="Location" unit="—">
+                <Sel value={ctx.locationId} onChange={(v) => { setCtx((s) => ({ ...s, locationId: v })); setLocOverride({}); setUploadedResource(null); setResourceSource({ pv: "library", temp: "library", note: null }); }}
+                  options={Object.entries(LOCATION_LIBRARY).map(([k, v]) => ({ value: k, label: v.label }))} />
+              </Field>
+              <Field tier="critical" label="Project life" unit="years"><Num value={ctx.lifeYears} onChange={(v) => setCtx((s) => ({ ...s, lifeYears: v }))} /></Field>
+              <Field tier="critical" label="Discount rate (real)" unit="%/yr" hint="LCOE moves with this as much as with capex">
+                <Num value={ctx.discountPct} step={0.1} onChange={(v) => setCtx((s) => ({ ...s, discountPct: v }))} />
+              </Field>
+            </div>
+
+            <Advanced key={`ctx-${density}`} title="Advanced — connection detail and currency" count={ctx.gridStatus === "flexible" ? 4 : 2} defaultOpen={showAll}>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+                <Field label="Export cap" unit="kW" hint="0 = no export allowed"><Num value={ctx.exportCapKW} step={100} onChange={(v) => setCtx((s) => ({ ...s, exportCapKW: v }))} /></Field>
+                <Field label="Currency" unit="—"><Txt value="EUR" readOnly /></Field>
+                {ctx.gridStatus === "flexible" && (<>
+                  <Field label="Reduced cap when curtailed" unit="kW"><Num value={ctx.flexReducedCapKW} step={100} onChange={(v) => setCtx((s) => ({ ...s, flexReducedCapKW: v }))} /></Field>
+                  <Field label="Hours at reduced cap" unit="% of year"><Num value={ctx.flexPctHours} onChange={(v) => setCtx((s) => ({ ...s, flexPctHours: v }))} /></Field>
+                </>)}
+                {ctx.gridStatus === "phased" && (
+                  <div className="md:col-span-4">
+                    <div className={`mb-1 flex items-baseline justify-between`}><span className={`text-xs ${T.advLabel}`}>Connection steps</span><span className={`font-mono text-xs ${T.ghost}`}>year → kW</span></div>
+                    <div className="space-y-1">
+                      {ctx.phases.map((p, i) => (
+                        <div key={i} className="flex gap-2">
+                          <Num value={p.year} onChange={(v) => setCtx((s) => { const ph = [...s.phases]; ph[i] = { ...ph[i], year: v }; return { ...s, phases: ph }; })} />
+                          <Num value={p.capKW} step={100} onChange={(v) => setCtx((s) => { const ph = [...s.phases]; ph[i] = { ...ph[i], capKW: v }; return { ...s, phases: ph }; })} />
+                          <button className={`rounded border px-2 text-xs ${T.btn}`} onClick={() => setCtx((s) => ({ ...s, phases: s.phases.filter((_, j) => j !== i) }))}>−</button>
+                        </div>
+                      ))}
+                      <button className={`rounded border px-2 py-1 text-xs ${T.btn}`}
+                        onClick={() => setCtx((s) => ({ ...s, phases: [...s.phases, { year: (s.phases.at(-1)?.year || 0) + 1, capKW: 0 }] }))}>Add step</button>
                     </div>
-                  ))}
-                  <button className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-400"
-                    onClick={() => setCtx((s) => ({ ...s, phases: [...s.phases, { year: (s.phases.at(-1)?.year || 0) + 1, capKW: 0 }] }))}>Add step</button>
+                  </div>
+                )}
+              </div>
+            </Advanced>
+          </Panel>
+
+          {/* 1B. LOCATION AND RESOURCE */}
+          <Panel title="Location and resource" step="1B" sub="LCOE moves more with yield than with equipment price"
+            right={
+              <div className="flex items-center gap-2">
+                <span className={`rounded px-2 py-0.5 font-mono text-xs ${resourceSource.pv === "site" ? T.chipOk : T.chipWarn}`}>
+                  {resourceSource.pv === "site" ? "site data" : "library default"} ±{resourceSource.pv === "site" ? CONSTANTS.SITE_YIELD_UNCERTAINTY_PCT : CONSTANTS.LIBRARY_YIELD_UNCERTAINTY_PCT}%
+                </span>
+                <button onClick={() => resFileRef.current?.click()} className={`rounded border px-2 py-1 text-xs ${T.btn}`}>Upload PVGIS / TMY / 8760</button>
+                <input ref={resFileRef} type="file" accept=".csv,.txt" className="hidden" onChange={onResourceFile} />
+              </div>
+            }>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <Field tier="critical" label="Specific yield" unit="kWh/kWp/yr" flag={resourceSource.pv === "library" ? "library default" : null}>
+                <Num value={loc.specificYield_kWh_per_kWp} step={10} onChange={(v) => setLocOverride((s) => ({ ...s, specificYield_kWh_per_kWp: v }))} />
+              </Field>
+              <Field tier="critical" label="Grid import tariff" unit="€/MWh"><Num value={loc.importTariff_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, importTariff_EUR_per_MWh: v }))} /></Field>
+              <Field tier="critical" label="Diesel price" unit="€/litre"><Num value={loc.diesel_EUR_per_litre} step={0.05} onChange={(v) => setLocOverride((s) => ({ ...s, diesel_EUR_per_litre: v }))} /></Field>
+              <Field tier="critical" label="Gas price" unit="€/MWh th"><Num value={loc.gas_EUR_per_MWh_th} onChange={(v) => setLocOverride((s) => ({ ...s, gas_EUR_per_MWh_th: v }))} /></Field>
+            </div>
+
+            <Advanced key={`loc-${density}`} title="Advanced — site physics, tariff structure and monthly shapes" count={7} defaultOpen={showAll}>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Field label="Latitude" unit="°"><Num value={loc.lat} step={0.01} onChange={(v) => setLocOverride((s) => ({ ...s, lat: v }))} /></Field>
+                <Field label="Mean wind speed @100 m" unit="m/s"><Num value={loc.windMean_m_s_100m} step={0.1} onChange={(v) => setLocOverride((s) => ({ ...s, windMean_m_s_100m: v }))} /></Field>
+                <Field label="Weibull shape k" unit="—"><Num value={loc.weibullK} step={0.1} onChange={(v) => setLocOverride((s) => ({ ...s, weibullK: v }))} /></Field>
+                <Field label="Diurnal swing" unit="°C"><Num value={loc.diurnalSwingC} step={0.5} onChange={(v) => setLocOverride((s) => ({ ...s, diurnalSwingC: v }))} /></Field>
+                <Field label="Grid fees" unit="€/MWh"><Num value={loc.gridFee_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridFee_EUR_per_MWh: v }))} /></Field>
+                <Field label="Capacity charge" unit="€/kW/yr"><Num value={loc.capacityCharge_EUR_per_kW_yr} onChange={(v) => setLocOverride((s) => ({ ...s, capacityCharge_EUR_per_kW_yr: v }))} /></Field>
+                <Field label="Grid emission factor" unit="gCO₂/kWh"><Num value={loc.gridCO2_g_per_kWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridCO2_g_per_kWh: v }))} /></Field>
+                <Field label="Annual mean dry bulb" unit="°C"><Txt value={fmt(annualMeanT, 1)} readOnly /></Field>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+                <div>
+                  <div className={`mb-1 text-xs ${T.faint}`}>Monthly PV yield share — relative, normalised in code</div>
+                  <div className="grid grid-cols-6 gap-1">
+                    {loc.monthlyYieldShare.map((v, i) => (
+                      <div key={i}>
+                        <div className={`text-center font-mono text-xs ${T.ghost}`}>{MONTHS[i]}</div>
+                        <input type="number" step={0.1} value={v}
+                          className={`w-full rounded border px-1 py-0.5 text-center font-mono text-xs ${T.micro}`}
+                          onChange={(e) => { const arr = [...loc.monthlyYieldShare]; arr[i] = Number(e.target.value); setLocOverride((s) => ({ ...s, monthlyYieldShare: arr })); }} />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className={`mb-1 text-xs ${T.faint}`}>Monthly mean dry bulb (°C) — PV derate, free cooling, thermal plant derating</div>
+                  <div className="grid grid-cols-6 gap-1">
+                    {loc.tempMeanC.map((v, i) => (
+                      <div key={i}>
+                        <div className={`text-center font-mono text-xs ${T.ghost}`}>{MONTHS[i]}</div>
+                        <input type="number" step={0.5} value={v}
+                          className={`w-full rounded border px-1 py-0.5 text-center font-mono text-xs ${T.micro}`}
+                          onChange={(e) => { const arr = [...loc.tempMeanC]; arr[i] = Number(e.target.value); setLocOverride((s) => ({ ...s, tempMeanC: arr })); }} />
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
-            )}
+            </Advanced>
 
-            <Field label="Location" unit="—">
-              <Sel value={ctx.locationId} onChange={(v) => { setCtx((s) => ({ ...s, locationId: v })); setLocOverride({}); setUploadedResource(null); setResourceSource({ pv: "library", temp: "library", note: null }); }}
-                options={Object.entries(LOCATION_LIBRARY).map(([k, v]) => ({ value: k, label: v.label }))} />
-            </Field>
-            <Field label="Project life" unit="years"><Num value={ctx.lifeYears} onChange={(v) => setCtx((s) => ({ ...s, lifeYears: v }))} /></Field>
-            <Field label="Discount rate (real)" unit="%/yr"><Num value={ctx.discountPct} onChange={(v) => setCtx((s) => ({ ...s, discountPct: v }))} step={0.1} /></Field>
-            <Field label="Currency" unit="—"><input className={inputCls} value="EUR" readOnly /></Field>
-          </div>
-        </Panel>
+            {resourceSource.note && <div className={`mt-2 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>{resourceSource.note}</div>}
 
-        {/* 1B. LOCATION AND RESOURCE */}
-        <Panel title="Location and resource" step="1B"
-          sub="LCOE moves more with yield than with equipment price"
-          right={
-            <div className="flex items-center gap-2">
-              <span className={`rounded px-2 py-0.5 font-mono text-xs ${resourceSource.pv === "site" ? "bg-emerald-950 text-emerald-300" : "bg-amber-950 text-amber-300"}`}>
-                {resourceSource.pv === "site" ? "site data" : "library default"} ±{resourceSource.pv === "site" ? CONSTANTS.SITE_YIELD_UNCERTAINTY_PCT : CONSTANTS.LIBRARY_YIELD_UNCERTAINTY_PCT}%
-              </span>
-              <button onClick={() => resFileRef.current?.click()} className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300">Upload PVGIS / TMY / 8760</button>
-              <input ref={resFileRef} type="file" accept=".csv,.txt" className="hidden" onChange={onResourceFile} />
-            </div>
-          }>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
-            <Field label="Specific yield" unit="kWh/kWp/yr" flag={resourceSource.pv === "library" ? "library default" : null}>
-              <Num value={loc.specificYield_kWh_per_kWp} step={10} onChange={(v) => setLocOverride((s) => ({ ...s, specificYield_kWh_per_kWp: v }))} />
-            </Field>
-            <Field label="Latitude" unit="°"><Num value={loc.lat} step={0.01} onChange={(v) => setLocOverride((s) => ({ ...s, lat: v }))} /></Field>
-            <Field label="Mean wind speed @100 m" unit="m/s"><Num value={loc.windMean_m_s_100m} step={0.1} onChange={(v) => setLocOverride((s) => ({ ...s, windMean_m_s_100m: v }))} /></Field>
-            <Field label="Weibull shape k" unit="—"><Num value={loc.weibullK} step={0.1} onChange={(v) => setLocOverride((s) => ({ ...s, weibullK: v }))} /></Field>
-            <Field label="Diurnal swing" unit="°C"><Num value={loc.diurnalSwingC} step={0.5} onChange={(v) => setLocOverride((s) => ({ ...s, diurnalSwingC: v }))} /></Field>
-            <Field label="Annual mean dry bulb" unit="°C"><input className={inputCls} value={fmt(annualMeanT, 1)} readOnly /></Field>
-
-            <Field label="Grid import tariff" unit="€/MWh"><Num value={loc.importTariff_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, importTariff_EUR_per_MWh: v }))} /></Field>
-            <Field label="Grid fees" unit="€/MWh"><Num value={loc.gridFee_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridFee_EUR_per_MWh: v }))} /></Field>
-            <Field label="Capacity charge" unit="€/kW/yr"><Num value={loc.capacityCharge_EUR_per_kW_yr} onChange={(v) => setLocOverride((s) => ({ ...s, capacityCharge_EUR_per_kW_yr: v }))} /></Field>
-            <Field label="Diesel price" unit="€/litre"><Num value={loc.diesel_EUR_per_litre} step={0.05} onChange={(v) => setLocOverride((s) => ({ ...s, diesel_EUR_per_litre: v }))} /></Field>
-            <Field label="Gas price" unit="€/MWh th"><Num value={loc.gas_EUR_per_MWh_th} onChange={(v) => setLocOverride((s) => ({ ...s, gas_EUR_per_MWh_th: v }))} /></Field>
-            <Field label="Grid emission factor" unit="gCO₂/kWh"><Num value={loc.gridCO2_g_per_kWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridCO2_g_per_kWh: v }))} /></Field>
-          </div>
-
-          {resourceSource.note && <div className="mt-2 rounded border border-slate-800 bg-slate-950 px-2 py-1 text-xs text-slate-400">{resourceSource.note}</div>}
-
-          <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-            <div>
-              <div className="mb-1 text-xs text-slate-500">Monthly PV yield (kWh/kWp) and mean dry bulb (°C) — editable shares</div>
-              <div className="h-44">
-                <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart data={monthlyChart} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
-                    <CartesianGrid stroke="#1e293b" vertical={false} />
-                    <XAxis dataKey="m" tick={chartAxis} />
-                    <YAxis yAxisId="l" tick={chartAxis} />
-                    <YAxis yAxisId="r" orientation="right" tick={chartAxis} />
-                    <Tooltip contentStyle={tipStyle} />
-                    <Bar yAxisId="l" dataKey="yield" name="kWh/kWp" fill="#f59e0b" />
-                    <Line yAxisId="r" type="monotone" dataKey="temp" name="°C" stroke="#22d3ee" dot={false} />
-                  </ComposedChart>
-                </ResponsiveContainer>
+            <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <div>
+                <div className={`mb-1 text-xs ${T.faint}`}>Monthly PV yield (kWh/kWp) and mean dry bulb (°C)</div>
+                <div className="h-44">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={monthlyChart} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                      <CartesianGrid stroke={T.chart.grid} vertical={false} />
+                      <XAxis dataKey="m" tick={axis} />
+                      <YAxis yAxisId="l" tick={axis} />
+                      <YAxis yAxisId="r" orientation="right" tick={axis} />
+                      <Tooltip contentStyle={tip} />
+                      <Bar yAxisId="l" dataKey="yield" name="kWh/kWp" fill={T.chart.bar2} />
+                      <Line yAxisId="r" type="monotone" dataKey="temp" name="°C" stroke={T.chart.load} dot={false} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
-              <div className="mt-1 grid grid-cols-6 gap-1">
-                {loc.monthlyYieldShare.map((v, i) => (
-                  <div key={i}>
-                    <div className="text-center font-mono text-xs text-slate-600">{MONTHS[i]}</div>
-                    <input type="number" step={0.1} value={v}
-                      className="w-full rounded border border-slate-800 bg-slate-950 px-1 py-0.5 text-center font-mono text-xs text-slate-300"
-                      onChange={(e) => { const arr = [...loc.monthlyYieldShare]; arr[i] = Number(e.target.value); setLocOverride((s) => ({ ...s, monthlyYieldShare: arr })); }} />
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div>
-              <div className="mb-1 text-xs text-slate-500">Monthly mean dry bulb (°C) — drives PV derate, free cooling and thermal plant derating</div>
-              <div className="grid grid-cols-6 gap-1">
-                {loc.tempMeanC.map((v, i) => (
-                  <div key={i}>
-                    <div className="text-center font-mono text-xs text-slate-600">{MONTHS[i]}</div>
-                    <input type="number" step={0.5} value={v}
-                      className="w-full rounded border border-slate-800 bg-slate-950 px-1 py-0.5 text-center font-mono text-xs text-slate-300"
-                      onChange={(e) => { const arr = [...loc.tempMeanC]; arr[i] = Number(e.target.value); setLocOverride((s) => ({ ...s, tempMeanC: arr })); }} />
-                  </div>
-                ))}
-              </div>
-              <div className="mt-2 grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-2 gap-2 content-start">
                 <Stat label="Equivalent full-load hours, PV" value={fmt(loc.specificYield_kWh_per_kWp, 0)} unit="h/yr" tone="amber" />
                 <Stat label="Hours ≥ 30 °C" value={fmt(Array.from(temp).filter((t) => t >= 30).length, 0)} unit="h/yr" tone="rose" />
                 <Stat label="Hours ≤ 18 °C" value={fmt(Array.from(temp).filter((t) => t <= 18).length, 0)} unit="h/yr" tone="cyan" />
-                <Stat label="Yield band" value={`±${resourceSource.pv === "site" ? CONSTANTS.SITE_YIELD_UNCERTAINTY_PCT : CONSTANTS.LIBRARY_YIELD_UNCERTAINTY_PCT}`} unit="% P50" />
+                <Stat label="Yield uncertainty band" value={`±${resourceSource.pv === "site" ? CONSTANTS.SITE_YIELD_UNCERTAINTY_PCT : CONSTANTS.LIBRARY_YIELD_UNCERTAINTY_PCT}`} unit="% P50" />
               </div>
             </div>
-          </div>
-          <p className="mt-2 text-xs text-slate-500">
-            Sensitivity of LCOE to specific yield, capex and discount rate is charted in Phase 4. Location comparison mode — the same design evaluated at several sites — is built in Phase 5.
-          </p>
-        </Panel>
+            <p className={`mt-2 text-xs ${T.faint}`}>
+              LCOE sensitivity to yield, capex and discount rate is charted in Phase 4. Location comparison mode is built in Phase 5.
+            </p>
+          </Panel>
 
-        {/* 1A. AIDC MODE */}
-        {mode === "aidc" && (
-          <Panel title="AI data centre design inputs" step="1A" sub="sized backwards from a capacity target, not from a measured load">
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-              <Field label="Target IT capacity, design" unit="MW IT"><Num value={aidc.targetMWIT} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, targetMWIT: v }))} /></Field>
-              <Field label="Cooling type" unit="—">
-                <Sel value={aidc.coolingType} onChange={setCooling}
-                  options={Object.entries(CONSTANTS.COOLING).map(([k, v]) => ({ value: k, label: v.label }))} />
-              </Field>
-              <Field label="Design PUE" unit="—" flag={aidc.pueTouched ? null : `default for ${aidc.coolingType} at this climate`}>
-                <Num value={aidc.designPUE} step={0.01} onChange={(v) => setAidc((s) => ({ ...s, designPUE: v, pueTouched: true }))} />
-              </Field>
-              <Field label="Design ambient for that PUE" unit="°C"><Num value={aidc.designAmbientC} onChange={(v) => setAidc((s) => ({ ...s, designAmbientC: v }))} /></Field>
+          {/* 1A. AIDC */}
+          {mode === "aidc" && (
+            <Panel title="AI data centre design inputs" step="1A" sub="sized backwards from a capacity target, not from a measured load">
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Field tier="critical" label="Target IT capacity, design" unit="MW IT"><Num value={aidc.targetMWIT} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, targetMWIT: v }))} /></Field>
+                <Field tier="critical" label="Cooling type" unit="—">
+                  <Sel value={aidc.coolingType} onChange={setCooling} options={Object.entries(CONSTANTS.COOLING).map(([k, v]) => ({ value: k, label: v.label }))} />
+                </Field>
+                <Field tier="critical" label="Design PUE" unit="—" flag={aidc.pueTouched ? null : "default for this cooling type and climate"}>
+                  <Num value={aidc.designPUE} step={0.01} onChange={(v) => setAidc((s) => ({ ...s, designPUE: v, pueTouched: true }))} />
+                </Field>
+                <Field tier="critical" label="Redundancy level" unit="—">
+                  <Sel value={aidc.redundancy} onChange={(v) => setAidc((s) => ({ ...s, redundancy: v }))} options={Object.entries(CONSTANTS.REDUNDANCY).map(([k, v]) => ({ value: k, label: v.label }))} />
+                </Field>
+                <Field tier="critical" label="Grid supply strategy" unit="—">
+                  <Sel value={aidc.gridStrategy} onChange={(v) => setAidc((s) => ({ ...s, gridStrategy: v }))}
+                    options={[
+                      { value: "grid100", label: "100 % from grid (assets for resilience only)" },
+                      { value: "capped", label: "Capped import + on-site balance" },
+                      { value: "phased", label: "Phased import caps" },
+                      { value: "offgrid", label: "Fully off-grid" },
+                    ]} />
+                </Field>
+                <Field tier="critical" label="Land available for PV" unit="ha"><Num value={aidc.landPV_ha} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, landPV_ha: v }))} /></Field>
+                <Field tier="critical" label="Permitted engine running hours" unit="h/yr"><Num value={aidc.engineHoursLimit} step={50} onChange={(v) => setAidc((s) => ({ ...s, engineHoursLimit: v }))} /></Field>
+                <Field tier="critical" label="Collective compute swing" unit="% of IT" hint="largest load step for the dynamic check">
+                  <Num value={aidc.loadSwingPct} onChange={(v) => setAidc((s) => ({ ...s, loadSwingPct: v }))} />
+                </Field>
+              </div>
 
-              <Field label="Free cooling below" unit="°C dry bulb"><Num value={aidc.freeCoolingBelowC} onChange={(v) => setAidc((s) => ({ ...s, freeCoolingBelowC: v }))} /></Field>
-              <Field label="IT utilisation" unit="% of installed"><Num value={aidc.itUtilisationPct} onChange={(v) => setAidc((s) => ({ ...s, itUtilisationPct: v }))} /></Field>
-              <Field label="Redundancy level" unit="—">
-                <Sel value={aidc.redundancy} onChange={(v) => setAidc((s) => ({ ...s, redundancy: v }))}
-                  options={Object.entries(CONSTANTS.REDUNDANCY).map(([k, v]) => ({ value: k, label: v.label }))} />
-              </Field>
-              <Field label="Distribution topology" unit="text" hint="named so the single-point-of-failure check can read it">
-                <input className={inputCls} value={aidc.topology} onChange={(e) => setAidc((s) => ({ ...s, topology: e.target.value }))} />
-              </Field>
-
-              <Field label="UPS / ride-through" unit="—">
-                <Sel value={aidc.upsPresent ? "yes" : "no"} onChange={(v) => setAidc((s) => ({ ...s, upsPresent: v === "yes" }))}
-                  options={[{ value: "yes", label: "Present" }, { value: "no", label: "None" }]} />
-              </Field>
-              <Field label="UPS autonomy" unit="min"><Num value={aidc.upsAutonomyMin} onChange={(v) => setAidc((s) => ({ ...s, upsAutonomyMin: v }))} disabled={!aidc.upsPresent} /></Field>
-              <Field label="Collective compute swing" unit="% of IT"><Num value={aidc.loadSwingPct} onChange={(v) => setAidc((s) => ({ ...s, loadSwingPct: v }))} /></Field>
-              <Field label="Swing timescale" unit="s" hint="feeds the dynamic adequacy check"><Num value={aidc.loadSwingSeconds} onChange={(v) => setAidc((s) => ({ ...s, loadSwingSeconds: v }))} /></Field>
-
-              <Field label="Chiller anti-recycle timer" unit="min" hint="respected by dispatch and recovery"><Num value={aidc.antiRecycleMin} onChange={(v) => setAidc((s) => ({ ...s, antiRecycleMin: v }))} /></Field>
-              <Field label="Grid supply strategy" unit="—">
-                <Sel value={aidc.gridStrategy} onChange={(v) => setAidc((s) => ({ ...s, gridStrategy: v }))}
-                  options={[
-                    { value: "grid100", label: "100 % from grid (assets for resilience only)" },
-                    { value: "capped", label: "Capped import + on-site balance" },
-                    { value: "phased", label: "Phased import caps" },
-                    { value: "offgrid", label: "Fully off-grid" },
-                  ]} />
-              </Field>
-              <Field label="Permitted engine running hours" unit="h/yr"><Num value={aidc.engineHoursLimit} step={50} onChange={(v) => setAidc((s) => ({ ...s, engineHoursLimit: v }))} /></Field>
-              <Field label="Water available for evaporative cooling" unit="—">
-                <Sel value={aidc.waterAvailable ? "yes" : "no"} onChange={(v) => setAidc((s) => ({ ...s, waterAvailable: v === "yes" }))}
-                  options={[{ value: "no", label: "No" }, { value: "yes", label: "Yes" }]} />
-              </Field>
-
-              <Field label="Land available for PV" unit="ha"><Num value={aidc.landPV_ha} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, landPV_ha: v }))} /></Field>
-              <Field label="Area per kWp" unit="m²/kWp"><Num value={aidc.pvAreaPerKWp} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, pvAreaPerKWp: v }))} /></Field>
-              <Field label="Footprint for BESS" unit="m²"><Num value={aidc.landBESS_m2} step={100} onChange={(v) => setAidc((s) => ({ ...s, landBESS_m2: v }))} /></Field>
-              <Field label="Footprint for engines" unit="m²"><Num value={aidc.landEngine_m2} step={100} onChange={(v) => setAidc((s) => ({ ...s, landEngine_m2: v }))} /></Field>
-              <Field label="Noise / emissions limit note" unit="text">
-                <input className={inputCls} value={aidc.noiseLimitNote} placeholder="e.g. 45 dB(A) at boundary, night dispatch blocked"
-                  onChange={(e) => setAidc((s) => ({ ...s, noiseLimitNote: e.target.value }))} />
-              </Field>
-            </div>
-
-            {/* Ramp */}
-            <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
-              <div className="lg:col-span-1">
-                <div className="mb-1 flex items-baseline justify-between">
-                  <span className="text-xs text-slate-400">Phased fit-out</span>
-                  <span className="font-mono text-xs text-slate-600">year → MW IT</span>
-                </div>
-                <div className="space-y-1">
-                  {aidc.ramp.map((r, i) => (
-                    <div key={i} className="flex items-center gap-2">
-                      <Num value={r.year} onChange={(v) => setAidc((s) => { const a = [...s.ramp]; a[i] = { ...a[i], year: v }; return { ...s, ramp: a }; })} />
-                      <Num value={r.mwIT} step={0.5} onChange={(v) => setAidc((s) => { const a = [...s.ramp]; a[i] = { ...a[i], mwIT: v }; return { ...s, ramp: a }; })} />
-                      <button onClick={() => setAidc((s) => ({ ...s, ramp: s.ramp.filter((_, j) => j !== i) }))}
-                        className="rounded border border-slate-700 px-2 text-xs text-slate-400">−</button>
-                    </div>
-                  ))}
-                  <div className="flex gap-2">
-                    <button onClick={() => setAidc((s) => ({ ...s, ramp: [...s.ramp, { year: (s.ramp.at(-1)?.year || 0) + 1, mwIT: s.targetMWIT }] }))}
-                      className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-400">Add year</button>
-                    <div className="flex-1">
-                      <Sel value={String(aidc.analysisYear)} onChange={(v) => setAidc((s) => ({ ...s, analysisYear: Number(v) }))}
-                        options={aidc.ramp.map((r) => ({ value: String(r.year), label: `Analyse year ${r.year} — ${r.mwIT} MW IT` }))} />
+              {/* Ramp is critical */}
+              <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
+                <div className={`border-l-2 pl-2 ${T.critRule}`}>
+                  <div className="mb-1 flex items-baseline justify-between">
+                    <span className={`text-xs font-medium ${T.critLabel}`}>Phased fit-out</span>
+                    <span className={`font-mono text-xs ${T.ghost}`}>year → MW IT</span>
+                  </div>
+                  <div className="space-y-1">
+                    {aidc.ramp.map((r, i) => (
+                      <div key={i} className="flex items-center gap-2">
+                        <Num value={r.year} onChange={(v) => setAidc((s) => { const a = [...s.ramp]; a[i] = { ...a[i], year: v }; return { ...s, ramp: a }; })} />
+                        <Num value={r.mwIT} step={0.5} onChange={(v) => setAidc((s) => { const a = [...s.ramp]; a[i] = { ...a[i], mwIT: v }; return { ...s, ramp: a }; })} />
+                        <button onClick={() => setAidc((s) => ({ ...s, ramp: s.ramp.filter((_, j) => j !== i) }))} className={`rounded border px-2 text-xs ${T.btn}`}>−</button>
+                      </div>
+                    ))}
+                    <div className="flex gap-2">
+                      <button onClick={() => setAidc((s) => ({ ...s, ramp: [...s.ramp, { year: (s.ramp.at(-1)?.year || 0) + 1, mwIT: s.targetMWIT }] }))}
+                        className={`rounded border px-2 py-1 text-xs ${T.btn}`}>Add year</button>
+                      <div className="flex-1">
+                        <Sel value={String(aidc.analysisYear)} onChange={(v) => setAidc((s) => ({ ...s, analysisYear: Number(v) }))}
+                          options={aidc.ramp.map((r) => ({ value: String(r.year), label: `Analyse year ${r.year} — ${r.mwIT} MW IT` }))} />
+                      </div>
                     </div>
                   </div>
                 </div>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <Stat label="Day-one load" value={fmt(100 * (aidc.ramp[0]?.mwIT || 0) / (aidc.targetMWIT || 1), 0)} unit="% of design" tone="amber" />
-                  <Stat label="Free-cooling hours" value={fmt(aidcDerived.freeHours, 0)} unit="h/yr" tone="cyan" />
-                </div>
+                <div className="lg:col-span-2"><Trace lines={aidcTrace} /></div>
               </div>
 
-              <div className="lg:col-span-2">
-                <Trace lines={aidcTrace} />
+              <Advanced key={`aidc-${density}`} title="Advanced — thermal design point, UPS, footprints and site limits" count={11} defaultOpen={showAll}>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field label="Design ambient for that PUE" unit="°C"><Num value={aidc.designAmbientC} onChange={(v) => setAidc((s) => ({ ...s, designAmbientC: v }))} /></Field>
+                  <Field label="Free cooling below" unit="°C dry bulb"><Num value={aidc.freeCoolingBelowC} onChange={(v) => setAidc((s) => ({ ...s, freeCoolingBelowC: v }))} /></Field>
+                  <Field label="IT utilisation" unit="% of installed"><Num value={aidc.itUtilisationPct} onChange={(v) => setAidc((s) => ({ ...s, itUtilisationPct: v }))} /></Field>
+                  <Field label="Swing timescale" unit="s"><Num value={aidc.loadSwingSeconds} onChange={(v) => setAidc((s) => ({ ...s, loadSwingSeconds: v }))} /></Field>
+                  <Field label="UPS / ride-through" unit="—">
+                    <Sel value={aidc.upsPresent ? "yes" : "no"} onChange={(v) => setAidc((s) => ({ ...s, upsPresent: v === "yes" }))} options={[{ value: "yes", label: "Present" }, { value: "no", label: "None" }]} />
+                  </Field>
+                  <Field label="UPS autonomy" unit="min"><Num value={aidc.upsAutonomyMin} onChange={(v) => setAidc((s) => ({ ...s, upsAutonomyMin: v }))} disabled={!aidc.upsPresent} /></Field>
+                  <Field label="Chiller anti-recycle timer" unit="min"><Num value={aidc.antiRecycleMin} onChange={(v) => setAidc((s) => ({ ...s, antiRecycleMin: v }))} /></Field>
+                  <Field label="Distribution topology" unit="text" hint="read by the single-point-of-failure check">
+                    <Txt value={aidc.topology} onChange={(v) => setAidc((s) => ({ ...s, topology: v }))} />
+                  </Field>
+                  <Field label="Area per kWp" unit="m²/kWp"><Num value={aidc.pvAreaPerKWp} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, pvAreaPerKWp: v }))} /></Field>
+                  <Field label="Footprint for BESS" unit="m²"><Num value={aidc.landBESS_m2} step={100} onChange={(v) => setAidc((s) => ({ ...s, landBESS_m2: v }))} /></Field>
+                  <Field label="Footprint for engines" unit="m²"><Num value={aidc.landEngine_m2} step={100} onChange={(v) => setAidc((s) => ({ ...s, landEngine_m2: v }))} /></Field>
+                  <Field label="Water for evaporative cooling" unit="—">
+                    <Sel value={aidc.waterAvailable ? "yes" : "no"} onChange={(v) => setAidc((s) => ({ ...s, waterAvailable: v === "yes" }))} options={[{ value: "no", label: "No" }, { value: "yes", label: "Yes" }]} />
+                  </Field>
+                  <Field label="Noise / emissions limit note" unit="text">
+                    <Txt value={aidc.noiseLimitNote} placeholder="e.g. 45 dB(A) at boundary, night dispatch blocked" onChange={(v) => setAidc((s) => ({ ...s, noiseLimitNote: v }))} />
+                  </Field>
+                </div>
+              </Advanced>
+
+              <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-6">
+                <Stat label="IT load" value={fmt(aidcDerived.itKW / 1000, 2)} unit="MW" />
+                <Stat label="Cooling at design" value={fmt(aidcDerived.coolingDesignKW / 1000, 2)} unit="MW" tone="cyan" />
+                <Stat label="Other overhead" value={fmt(aidcDerived.otherKW / 1000, 2)} unit="MW" />
+                <Stat label={`Annualised PUE (design ${fmt(aidc.designPUE, 2)})`} value={fmt(aidcDerived.annualisedPUE, 3)} unit="—" tone="emerald" />
+                <Stat label="Load at design ambient" value={fmt(aidcOut.designPeakMW, 2)} unit="MW" tone="amber" />
+                <Stat label="Largest load step" value={fmt(aidcOut.stepKW / 1000, 2)} unit="MW" tone="rose" />
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-6">
+                <Stat label="Firm capacity requirement" value={fmt(aidcOut.firmMW, 2)} unit="MW" tone="amber" />
+                <Stat label="Peak, typical year" value={fmt(aidcOut.peakMW, 2)} unit="MW" />
+                <Stat label="Free-cooling hours" value={fmt(aidcDerived.freeHours, 0)} unit="h/yr" tone="cyan" />
+                <Stat label="PV cap from land" value={fmt(aidcOut.maxKWp / 1000, 2)} unit="MWp" tone="cyan" />
+                <Stat label="BESS cap from area" value={fmt(aidcOut.maxBessMW, 1)} unit="MW" tone="violet" />
+                <Stat label="Engine cap from area" value={fmt(aidcOut.maxEngineMW, 1)} unit="MW" />
+              </div>
+              <p className={`mt-2 text-xs ${T.faint}`}>
+                IT and cooling are both non-sheddable. Criticality is pre-filled at {fmt(aidcOut.critPct, 0)} % of mean load and can be overridden below.
+                €/MW IT capex, LCOE per MWh delivered to IT, time-to-power and the 2N single-point-of-failure check come in Phases 4 and 5.
+              </p>
+            </Panel>
+          )}
+
+          {/* 2. LOAD INPUT */}
+          {mode === "standard" && (
+            <Panel title="Load input" step="2"
+              right={<Seg value={loadCfg.path} onChange={(v) => setLoadCfg((s) => ({ ...s, path: v }))}
+                options={[{ value: "csv", label: "Upload CSV" }, { value: "parametric", label: "Parametric" }]} />}>
+              {loadCfg.path === "csv" ? (
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button onClick={() => fileRef.current?.click()} className={`rounded border px-3 py-1 text-xs ${T.chip}`}>Choose a CSV file</button>
+                    <input ref={fileRef} type="file" accept=".csv,.txt" className="hidden" onChange={onLoadFile} />
+                    <span className={`text-xs ${T.faint}`}>Accepts timestamp + kW, or kWh per interval. 15-minute and 30-minute data are averaged to hourly.</span>
+                  </div>
+                  {csvResult?.error && <div className={`rounded border px-2 py-1 text-xs ${T.notice.fail}`}>{csvResult.error}</div>}
+                  {csvResult?.notes && (
+                    <div className={`rounded border p-2 ${T.tile}`}>
+                      <div className={`mb-1 text-xs uppercase tracking-wide ${T.faint}`}>What was parsed and what was fixed</div>
+                      <ul className="space-y-0.5">
+                        {csvResult.notes.map((n, i) => <li key={i} className={`font-mono text-xs ${T.muted}`}>· {n}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                    <Field tier="critical" label="Annual energy" unit="MWh/yr"><Num value={loadCfg.annualEnergyMWh} step={100} onChange={(v) => setLoadCfg((s) => ({ ...s, annualEnergyMWh: v }))} /></Field>
+                    <Field tier="critical" label="Peak demand" unit="kW"><Num value={loadCfg.peakKW} step={50} onChange={(v) => setLoadCfg((s) => ({ ...s, peakKW: v }))} /></Field>
+                    <Field tier="critical" label="Base / minimum load" unit="kW"><Num value={loadCfg.baseKW} step={50} onChange={(v) => setLoadCfg((s) => ({ ...s, baseKW: v }))} /></Field>
+                    <Field tier="critical" label="Profile shape" unit="—">
+                      <Sel value={loadCfg.shapeKey} onChange={(v) => setLoadCfg((s) => ({ ...s, shapeKey: v }))} options={Object.entries(LOAD_SHAPES).map(([k, v]) => ({ value: k, label: v.label }))} />
+                    </Field>
+                  </div>
+                  <Advanced key={`load-${density}`} title="Advanced — seasonality, weekend factor and custom hourly shape" count={4} defaultOpen={showAll}>
+                    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                      <Field label="Seasonal weighting" unit="± %"><Num value={loadCfg.seasonality} onChange={(v) => setLoadCfg((s) => ({ ...s, seasonality: v }))} /></Field>
+                      <Field label="Season peaking" unit="—">
+                        <Sel value={loadCfg.seasonalPeak} onChange={(v) => setLoadCfg((s) => ({ ...s, seasonalPeak: v }))}
+                          options={[{ value: "winter", label: "Winter peaking" }, { value: "summer", label: "Summer peaking" }, { value: "none", label: "No seasonality" }]} />
+                      </Field>
+                      <Field label="Weekend factor" unit="× weekday"><Num value={loadCfg.weekendFactor} step={0.05} onChange={(v) => setLoadCfg((s) => ({ ...s, weekendFactor: v }))} /></Field>
+                      <Field label="Shape exponent γ solved" unit="—" hint="load = base + (peak − base) · shape^γ"><Txt value={fmt(synth?.gamma, 3)} readOnly /></Field>
+                      {loadCfg.shapeKey === "custom" && (
+                        <div className="md:col-span-4">
+                          {[["customWeekday", "Weekday"], ["customWeekend", "Weekend"]].map(([key, lbl]) => (
+                            <div key={key} className="mb-2">
+                              <div className={`mb-0.5 font-mono text-xs ${T.ghost}`}>{lbl} — hourly factors 0–1</div>
+                              <div className="grid grid-cols-12 gap-0.5">
+                                {loadCfg[key].map((v, i) => (
+                                  <input key={i} type="number" step={0.05} min={0} max={1} value={v}
+                                    className={`w-full rounded border px-0.5 py-0.5 text-center font-mono text-xs ${T.micro}`}
+                                    onChange={(e) => setLoadCfg((s) => { const a = [...s[key]]; a[i] = Number(e.target.value); return { ...s, [key]: a }; })} />
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </Advanced>
+                </>
+              )}
+            </Panel>
+          )}
+
+          {/* LOAD CHARACTERISATION */}
+          <Panel title="Load characterisation" step={mode === "aidc" ? "1A·2" : "2B"} sub="separate inputs — not derivable from the profile">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <Field tier="critical" label="Critical load (served in island)" unit="% of load">
+                <Num value={char.critPct} onChange={(v) => setChar((s) => ({ ...s, critPct: v, touched: true }))} />
+              </Field>
+              <Field tier="critical" label="Largest single load step" unit="kW" hint={mode === "aidc" ? "pre-filled from the compute swing" : "drives the dynamic adequacy check"}>
+                <Num value={mode === "aidc" && !char.touched ? Math.round(aidcOut.stepKW) : char.stepKW} step={10} onChange={(v) => setChar((s) => ({ ...s, stepKW: v, touched: true }))} />
+              </Field>
+              <Field tier="critical" label="Largest motor start" unit="kW"><Num value={char.motorKW} step={10} onChange={(v) => setChar((s) => ({ ...s, motorKW: v, touched: true }))} /></Field>
+              <Field tier="critical" label="Critical load at peak" unit="kW"><Txt value={fmt(stats.peakKW * char.critPct / 100, 0)} readOnly /></Field>
+            </div>
+
+            <Advanced key={`char-${density}`} title="Advanced — shedding tiers, starting method and parasitics" count={4} defaultOpen={showAll}>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Field label="Sheddable tier 1" unit="% of load"><Num value={char.shed1Pct} onChange={(v) => setChar((s) => ({ ...s, shed1Pct: v, touched: true }))} /></Field>
+                <Field label="Sheddable tier 2" unit="% of load"><Num value={char.shed2Pct} onChange={(v) => setChar((s) => ({ ...s, shed2Pct: v, touched: true }))} /></Field>
+                <Field label="Starting method" unit="—">
+                  <Sel value={char.motorMethod} onChange={(v) => setChar((s) => ({ ...s, motorMethod: v }))}
+                    options={[{ value: "DOL", label: "Direct on line" }, { value: "SOFT", label: "Soft starter" }, { value: "VSD", label: "VSD" }]} />
+                </Field>
+                <Field label="Parasitic / auxiliary load" unit={char.parasiticMode === "pct" ? "% of mean" : "kW"} hint="included in the island load, never omitted">
+                  <div className="flex gap-1">
+                    <Sel value={char.parasiticMode} onChange={(v) => setChar((s) => ({ ...s, parasiticMode: v }))} options={[{ value: "pct", label: "%" }, { value: "kw", label: "kW" }]} />
+                    {char.parasiticMode === "pct"
+                      ? <Num value={char.parasiticPct} onChange={(v) => setChar((s) => ({ ...s, parasiticPct: v }))} />
+                      : <Num value={char.parasiticKW} step={10} onChange={(v) => setChar((s) => ({ ...s, parasiticKW: v }))} />}
+                  </div>
+                </Field>
+              </div>
+            </Advanced>
+
+            <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">
+              <Stat label="Parasitic load" value={fmt(parasiticKW, 0)} unit="kW" />
+              <Stat label="Island load at peak (critical + parasitic)" value={fmt((stats.peakKW * char.critPct / 100 + parasiticKW) / 1000, 2)} unit="MW" tone="amber" />
+              <Stat label={`Energy for ${fmt(ctx.autonomyH, 0)} h at critical load`} value={fmt(stats.peakKW * char.critPct / 100 * ctx.autonomyH / 1000, 2)} unit="MWh" tone="violet" />
+              <Stat label="Autonomy required" value={fmt(ctx.autonomyH, 0)} unit="h" />
+            </div>
+          </Panel>
+
+          {/* LOAD PROFILE */}
+          <Panel title="Load profile" step="1C"
+            right={
+              <div className="flex flex-wrap items-center gap-2">
+                <Seg value={view.span} onChange={(v) => setView((s) => ({ ...s, span: v }))}
+                  options={[{ value: "day", label: "Day" }, { value: "week", label: "Week" }, { value: "month", label: "Month" }, { value: "year", label: "Year" }]} />
+                {view.span !== "year" && (
+                  <input type="range" min={0} max={364} value={view.startDay} className="w-40"
+                    onChange={(e) => setView((s) => ({ ...s, startDay: Number(e.target.value) }))} />
+                )}
+                <span className={`font-mono text-xs ${T.faint}`}>{view.span === "year" ? "daily mean" : `from ${dayLabel(view.startDay)}`}</span>
+              </div>
+            }>
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={series} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
+                  <CartesianGrid stroke={T.chart.grid} vertical={false} />
+                  <XAxis dataKey="t" tick={axis} minTickGap={40} />
+                  <YAxis yAxisId="l" tick={axis} label={{ value: "kW", angle: -90, position: "insideLeft", fill: T.chart.axis, fontSize: 10 }} />
+                  <YAxis yAxisId="r" orientation="right" tick={axis} />
+                  <Tooltip contentStyle={tip} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Area yAxisId="l" type="monotone" dataKey="load" name="Load (kW)" stroke={T.chart.load} fill={T.chart.loadFill} fillOpacity={0.35} />
+                  <Line yAxisId="r" type="monotone" dataKey="temp" name="Dry bulb (°C)" stroke={T.chart.temp} dot={false} strokeWidth={1} />
+                  <Line yAxisId="r" type="monotone" dataKey="pv" name="PV (kW/kWp)" stroke={T.chart.pv} dot={false} strokeWidth={1} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <div>
+                <div className={`mb-1 text-xs ${T.faint}`}>Load duration curve — kW against % of hours exceeded</div>
+                <div className="h-48">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={ldc} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
+                      <CartesianGrid stroke={T.chart.grid} />
+                      <XAxis dataKey="pct" tick={axis} unit="%" />
+                      <YAxis tick={axis} />
+                      <Tooltip contentStyle={tip} />
+                      <ReferenceLine y={stats.meanKW} stroke={T.chart.ref} strokeDasharray="3 3" label={{ value: "mean", fill: T.chart.ref, fontSize: 10 }} />
+                      {ctx.gridStatus !== "none" && (
+                        <ReferenceLine y={ctx.importCapKW} stroke={T.chart.refWarn} strokeDasharray="4 2" label={{ value: "import cap", fill: T.chart.refWarn, fontSize: 10 }} />
+                      )}
+                      <Line type="monotone" dataKey="kW" stroke={T.chart.load} dot={false} strokeWidth={1.5} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+              <div>
+                <div className={`mb-1 text-xs ${T.faint}`}>Monthly energy — load (MWh) against PV yield (kWh/kWp)</div>
+                <div className="h-48">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={monthlyChart} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
+                      <CartesianGrid stroke={T.chart.grid} vertical={false} />
+                      <XAxis dataKey="m" tick={axis} />
+                      <YAxis yAxisId="l" tick={axis} />
+                      <YAxis yAxisId="r" orientation="right" tick={axis} />
+                      <Tooltip contentStyle={tip} />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      <Bar yAxisId="l" dataKey="load" name="Load (MWh)" fill={T.chart.bar1} />
+                      <Bar yAxisId="r" dataKey="yield" name="PV (kWh/kWp)" fill={T.chart.bar2} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
             </div>
 
             <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-6">
-              <Stat label="IT load" value={fmt(aidcDerived.itKW / 1000, 2)} unit="MW" />
-              <Stat label="Cooling at design" value={fmt(aidcDerived.coolingDesignKW / 1000, 2)} unit="MW" tone="cyan" />
-              <Stat label="Other overhead" value={fmt(aidcDerived.otherKW / 1000, 2)} unit="MW" />
-              <Stat label={`Annualised PUE (design ${fmt(aidc.designPUE, 2)})`} value={fmt(aidcDerived.annualisedPUE, 3)} unit="—" tone="emerald" />
-              <Stat label="Load at design ambient" value={fmt(aidcOut.designPeakMW, 2)} unit="MW" tone="amber" />
-              <Stat label="Largest load step" value={fmt(aidcOut.stepKW / 1000, 2)} unit="MW" tone="rose" />
+              <Stat label="Mean load" value={fmt(stats.meanKW / 1000, 2)} unit="MW" />
+              <Stat label="Peak hour" value={`${dayLabel(cal.doy[stats.peakHour])} ${String(cal.hourOfDay[stats.peakHour]).padStart(2, "0")}h`} unit="" tone="amber" />
+              <Stat label="Peak-to-base ratio" value={fmt(stats.peakKW / (stats.minKW || 1), 2)} unit="×" />
+              <Stat label="Hours above 90 % peak" value={fmt(Array.from(load).filter((v) => v > 0.9 * stats.peakKW).length, 0)} unit="h/yr" />
+              <Stat label="PV yield in use" value={fmt(loc.specificYield_kWh_per_kWp, 0)} unit="kWh/kWp" tone={resourceSource.pv === "site" ? "emerald" : "amber"} />
+              <Stat label="Resource source" value={resourceSource.pv === "site" ? "site" : "library"} unit="" tone={resourceSource.pv === "site" ? "emerald" : "amber"} />
             </div>
-            <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-6">
-              <Stat label="Firm capacity requirement" value={fmt(aidcOut.firmMW, 2)} unit="MW" tone="amber" />
-              <Stat label="Peak, typical year" value={fmt(aidcOut.peakMW, 2)} unit="MW" />
-              <Stat label="PV cap from land" value={fmt(aidcOut.maxKWp / 1000, 2)} unit="MWp" tone="cyan" />
-              <Stat label="BESS cap from area" value={fmt(aidcOut.maxBessMW, 1)} unit="MW" tone="violet" />
-              <Stat label="Engine cap from area" value={fmt(aidcOut.maxEngineMW, 1)} unit="MW" />
-              <Stat label="Engine hours permitted" value={fmt(aidc.engineHoursLimit, 0)} unit="h/yr" />
-            </div>
-
-            <p className="mt-2 text-xs text-slate-500">
-              IT and cooling are both treated as non-sheddable. Criticality is pre-filled at {fmt(aidcOut.critPct, 0)} % of mean load and can be overridden below.
-              €/MW IT capex, LCOE per MWh delivered to IT, time-to-power and the 2N single-point-of-failure check are produced in Phases 4 and 5.
-            </p>
           </Panel>
-        )}
 
-        {/* 2. LOAD INPUT — standard mode */}
-        {mode === "standard" && (
-          <Panel title="Load input" step="2"
-            right={
-              <div className="flex overflow-hidden rounded border border-slate-700">
-                {[["csv", "Upload CSV"], ["parametric", "Parametric"]].map(([k, l]) => (
-                  <button key={k} onClick={() => setLoadCfg((s) => ({ ...s, path: k }))}
-                    className={`px-3 py-1 text-xs ${loadCfg.path === k ? "bg-cyan-900 text-cyan-200" : "bg-slate-900 text-slate-400"}`}>{l}</button>
-                ))}
-              </div>
-            }>
-            {loadCfg.path === "csv" ? (
-              <div className="space-y-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <button onClick={() => fileRef.current?.click()} className="rounded border border-cyan-700 bg-cyan-950 px-3 py-1 text-xs text-cyan-200">Choose a CSV file</button>
-                  <input ref={fileRef} type="file" accept=".csv,.txt" className="hidden" onChange={onLoadFile} />
-                  <span className="text-xs text-slate-500">Accepts timestamp + kW, or kWh per interval. 15-minute and 30-minute data are averaged to hourly.</span>
-                </div>
-                {csvResult?.error && <div className="rounded border border-rose-700 bg-rose-950 px-2 py-1 text-xs text-rose-200">{csvResult.error}</div>}
-                {csvResult?.notes && (
-                  <div className="rounded border border-slate-800 bg-slate-950 p-2">
-                    <div className="mb-1 text-xs uppercase tracking-wide text-slate-500">What was parsed and what was fixed</div>
-                    <ul className="space-y-0.5">
-                      {csvResult.notes.map((n, i) => <li key={i} className="font-mono text-xs text-slate-400">· {n}</li>)}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                <Field label="Annual energy" unit="MWh/yr"><Num value={loadCfg.annualEnergyMWh} step={100} onChange={(v) => setLoadCfg((s) => ({ ...s, annualEnergyMWh: v }))} /></Field>
-                <Field label="Peak demand" unit="kW"><Num value={loadCfg.peakKW} step={50} onChange={(v) => setLoadCfg((s) => ({ ...s, peakKW: v }))} /></Field>
-                <Field label="Base / minimum load" unit="kW"><Num value={loadCfg.baseKW} step={50} onChange={(v) => setLoadCfg((s) => ({ ...s, baseKW: v }))} /></Field>
-                <Field label="Profile shape" unit="—">
-                  <Sel value={loadCfg.shapeKey} onChange={(v) => setLoadCfg((s) => ({ ...s, shapeKey: v }))}
-                    options={Object.entries(LOAD_SHAPES).map(([k, v]) => ({ value: k, label: v.label }))} />
-                </Field>
-                <Field label="Seasonal weighting" unit="± %"><Num value={loadCfg.seasonality} onChange={(v) => setLoadCfg((s) => ({ ...s, seasonality: v }))} /></Field>
-                <Field label="Season peaking" unit="—">
-                  <Sel value={loadCfg.seasonalPeak} onChange={(v) => setLoadCfg((s) => ({ ...s, seasonalPeak: v }))}
-                    options={[{ value: "winter", label: "Winter peaking" }, { value: "summer", label: "Summer peaking" }, { value: "none", label: "No seasonality" }]} />
-                </Field>
-                <Field label="Weekend factor" unit="× weekday"><Num value={loadCfg.weekendFactor} step={0.05} onChange={(v) => setLoadCfg((s) => ({ ...s, weekendFactor: v }))} /></Field>
-                <Field label="Shape exponent γ solved" unit="—" hint="load = base + (peak − base) · shape^γ">
-                  <input className={inputCls} value={fmt(synth?.gamma, 3)} readOnly />
-                </Field>
-                {loadCfg.shapeKey === "custom" && (
-                  <div className="md:col-span-4">
-                    <div className="mb-1 text-xs text-slate-400">Custom hourly factors, 0–1</div>
-                    {[["customWeekday", "Weekday"], ["customWeekend", "Weekend"]].map(([key, lbl]) => (
-                      <div key={key} className="mb-2">
-                        <div className="mb-0.5 font-mono text-xs text-slate-600">{lbl}</div>
-                        <div className="grid grid-cols-12 gap-0.5">
-                          {loadCfg[key].map((v, i) => (
-                            <input key={i} type="number" step={0.05} min={0} max={1} value={v}
-                              className="w-full rounded border border-slate-800 bg-slate-950 px-0.5 py-0.5 text-center font-mono text-xs text-slate-300"
-                              onChange={(e) => setLoadCfg((s) => { const a = [...s[key]]; a[i] = Number(e.target.value); return { ...s, [key]: a }; })} />
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </Panel>
-        )}
-
-        {/* LOAD CHARACTERISATION */}
-        <Panel title="Load characterisation" step={mode === "aidc" ? "1A·2" : "2B"} sub="separate inputs — not derivable from the profile">
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-            <Field label="Critical load (served in island)" unit="% of load">
-              <Num value={char.critPct} onChange={(v) => setChar((s) => ({ ...s, critPct: v, touched: true }))} />
-            </Field>
-            <Field label="Sheddable tier 1" unit="% of load"><Num value={char.shed1Pct} onChange={(v) => setChar((s) => ({ ...s, shed1Pct: v, touched: true }))} /></Field>
-            <Field label="Sheddable tier 2" unit="% of load"><Num value={char.shed2Pct} onChange={(v) => setChar((s) => ({ ...s, shed2Pct: v, touched: true }))} /></Field>
-            <Field label="Critical load at peak" unit="kW">
-              <input className={inputCls} readOnly value={fmt(stats.peakKW * char.critPct / 100, 0)} />
-            </Field>
-
-            <Field label="Largest single load step" unit="kW" hint={mode === "aidc" ? "pre-filled from the compute swing" : "drives the dynamic adequacy check"}>
-              <Num value={mode === "aidc" && !char.touched ? Math.round(aidcOut.stepKW) : char.stepKW}
-                onChange={(v) => setChar((s) => ({ ...s, stepKW: v, touched: true }))} step={10} />
-            </Field>
-            <Field label="Largest motor start" unit="kW"><Num value={char.motorKW} step={10} onChange={(v) => setChar((s) => ({ ...s, motorKW: v, touched: true }))} /></Field>
-            <Field label="Starting method" unit="—">
-              <Sel value={char.motorMethod} onChange={(v) => setChar((s) => ({ ...s, motorMethod: v }))}
-                options={[{ value: "DOL", label: "Direct on line" }, { value: "SOFT", label: "Soft starter" }, { value: "VSD", label: "VSD" }]} />
-            </Field>
-            <Field label="Parasitic / auxiliary load" unit={char.parasiticMode === "pct" ? "% of mean" : "kW"}
-              hint="included in the island load, never omitted">
-              <div className="flex gap-1">
-                <Sel value={char.parasiticMode} onChange={(v) => setChar((s) => ({ ...s, parasiticMode: v }))}
-                  options={[{ value: "pct", label: "%" }, { value: "kw", label: "kW" }]} />
-                {char.parasiticMode === "pct"
-                  ? <Num value={char.parasiticPct} onChange={(v) => setChar((s) => ({ ...s, parasiticPct: v }))} />
-                  : <Num value={char.parasiticKW} step={10} onChange={(v) => setChar((s) => ({ ...s, parasiticKW: v }))} />}
-              </div>
-            </Field>
-          </div>
-          <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">
-            <Stat label="Parasitic load" value={fmt(parasiticKW, 0)} unit="kW" />
-            <Stat label="Island load at peak (critical + parasitic)" value={fmt((stats.peakKW * char.critPct / 100 + parasiticKW) / 1000, 2)} unit="MW" tone="amber" />
-            <Stat label={`Energy for ${fmt(ctx.autonomyH, 0)} h at critical load`} value={fmt(stats.peakKW * char.critPct / 100 * ctx.autonomyH / 1000, 2)} unit="MWh" tone="violet" />
-            <Stat label="Autonomy required" value={fmt(ctx.autonomyH, 0)} unit="h" />
-          </div>
-        </Panel>
-
-        {/* LOAD PROFILE CHARTS */}
-        <Panel title="Load profile" step="1C"
-          right={
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex overflow-hidden rounded border border-slate-700">
-                {[["day", "Day"], ["week", "Week"], ["month", "Month"], ["year", "Year"]].map(([k, l]) => (
-                  <button key={k} onClick={() => setView((s) => ({ ...s, span: k }))}
-                    className={`px-2 py-1 text-xs ${view.span === k ? "bg-cyan-900 text-cyan-200" : "bg-slate-900 text-slate-400"}`}>{l}</button>
-                ))}
-              </div>
-              {view.span !== "year" && (
-                <input type="range" min={0} max={364} value={view.startDay} className="w-40"
-                  onChange={(e) => setView((s) => ({ ...s, startDay: Number(e.target.value) }))} />
-              )}
-              <span className="font-mono text-xs text-slate-500">{view.span === "year" ? "daily mean" : `from ${dayLabel(view.startDay)}`}</span>
-            </div>
-          }>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={series} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
-                <CartesianGrid stroke="#1e293b" vertical={false} />
-                <XAxis dataKey="t" tick={chartAxis} minTickGap={40} />
-                <YAxis yAxisId="l" tick={chartAxis} label={{ value: "kW", angle: -90, position: "insideLeft", fill: "#475569", fontSize: 10 }} />
-                <YAxis yAxisId="r" orientation="right" tick={chartAxis} />
-                <Tooltip contentStyle={tipStyle} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Area yAxisId="l" type="monotone" dataKey="load" name="Load (kW)" stroke="#22d3ee" fill="#0e7490" fillOpacity={0.35} />
-                <Line yAxisId="r" type="monotone" dataKey="temp" name="Dry bulb (°C)" stroke="#f59e0b" dot={false} strokeWidth={1} />
-                <Line yAxisId="r" type="monotone" dataKey="pv" name="PV (kW/kWp)" stroke="#a78bfa" dot={false} strokeWidth={1} />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
-
-          <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-            <div>
-              <div className="mb-1 text-xs text-slate-500">Load duration curve — kW against % of hours exceeded</div>
-              <div className="h-48">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={ldc} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
-                    <CartesianGrid stroke="#1e293b" />
-                    <XAxis dataKey="pct" tick={chartAxis} unit="%" />
-                    <YAxis tick={chartAxis} />
-                    <Tooltip contentStyle={tipStyle} />
-                    <ReferenceLine y={stats.meanKW} stroke="#64748b" strokeDasharray="3 3" label={{ value: "mean", fill: "#64748b", fontSize: 10 }} />
-                    {mode === "aidc" && ctx.gridStatus !== "none" && (
-                      <ReferenceLine y={ctx.importCapKW} stroke="#f43f5e" strokeDasharray="4 2" label={{ value: "import cap", fill: "#f43f5e", fontSize: 10 }} />
-                    )}
-                    <Line type="monotone" dataKey="kW" stroke="#22d3ee" dot={false} strokeWidth={1.5} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-            <div>
-              <div className="mb-1 text-xs text-slate-500">Monthly energy — load (MWh) against PV yield (kWh/kWp)</div>
-              <div className="h-48">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={monthlyChart} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
-                    <CartesianGrid stroke="#1e293b" vertical={false} />
-                    <XAxis dataKey="m" tick={chartAxis} />
-                    <YAxis yAxisId="l" tick={chartAxis} />
-                    <YAxis yAxisId="r" orientation="right" tick={chartAxis} />
-                    <Tooltip contentStyle={tipStyle} />
-                    <Legend wrapperStyle={{ fontSize: 11 }} />
-                    <Bar yAxisId="l" dataKey="load" name="Load (MWh)" fill="#0e7490" />
-                    <Bar yAxisId="r" dataKey="yield" name="PV (kWh/kWp)" fill="#f59e0b" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-6">
-            <Stat label="Mean load" value={fmt(stats.meanKW / 1000, 2)} unit="MW" />
-            <Stat label="Peak hour" value={`${dayLabel(cal.doy[stats.peakHour])} ${String(cal.hourOfDay[stats.peakHour]).padStart(2, "0")}h`} unit="" tone="amber" />
-            <Stat label="Peak-to-base ratio" value={fmt(stats.peakKW / (stats.minKW || 1), 2)} unit="×" />
-            <Stat label="Hours above 90 % peak" value={fmt(Array.from(load).filter((v) => v > 0.9 * stats.peakKW).length, 0)} unit="h/yr" />
-            <Stat label="PV yield in use" value={fmt(loc.specificYield_kWh_per_kWp, 0)} unit="kWh/kWp" tone={resourceSource.pv === "site" ? "emerald" : "amber"} />
-            <Stat label="Resource source" value={resourceSource.pv === "site" ? "site" : "library"} unit="" tone={resourceSource.pv === "site" ? "emerald" : "amber"} />
-          </div>
-        </Panel>
-
-        <footer className="border-t border-slate-800 pt-2 text-xs text-slate-500">
-          Phase 1 complete: project context, location and resource library with upload, both load paths and the AIDC derivation.
-          Next — Phase 2: PV, wind, BESS, engine and turbine inputs, generation profiles, the priority-based dispatch engine, and the hourly table with reason codes.
-        </footer>
+          <footer className={`border-t pt-2 text-xs ${T.rule} ${T.faint}`}>
+            Phase 1 of 6 complete. Next — Phase 2: PV, wind, BESS, engine and turbine inputs, generation profiles, the priority-based dispatch engine, and the hourly table with reason codes.
+          </footer>
+        </div>
       </div>
-    </div>
+    </ThemeCtx.Provider>
   );
 }
