@@ -159,6 +159,23 @@ export const CONSTANTS = {
   TOU_OFFPEAK_MULTIPLIER: 0.6,          // ×       of the base import tariff
   ARBITRAGE_CHARGE_THRESHOLD: 0.8,      // ×       charge from grid below this × mean price
 
+  /* --- Adequacy assessment (Phase 3) -------------------------------------
+     Dynamic adequacy is assessed in island mode, because that is the condition
+     in which the microgrid has to survive a step on its own inertia.          */
+  NOMINAL_FREQUENCY_HZ: 50,             // Hz
+  INERTIA_H_ENGINE_S: 1.5,              // s       inertia constant of a genset, on its own MVA base
+  INERTIA_H_TURBINE_S: 5.0,             // s       aeroderivative gas turbine
+  GENERATOR_POWER_FACTOR: 0.9,          // -       kW → kVA for the inertia base
+  GOVERNOR_RESPONSE_TIME_S: 1.5,        // s       time to arrest frequency with fuel valve response
+  ROCOF_PASS_HZ_PER_S: 1.0,             // Hz/s    below this the step is comfortable
+  ROCOF_MARGINAL_HZ_PER_S: 2.0,         // Hz/s    typical loss-of-mains protection setting
+  FREQ_NADIR_PASS_HZ: 1.0,              // Hz      ±2 % of 50 Hz
+  FREQ_NADIR_MARGINAL_HZ: 2.0,          // Hz      ±4 %, beyond which load shedding is expected
+  MOTOR_INRUSH_FACTOR: { DOL: 6.0, SOFT: 3.0, VSD: 1.1 }, // × rated kW, starting current as apparent power
+  UNSERVED_ENERGY_TOLERANCE_PCT: 0.01,  // %       of annual load treated as a pass
+  LOW_RENEWABLE_WINDOW_H: 72,           // h       window used to find the worst renewable spell
+  N_MINUS_1_MARGIN_PCT: 0,              // %       required headroom after losing the largest unit
+
   /* --- Cost defaults library (EUR, EU markets) — surfaced in Phase 4 -----
      Held here so that every coefficient in the tool sits in one place.     */
   COST_DEFAULTS: {
@@ -1086,6 +1103,200 @@ function dispatch(cfg) {
 }
 
 /* ============================================================================
+   PHASE 3 ENGINE — adequacy checks
+   Three independent verdicts. They are never combined into a single score:
+   a design that fails dynamic adequacy is not viable because energy passes.
+   ========================================================================== */
+
+const verdict = (pass, marginal) => (pass ? "PASS" : marginal ? "MARGINAL" : "FAIL");
+
+/**
+ * 1. ENERGY ADEQUACY — is there enough energy over the year, and enough stored
+ *    energy to ride through the required island?
+ */
+function assessEnergyAdequacy(a) {
+  const { disp, load, cal, bess, ctx, islandLoadKW, engineFirmKW } = a;
+  const s = disp.summary;
+
+  const unservedPct = s.loadMWh > 0 ? 100 * s.unservedMWh / s.loadMWh : 0;
+  const shedMWh = s.shed1MWh + s.shed2MWh;
+
+  // Stored energy available for an island, in kWh at the busbar.
+  // Unplanned islanding can only use what the reserve holds; planned islanding
+  // can charge to the top of the SOC window first.
+  const effOneWay = Math.sqrt(bess.rteFraction);
+  const usableWindowPct = ctx.islanding === "planned"
+    ? bess.socMaxPct - bess.socMinPct
+    : Math.max(0, bess.reserveSocPct - bess.socMinPct);
+  const islandKWh = bess.enabled ? bess.energyKWh * usableWindowPct / 100 * effOneWay : 0;
+  const autonomyFromBessH = islandLoadKW > 0 ? islandKWh / islandLoadKW : 0;
+  const enginesCarryIsland = engineFirmKW >= islandLoadKW;
+
+  // Worst renewable spell — the window where renewables cover least of the load.
+  const W = CONSTANTS.LOW_RENEWABLE_WINDOW_H;
+  let bestGen = 0, bestLoad = 0, worstRatio = Infinity, worstStart = 0;
+  let genSum = 0, loadSum = 0;
+  for (let i = 0; i < H; i++) {
+    genSum += disp.pv[i] + disp.wind[i];
+    loadSum += load[i];
+    if (i >= W) { genSum -= disp.pv[i - W] + disp.wind[i - W]; loadSum -= load[i - W]; }
+    if (i >= W - 1 && loadSum > 0) {
+      const ratio = genSum / loadSum;
+      if (ratio < worstRatio) { worstRatio = ratio; worstStart = i - W + 1; bestGen = genSum; bestLoad = loadSum; }
+    }
+  }
+  const worstDeficitMWh = (bestLoad - bestGen) / 1000;
+
+  const autonomyOK = ctx.islanding === "none" || autonomyFromBessH >= ctx.autonomyH || enginesCarryIsland;
+  const energyOK = unservedPct <= CONSTANTS.UNSERVED_ENERGY_TOLERANCE_PCT;
+  const pass = energyOK && autonomyOK;
+  const marginal = energyOK && !autonomyOK && autonomyFromBessH >= ctx.autonomyH * 0.75;
+
+  return {
+    verdict: verdict(pass, marginal),
+    governing: !energyOK
+      ? `${s.unservedMWh.toFixed(1)} MWh/yr unserved (${unservedPct.toFixed(3)} % of load)`
+      : !autonomyOK
+        ? `${autonomyFromBessH.toFixed(1)} h autonomy against ${ctx.autonomyH} h required`
+        : `${s.unservedMWh.toFixed(2)} MWh unserved, ${autonomyFromBessH.toFixed(1)} h autonomy`,
+    unservedMWh: s.unservedMWh, unservedPct, shedMWh,
+    autonomyFromBessH, autonomyRequiredH: ctx.autonomyH, islandKWh, islandLoadKW,
+    enginesCarryIsland, engineFirmKW,
+    worstWindowH: W, worstRenewableShare: worstRatio === Infinity ? 0 : worstRatio,
+    worstWindowStart: worstStart, worstDeficitMWh,
+    worstWindowLabel: `${dayLabel(cal.doy[worstStart])} ${String(cal.hourOfDay[worstStart]).padStart(2, "0")}h`,
+  };
+}
+
+/**
+ * 2. POWER ADEQUACY — firm capacity against coincident peak, with N-1 applied.
+ *    Renewables contribute no firm capacity. The battery contributes its rated
+ *    power only while it holds energy, which is flagged rather than assumed.
+ */
+function assessPowerAdequacy(a) {
+  const { peakKW, parasiticKW, grid, bess, engine, turbine, gridFormingSource } = a;
+  const coincidentPeakKW = peakKW + parasiticKW;
+
+  const units = [];
+  if (grid.enabled) units.push({ name: "Grid connection", kW: grid.firmCapKW, kind: "grid", gridForming: gridFormingSource === "grid" });
+  if (engine.enabled) for (let i = 0; i < engine.units; i++)
+    units.push({ name: `Engine unit ${i + 1}`, kW: engine.unitKW, kind: "engine", gridForming: false });
+  if (turbine.enabled) units.push({ name: "Gas turbine", kW: turbine.ratedKW, kind: "turbine", gridForming: false });
+  if (bess.enabled) units.push({ name: "BESS", kW: bess.powerKW, kind: "bess", gridForming: gridFormingSource === "bess" });
+
+  const firmKW = units.reduce((t, u) => t + u.kW, 0);
+  const largest = units.reduce((m, u) => (u.kW > (m?.kW || 0) ? u : m), null);
+  const firmAfterN1KW = firmKW - (largest?.kW || 0);
+  const marginKW = firmAfterN1KW - coincidentPeakKW;
+
+  const losesGridForming = !!largest?.gridForming;
+  const pass = marginKW >= coincidentPeakKW * CONSTANTS.N_MINUS_1_MARGIN_PCT / 100 && !losesGridForming;
+  const marginal = marginKW >= 0 && losesGridForming;
+
+  return {
+    verdict: verdict(pass, marginal),
+    governing: marginKW < 0
+      ? `${(marginKW / 1000).toFixed(2)} MW short after losing ${largest?.name}`
+      : losesGridForming
+        ? `${(marginKW / 1000).toFixed(2)} MW spare, but losing ${largest?.name} also loses the grid-forming source`
+        : `${(marginKW / 1000).toFixed(2)} MW spare after losing ${largest?.name}`,
+    coincidentPeakKW, parasiticKW, firmKW, firmAfterN1KW, marginKW,
+    largestUnit: largest, losesGridForming, units,
+  };
+}
+
+/**
+ * 3. DYNAMIC ADEQUACY — can the island absorb the largest load step and the
+ *    largest motor start without an unacceptable frequency excursion?
+ *
+ *    RoCoF = ΔP · f₀ / (2 · Σ Hᵢ·Sᵢ)   with the step net of instantaneous
+ *    grid-forming response. Nadir is estimated as RoCoF × governor response
+ *    time — a first-order figure, not a substitute for an EMT study.
+ */
+function assessDynamicAdequacy(a) {
+  const { stepKW, motorKW, motorMethod, bess, engine, turbine, islanded, disp, islandLoadKW } = a;
+
+  // Units expected to be online when the step arrives. Two sources: the most
+  // the dispatch ever ran, and — in an island — the number needed to carry the
+  // critical load, because those units are necessarily running and their step
+  // acceptance is therefore available. Taking only the dispatch maximum would
+  // credit one engine in a grid-connected year and fail a design that is fine.
+  let maxEnginesOn = 0;
+  for (let i = 0; i < H; i++) if (disp.enginesOn[i] > maxEnginesOn) maxEnginesOn = disp.enginesOn[i];
+  const neededForIsland = islanded && engine.enabled && engine.unitKW > 0
+    ? Math.min(engine.units, Math.ceil(islandLoadKW / engine.unitKW)) : 0;
+  const enginesOnline = engine.enabled ? Math.min(engine.units, Math.max(maxEnginesOn, neededForIsland)) : 0;
+
+  // Fast response available, kW
+  const bessStepKW = bess.enabled && bess.gridForming ? bess.powerKW * bess.gridFormingStepPct / 100 : 0;
+  const engineStepKW = engine.enabled ? enginesOnline * engine.unitKW * engine.stepAcceptancePct / 100 : 0;
+  const turbineStepKW = turbine.enabled ? turbine.ratedKW * CONSTANTS.ENGINE_STEP_ACCEPTANCE_PCT / 100 : 0;
+  const fastResponseKW = bessStepKW + engineStepKW + turbineStepKW;
+
+  // Motor starting appears as apparent power, several times its rating
+  const inrush = CONSTANTS.MOTOR_INRUSH_FACTOR[motorMethod] || 6;
+  const motorStepKW = motorKW * inrush;
+  const worstStepKW = Math.max(stepKW, motorStepKW);
+
+  // System inertia — only rotating plant contributes. A grid-forming battery
+  // supplies power fast but no stored kinetic energy.
+  const engineMVA = enginesOnline * engine.unitKW / CONSTANTS.GENERATOR_POWER_FACTOR / 1000;
+  const turbineMVA = turbine.enabled ? turbine.ratedKW / CONSTANTS.GENERATOR_POWER_FACTOR / 1000 : 0;
+  const inertiaMWs = engineMVA * CONSTANTS.INERTIA_H_ENGINE_S + turbineMVA * CONSTANTS.INERTIA_H_TURBINE_S;
+
+  const deficitMW = Math.max(0, worstStepKW - fastResponseKW) / 1000;
+  const rocof = inertiaMWs > 0 ? deficitMW * CONSTANTS.NOMINAL_FREQUENCY_HZ / (2 * inertiaMWs) : (deficitMW > 0 ? Infinity : 0);
+  const nadirHz = rocof === Infinity ? Infinity : rocof * CONSTANTS.GOVERNOR_RESPONSE_TIME_S;
+
+  const pass = !islanded || (deficitMW <= 0 && rocof <= CONSTANTS.ROCOF_PASS_HZ_PER_S)
+    || (rocof <= CONSTANTS.ROCOF_PASS_HZ_PER_S && nadirHz <= CONSTANTS.FREQ_NADIR_PASS_HZ);
+  const marginal = !pass && rocof <= CONSTANTS.ROCOF_MARGINAL_HZ_PER_S && nadirHz <= CONSTANTS.FREQ_NADIR_MARGINAL_HZ;
+
+  return {
+    verdict: islanded ? verdict(pass, marginal) : "PASS",
+    governing: !islanded
+      ? "Grid-connected — the network absorbs the step; island case not required"
+      : deficitMW <= 0
+        ? `${(worstStepKW / 1000).toFixed(2)} MW step fully covered by ${(fastResponseKW / 1000).toFixed(2)} MW of fast response`
+        : `${(deficitMW).toFixed(2)} MW uncovered → RoCoF ${rocof === Infinity ? "no inertia" : rocof.toFixed(2) + " Hz/s"}, nadir ${nadirHz === Infinity ? "collapse" : "−" + nadirHz.toFixed(2) + " Hz"}`,
+    worstStepKW, loadStepKW: stepKW, motorStepKW, motorMethod, inrush,
+    fastResponseKW, bessStepKW, engineStepKW, turbineStepKW,
+    enginesOnline, inertiaMWs, deficitMW, rocof, nadirHz, islanded,
+  };
+}
+
+/** Bill of materials — quantities only. Costs arrive in Phase 4. */
+function buildBOM(a) {
+  const { res, ctx, grid, disp, aidcLimits } = a;
+  const rows = [];
+  if (res.pv.enabled) {
+    rows.push({ item: "PV array", qty: 1, rating: `${(res.pv.kWp / 1000).toFixed(2)} MWp DC`, note: `DC/AC ${res.pv.dcacRatio.toFixed(2)}` });
+    rows.push({ item: "PV inverters", qty: 1, rating: `${(res.pv.kWp / res.pv.dcacRatio / 1000).toFixed(2)} MW AC`, note: `${disp.summary.pvMWh.toFixed(0)} MWh/yr generated` });
+  }
+  if (res.wind.enabled) rows.push({ item: "Wind turbines", qty: 1, rating: `${(res.wind.ratedKW / 1000).toFixed(2)} MW`, note: `hub ${res.wind.hubHeightM} m` });
+  if (res.bess.enabled) {
+    rows.push({ item: "BESS power conversion", qty: 1, rating: `${(res.bess.powerKW / 1000).toFixed(2)} MW`, note: res.bess.gridForming ? "grid-forming" : "grid-following" });
+    rows.push({ item: "BESS energy", qty: 1, rating: `${(res.bess.energyKWh / 1000).toFixed(2)} MWh`, note: `${(res.bess.energyKWh / Math.max(1, res.bess.powerKW)).toFixed(2)} h duration, ${disp.summary.equivalentFullCycles.toFixed(0)} EFC/yr` });
+  }
+  if (res.engine.enabled) rows.push({ item: `${res.engine.fuelType === "gas" ? "Gas" : "Diesel"} engines`, qty: res.engine.units, rating: `${(res.engine.unitKW / 1000).toFixed(2)} MW each`, note: `${(res.engine.units * res.engine.unitKW / 1000).toFixed(2)} MW total, ${disp.summary.engineHours} h/yr` });
+  if (res.turbine.enabled) rows.push({ item: "Gas turbine", qty: 1, rating: `${(res.turbine.ratedKW / 1000).toFixed(2)} MW site-rated`, note: "not ISO rating" });
+  if (grid.enabled) rows.push({ item: "Grid connection", qty: 1, rating: `${(grid.firmCapKW / 1000).toFixed(2)} MW import`, note: `${(ctx.exportCapKW / 1000).toFixed(2)} MW export, peak used ${(disp.summary.peakImportKW / 1000).toFixed(2)} MW` });
+
+  const pvArea = res.pv.enabled ? res.pv.kWp * (aidcLimits?.pvAreaPerKWp || CONSTANTS.PV_AREA_M2_PER_KWP) : 0;
+  const bessArea = res.bess.enabled ? res.bess.powerKW / 1000 * (aidcLimits?.bessFootprint || CONSTANTS.BESS_FOOTPRINT_M2_PER_MW) : 0;
+  const engineArea = res.engine.enabled ? res.engine.units * res.engine.unitKW / 1000 * (aidcLimits?.engineFootprint || CONSTANTS.ENGINE_FOOTPRINT_M2_PER_MW) : 0;
+
+  return {
+    rows,
+    installedMW: ((res.pv.enabled ? res.pv.kWp / res.pv.dcacRatio : 0) + (res.wind.enabled ? res.wind.ratedKW : 0)
+      + (res.bess.enabled ? res.bess.powerKW : 0) + (res.engine.enabled ? res.engine.units * res.engine.unitKW : 0)
+      + (res.turbine.enabled ? res.turbine.ratedKW : 0)) / 1000,
+    pvAreaM2: pvArea, bessAreaM2: bessArea, engineAreaM2: engineArea,
+    totalAreaM2: pvArea + bessArea + engineArea,
+  };
+}
+
+/* ============================================================================
    THEME
    Two palettes. Tailwind's dark: variant needs a build-config change, so the
    palette is resolved in JS instead and passed down through context. Every
@@ -1285,6 +1496,12 @@ function Notices({ items }) {
   );
 }
 
+function Badge({ v }) {
+  const T = useT();
+  const cls = v === "PASS" ? T.chipOk : v === "MARGINAL" ? T.chipWarn : T.notice.fail;
+  return <span className={`rounded border px-2 py-0.5 font-mono text-xs ${cls}`}>{v}</span>;
+}
+
 function Seg({ value, onChange, options }) {
   const T = useT();
   return (
@@ -1297,10 +1514,20 @@ function Seg({ value, onChange, options }) {
   );
 }
 
+export const TABS = [
+  { n: 1, title: "Project context",              sub: "drives defaults and which adequacy check binds" },
+  { n: 2, title: "Location and resource",        sub: "LCOE moves more with yield than with equipment price" },
+  { n: 3, title: "Load",                         sub: "measured, synthesised, or derived from a capacity target" },
+  { n: 4, title: "Resources",                    sub: "what the dispatch has available" },
+  { n: 5, title: "Dispatch",                     sub: "deterministic priority merit order — every hour is readable" },
+  { n: 6, title: "Adequacy",                     sub: "three independent verdicts" },
+  { n: 7, title: "Sizing and bill of materials", sub: "quantities only — pricing arrives in Phase 4" },
+];
+
 const PHASES = [
   { n: 1, label: "Context · resource · load", done: true },
   { n: 2, label: "Resources · dispatch engine", done: true },
-  { n: 3, label: "Adequacy · BOM", done: false },
+  { n: 3, label: "Adequacy · BOM", done: true },
   { n: 4, label: "Costs · LCOE", done: false },
   { n: 5, label: "Auto-size · AIDC ramp", done: false },
   { n: 6, label: "Financials · scenarios · Excel", done: false },
@@ -1368,6 +1595,7 @@ export default function MicrogridDesignTool() {
 
   const [view, setView] = useState({ span: "week", startDay: 172 });
   const [reasonFilter, setReasonFilter] = useState(-1);
+  const [tab, setTab] = useState(0);
 
   const [res, setRes] = useState({
     pv: { enabled: true, kWp: 10000, dcacRatio: CONSTANTS.PV_DCAC_RATIO_DEFAULT, soilingPct: CONSTANTS.PV_SOILING_PCT,
@@ -1514,6 +1742,7 @@ export default function MicrogridDesignTool() {
   }, [ctx.gridStatus, ctx.flexPctHours, load]);
 
   const reserveApplies = ctx.islanding !== "none" && ctx.gridStatus !== "none";
+  const parasiticKWval = char.parasiticMode === "pct" ? stats.meanKW * char.parasiticPct / 100 : char.parasiticKW;
 
   // A phased connection steps up over time. The cap in force is the last step
   // whose year has been reached — using the base cap in every year would
@@ -1580,6 +1809,43 @@ export default function MicrogridDesignTool() {
     }
     return rows;
   }, [disp, load, cal, view, reasonFilter]);
+
+  /* --- Phase 3: adequacy ------------------------------------------------- */
+  const gridForBom = {
+    enabled: ctx.gridStatus !== "none" && !(mode === "aidc" && aidc.gridStrategy === "offgrid"),
+    // A non-firm connection contributes only its curtailed capacity as firm.
+    firmCapKW: ctx.gridStatus === "flexible" ? ctx.flexReducedCapKW : effectiveImportCapKW,
+  };
+
+  const adeq = useMemo(() => {
+    const islandLoadKW = stats.peakKW * char.critPct / 100 + parasiticKWval;
+    const engineFirmKW = (res.engine.enabled ? res.engine.units * res.engine.unitKW : 0)
+      + (res.turbine.enabled ? res.turbine.ratedKW : 0);
+    const gridFormingSource = res.bess.enabled && res.bess.gridForming ? "bess"
+      : gridForBom.enabled ? "grid" : "engine";
+    const islanded = ctx.islanding !== "none" || ctx.gridStatus === "none"
+      || (mode === "aidc" && aidc.gridStrategy === "offgrid");
+    return {
+      energy: assessEnergyAdequacy({
+        disp, load, cal, bess: { ...res.bess, rteFraction: res.bess.rtePct / 100 },
+        ctx, islandLoadKW, engineFirmKW,
+      }),
+      power: assessPowerAdequacy({
+        peakKW: stats.peakKW, parasiticKW: parasiticKWval, grid: gridForBom,
+        bess: res.bess, engine: res.engine, turbine: res.turbine, gridFormingSource,
+      }),
+      dynamic: assessDynamicAdequacy({
+        stepKW: mode === "aidc" && !char.touched && aidcOut ? aidcOut.stepKW : char.stepKW,
+        motorKW: char.motorKW, motorMethod: char.motorMethod,
+        bess: res.bess, engine: res.engine, turbine: res.turbine, islanded, disp, islandLoadKW,
+      }),
+    };
+  }, [disp, load, cal, res, ctx, stats, char, mode, aidc, aidcOut, gridForBom.enabled, gridForBom.firmCapKW, parasiticKWval]);
+
+  const bom = useMemo(() => buildBOM({
+    res, ctx, grid: gridForBom, disp,
+    aidcLimits: mode === "aidc" ? { pvAreaPerKWp: aidc.pvAreaPerKWp, bessFootprint: aidc.bessFootprint, engineFootprint: aidc.engineFootprint } : null,
+  }), [res, ctx, gridForBom.enabled, gridForBom.firmCapKW, disp, mode, aidc]);
 
   const monthlyChart = useMemo(() => stats.monthlyMWh.map((v, i) => ({
     m: MONTHS[i], load: +v.toFixed(0),
@@ -1655,7 +1921,7 @@ export default function MicrogridDesignTool() {
     { label: "Engine cap from area", expr: `${fmt(aidc.landEngine_m2, 0)} m² ÷ ${fmt(aidc.engineFootprint, 0)} m²/MW`, result: `${fmt(aidcOut.maxEngineMW, 1)} MW max` },
   ] : [];
 
-  const parasiticKW = char.parasiticMode === "pct" ? stats.meanKW * char.parasiticPct / 100 : char.parasiticKW;
+  const parasiticKW = parasiticKWval;
   const axis = { stroke: T.chart.axis, fontSize: 10 };
   const tip = { backgroundColor: T.chart.tipBg, border: `1px solid ${T.chart.tipBorder}`, borderRadius: 4, fontSize: 11 };
 
@@ -1678,18 +1944,23 @@ export default function MicrogridDesignTool() {
             </div>
           </header>
 
-          {/* Build progress + input key */}
-          <div className="flex flex-wrap items-center gap-2">
-            {PHASES.map((p) => (
-              <span key={p.n} className={`rounded border px-2 py-0.5 font-mono text-xs ${p.done ? T.chip : T.chipIdle}`}>
-                {p.n}. {p.label}{p.done ? " ✓" : ""}
-              </span>
+          {/* Step tabs */}
+          <nav className={`flex flex-wrap gap-1 rounded border p-1 ${T.panel}`}>
+            {TABS.map((t2, i) => (
+              <button key={t2.n} onClick={() => setTab(i)}
+                className={`flex items-baseline gap-1.5 rounded px-2 py-1 text-xs ${tab === i ? T.btnOn : T.muted}`}>
+                <span className="font-mono">{t2.n}</span>
+                <span className={tab === i ? "font-semibold" : ""}>{t2.title}</span>
+              </button>
             ))}
-          </div>
+          </nav>
+
           <div className={`flex flex-wrap items-center gap-4 rounded border px-2 py-1.5 ${T.tile}`}>
             <span className={`border-l-2 pl-2 text-xs ${T.critRule} ${T.critLabel}`}>Critical input — set it and check it</span>
             <span className={`text-xs ${T.advLabel}`}>Advanced parameter — defensible default, folded away</span>
-            <span className={`ml-auto font-mono text-xs ${T.ghost}`}>{showAll ? "all parameters shown" : "advanced parameters folded"}</span>
+            <span className={`ml-auto font-mono text-xs ${T.ghost}`}>
+              {PHASES.filter((p) => p.done).length} of {PHASES.length} build phases complete
+            </span>
           </div>
 
           {/* Headline */}
@@ -1708,6 +1979,7 @@ export default function MicrogridDesignTool() {
           <Notices items={notices} />
 
           {/* 1. PROJECT CONTEXT */}
+          {tab === 0 && (
           <Panel title="Project context" step="1" sub="drives defaults and which adequacy check binds">
             <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
               <Field tier="critical" label="Use-case family" unit="—" hint={USE_CASE_FAMILIES[ctx.useCase].binding}>
@@ -1774,9 +2046,11 @@ export default function MicrogridDesignTool() {
               </div>
             </Advanced>
           </Panel>
+          )}
 
           {/* 1B. LOCATION AND RESOURCE */}
-          <Panel title="Location and resource" step="1B" sub="LCOE moves more with yield than with equipment price"
+          {tab === 1 && (
+          <Panel title="Location and resource" step="2" sub="LCOE moves more with yield than with equipment price"
             right={
               <div className="flex items-center gap-2">
                 <span className={`rounded px-2 py-0.5 font-mono text-xs ${resourceSource.pv === "site" ? T.chipOk : T.chipWarn}`}>
@@ -1867,10 +2141,11 @@ export default function MicrogridDesignTool() {
               LCOE sensitivity to yield, capex and discount rate is charted in Phase 4. Location comparison mode is built in Phase 5.
             </p>
           </Panel>
+          )}
 
           {/* 1A. AIDC */}
-          {mode === "aidc" && (
-            <Panel title="AI data centre design inputs" step="1A" sub="sized backwards from a capacity target, not from a measured load">
+          {tab === 2 && mode === "aidc" && (
+            <Panel title="AI data centre design inputs" step="3" sub="sized backwards from a capacity target, not from a measured load">
               <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
                 <Field tier="critical" label="Target IT capacity, design" unit="MW IT"><Num value={aidc.targetMWIT} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, targetMWIT: v }))} /></Field>
                 <Field tier="critical" label="Cooling type" unit="—">
@@ -1976,8 +2251,8 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* 2. LOAD INPUT */}
-          {mode === "standard" && (
-            <Panel title="Load input" step="2"
+          {tab === 2 && mode === "standard" && (
+            <Panel title="Load input" step="3"
               right={<Seg value={loadCfg.path} onChange={(v) => setLoadCfg((s) => ({ ...s, path: v }))}
                 options={[{ value: "csv", label: "Upload CSV" }, { value: "parametric", label: "Parametric" }]} />}>
               {loadCfg.path === "csv" ? (
@@ -2040,7 +2315,8 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* LOAD CHARACTERISATION */}
-          <Panel title="Load characterisation" step={mode === "aidc" ? "1A·2" : "2B"} sub="separate inputs — not derivable from the profile">
+          {tab === 2 && (
+          <Panel title="Load characterisation" step="3" sub="separate inputs — not derivable from the profile">
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               <Field tier="critical" label="Critical load (served in island)" unit="% of load">
                 <Num value={char.critPct} onChange={(v) => setChar((s) => ({ ...s, critPct: v, touched: true }))} />
@@ -2079,8 +2355,11 @@ export default function MicrogridDesignTool() {
             </div>
           </Panel>
 
+          )}
+
           {/* LOAD PROFILE */}
-          <Panel title="Load profile" step="1C"
+          {tab === 2 && (
+          <Panel title="Load profile" step="3"
             right={
               <div className="flex flex-wrap items-center gap-2">
                 <Seg value={view.span} onChange={(v) => setView((s) => ({ ...s, span: v }))}
@@ -2156,8 +2435,11 @@ export default function MicrogridDesignTool() {
             </div>
           </Panel>
 
+          )}
+
           {/* ================= PHASE 2 — RESOURCES ================= */}
-          <Panel title="Resources" step="3" sub="what the dispatch has available"
+          {tab === 3 && (
+          <Panel title="Resources" step="4" sub="what the dispatch has available"
             right={<span className={`font-mono text-xs ${T.faint}`}>
               {[res.pv.enabled && "PV", res.wind.enabled && "wind", res.bess.enabled && "BESS",
                 res.engine.enabled && "engines", res.turbine.enabled && "turbine",
@@ -2338,8 +2620,11 @@ export default function MicrogridDesignTool() {
             </div>
           </Panel>
 
+          )}
+
           {/* ================= DISPATCH ================= */}
-          <Panel title="Dispatch" step="4" sub="deterministic priority merit order — every hour is readable"
+          {tab === 4 && (
+          <Panel title="Dispatch" step="5" sub="deterministic priority merit order — every hour is readable"
             right={
               <div className="flex flex-wrap items-center gap-2">
                 <Seg value={view.span} onChange={(v) => setView((s) => ({ ...s, span: v }))}
@@ -2458,9 +2743,161 @@ export default function MicrogridDesignTool() {
               </p>
             </div>
           </Panel>
+          )}
+
+          {/* ================= PHASE 3 — ADEQUACY ================= */}
+          {tab === 5 && (<>
+            <Panel title="Adequacy" step="5" sub="three independent verdicts — never combined into one score">
+              <div className={`mb-3 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
+                A design that fails dynamic adequacy is not viable because energy and power pass. Each check below shows the
+                number that governs it. Dynamic adequacy is assessed in island mode, since that is when the microgrid must
+                survive a step on its own inertia.
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+                {/* Energy */}
+                <div className={`rounded border ${T.tile}`}>
+                  <div className={`flex items-center justify-between border-b px-2 py-1.5 ${T.rule}`}>
+                    <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Energy adequacy</span>
+                    <Badge v={adeq.energy.verdict} />
+                  </div>
+                  <div className="p-2">
+                    <div className={`mb-2 font-mono text-xs ${T.tone.cyan}`}>{adeq.energy.governing}</div>
+                    <Trace lines={[
+                      { label: "Unserved energy", expr: `over 8760 h, ${fmt(adeq.energy.unservedPct, 3)} % of annual load`, result: `${fmt(adeq.energy.unservedMWh, 2)} MWh/yr` },
+                      { label: "Load shed", expr: "tier 1 + tier 2 curtailed by the dispatch", result: `${fmt(adeq.energy.shedMWh, 2)} MWh/yr` },
+                      { label: "Island load", expr: `${fmt(char.critPct, 0)} % critical of ${fmt(stats.peakKW / 1000, 2)} MW peak + parasitics`, result: `${fmt(adeq.energy.islandLoadKW / 1000, 2)} MW` },
+                      { label: "Stored energy usable", expr: ctx.islanding === "planned" ? "planned island — full SOC window, charged in advance" : "unplanned island — only what the reserve holds", result: `${fmt(adeq.energy.islandKWh / 1000, 2)} MWh` },
+                      { label: "Autonomy achieved", expr: `stored energy ÷ island load, against ${fmt(adeq.energy.autonomyRequiredH, 0)} h required`, result: `${fmt(adeq.energy.autonomyFromBessH, 1)} h` },
+                      { label: "Engines in island", expr: `${fmt(adeq.energy.engineFirmKW / 1000, 2)} MW firm against ${fmt(adeq.energy.islandLoadKW / 1000, 2)} MW island load`, result: adeq.energy.enginesCarryIsland ? "can carry it" : "cannot carry it alone" },
+                      { label: `Worst ${adeq.energy.worstWindowH} h renewable spell`, expr: `from ${adeq.energy.worstWindowLabel} — renewables cover ${fmt(adeq.energy.worstRenewableShare * 100, 1)} % of load`, result: `${fmt(adeq.energy.worstDeficitMWh, 0)} MWh from storage and fuel` },
+                    ]} />
+                  </div>
+                </div>
+
+                {/* Power */}
+                <div className={`rounded border ${T.tile}`}>
+                  <div className={`flex items-center justify-between border-b px-2 py-1.5 ${T.rule}`}>
+                    <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Power adequacy</span>
+                    <Badge v={adeq.power.verdict} />
+                  </div>
+                  <div className="p-2">
+                    <div className={`mb-2 font-mono text-xs ${T.tone.cyan}`}>{adeq.power.governing}</div>
+                    <Trace lines={[
+                      { label: "Coincident peak", expr: `site peak ${fmt(stats.peakKW / 1000, 2)} MW + parasitics ${fmt(adeq.power.parasiticKW / 1000, 2)} MW`, result: `${fmt(adeq.power.coincidentPeakKW / 1000, 2)} MW` },
+                      { label: "Firm capacity, all", expr: "grid + engines + turbine + BESS power; renewables count zero", result: `${fmt(adeq.power.firmKW / 1000, 2)} MW` },
+                      { label: "Largest single unit", expr: adeq.power.largestUnit ? `${adeq.power.largestUnit.name}${adeq.power.losesGridForming ? " — also the grid-forming source" : ""}` : "none", result: `${fmt((adeq.power.largestUnit?.kW || 0) / 1000, 2)} MW` },
+                      { label: "Firm after N-1", expr: "largest unit removed", result: `${fmt(adeq.power.firmAfterN1KW / 1000, 2)} MW` },
+                      { label: "Margin", expr: "firm after N-1 − coincident peak", result: `${fmt(adeq.power.marginKW / 1000, 2)} MW` },
+                    ]} />
+                    <div className={`mt-2 max-h-32 overflow-auto rounded border ${T.panel}`}>
+                      <table className="w-full text-right font-mono text-xs">
+                        <tbody>
+                          {adeq.power.units.map((u, i) => (
+                            <tr key={i} className={`border-b ${T.divide}`}>
+                              <td className={`px-2 py-0.5 text-left ${u === adeq.power.largestUnit ? T.tone.amber : T.muted}`}>
+                                {u.name}{u.gridForming ? " ⚡" : ""}
+                              </td>
+                              <td className="px-2 py-0.5">{fmt(u.kW / 1000, 2)} MW</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Dynamic */}
+                <div className={`rounded border ${T.tile}`}>
+                  <div className={`flex items-center justify-between border-b px-2 py-1.5 ${T.rule}`}>
+                    <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Dynamic adequacy</span>
+                    <Badge v={adeq.dynamic.verdict} />
+                  </div>
+                  <div className="p-2">
+                    <div className={`mb-2 font-mono text-xs ${T.tone.cyan}`}>{adeq.dynamic.governing}</div>
+                    <Trace lines={[
+                      { label: "Largest load step", expr: mode === "aidc" ? "collective compute swing" : "specified separately from the profile", result: `${fmt(adeq.dynamic.loadStepKW / 1000, 2)} MW` },
+                      { label: "Motor start", expr: `${fmt(char.motorKW, 0)} kW × ${fmt(adeq.dynamic.inrush, 1)} inrush (${adeq.dynamic.motorMethod})`, result: `${fmt(adeq.dynamic.motorStepKW / 1000, 2)} MW` },
+                      { label: "Governing step", expr: "the larger of the two", result: `${fmt(adeq.dynamic.worstStepKW / 1000, 2)} MW` },
+                      { label: "BESS fast response", expr: res.bess.gridForming ? `${fmt(res.bess.powerKW / 1000, 2)} MW × ${fmt(res.bess.gridFormingStepPct, 0)} % step capability` : "grid-following — no step capability credited", result: `${fmt(adeq.dynamic.bessStepKW / 1000, 2)} MW` },
+                      { label: "Engine step acceptance", expr: `${adeq.dynamic.enginesOnline} unit(s) online (dispatch maximum, or what the island needs) × ${fmt(res.engine.stepAcceptancePct, 0)} % of rating`, result: `${fmt(adeq.dynamic.engineStepKW / 1000, 2)} MW` },
+                      { label: "System inertia", expr: `rotating plant only, H ${fmt(CONSTANTS.INERTIA_H_ENGINE_S, 1)} s engines / ${fmt(CONSTANTS.INERTIA_H_TURBINE_S, 1)} s turbine`, result: `${fmt(adeq.dynamic.inertiaMWs, 1)} MW·s` },
+                      { label: "RoCoF", expr: `ΔP ${fmt(adeq.dynamic.deficitMW, 2)} MW × 50 Hz ÷ (2 × ΣH·S)`, result: adeq.dynamic.rocof === Infinity ? "no inertia" : `${fmt(adeq.dynamic.rocof, 2)} Hz/s` },
+                      { label: "Frequency nadir", expr: `RoCoF × ${fmt(CONSTANTS.GOVERNOR_RESPONSE_TIME_S, 1)} s governor response`, result: adeq.dynamic.nadirHz === Infinity ? "collapse" : `−${fmt(adeq.dynamic.nadirHz, 2)} Hz` },
+                    ]} />
+                    <p className={`mt-2 text-xs ${T.faint}`}>
+                      First-order estimate. Thresholds: RoCoF {fmt(CONSTANTS.ROCOF_PASS_HZ_PER_S, 1)} / {fmt(CONSTANTS.ROCOF_MARGINAL_HZ_PER_S, 1)} Hz/s,
+                      nadir {fmt(CONSTANTS.FREQ_NADIR_PASS_HZ, 1)} / {fmt(CONSTANTS.FREQ_NADIR_MARGINAL_HZ, 1)} Hz. Not a substitute for an EMT study.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </Panel>
+          </>)}
+
+          {/* ================= PHASE 3 — BOM ================= */}
+          {tab === 6 && (
+            <Panel title="Sizing and bill of materials" step="6" sub="quantities only — pricing arrives in Phase 4">
+              <div className={`overflow-auto rounded border ${T.tile}`}>
+                <table className="w-full text-left font-mono text-xs">
+                  <thead className={T.panel}>
+                    <tr className={`border-b ${T.rule}`}>
+                      {["Item", "Qty", "Rating", "Note"].map((h) => <th key={h} className={`px-2 py-1 ${T.faint}`}>{h}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bom.rows.map((r, i) => (
+                      <tr key={i} className={`border-b ${T.divide}`}>
+                        <td className={`px-2 py-1 ${T.title}`}>{r.item}</td>
+                        <td className="px-2 py-1">{r.qty}</td>
+                        <td className={`px-2 py-1 ${T.tone.cyan}`}>{r.rating}</td>
+                        <td className={`px-2 py-1 ${T.muted}`}>{r.note}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">
+                <Stat label="Total installed capacity" value={fmt(bom.installedMW, 2)} unit="MW" tone="cyan" />
+                <Stat label="PV area required" value={fmt(bom.pvAreaM2 / CONSTANTS.M2_PER_HA, 2)} unit="ha" tone={mode === "aidc" && bom.pvAreaM2 > aidc.landPV_ha * CONSTANTS.M2_PER_HA ? "rose" : "slate"} />
+                <Stat label="BESS footprint" value={fmt(bom.bessAreaM2, 0)} unit="m²" tone={mode === "aidc" && bom.bessAreaM2 > aidc.landBESS_m2 ? "rose" : "slate"} />
+                <Stat label="Engine footprint" value={fmt(bom.engineAreaM2, 0)} unit="m²" tone={mode === "aidc" && bom.engineAreaM2 > aidc.landEngine_m2 ? "rose" : "slate"} />
+              </div>
+
+              {mode === "aidc" && (
+                <div className="mt-3">
+                  <Trace lines={[
+                    { label: "PV against land", expr: `${fmt(bom.pvAreaM2 / CONSTANTS.M2_PER_HA, 2)} ha required against ${fmt(aidc.landPV_ha, 1)} ha available`, result: bom.pvAreaM2 > aidc.landPV_ha * CONSTANTS.M2_PER_HA ? "EXCEEDS" : "within" },
+                    { label: "BESS against footprint", expr: `${fmt(bom.bessAreaM2, 0)} m² against ${fmt(aidc.landBESS_m2, 0)} m²`, result: bom.bessAreaM2 > aidc.landBESS_m2 ? "EXCEEDS" : "within" },
+                    { label: "Engines against footprint", expr: `${fmt(bom.engineAreaM2, 0)} m² against ${fmt(aidc.landEngine_m2, 0)} m²`, result: bom.engineAreaM2 > aidc.landEngine_m2 ? "EXCEEDS" : "within" },
+                    { label: "Engine hours against permit", expr: `${fmt(disp.summary.engineHours, 0)} h/yr dispatched against ${fmt(res.engine.annualHourLimit, 0)} h/yr permitted`, result: disp.summary.engineHours > res.engine.annualHourLimit ? "EXCEEDS" : "within" },
+                  ]} />
+                </div>
+              )}
+
+              <p className={`mt-2 text-xs ${T.faint}`}>
+                Estimate class: this is a pre-feasibility quantity take-off, not a contractor's scope. It excludes protection,
+                earthing, civils, controls integration and commissioning.
+              </p>
+            </Panel>
+          )}
+
+          {/* Step navigation */}
+          <div className={`flex items-center justify-between gap-3 rounded border p-2 ${T.panel}`}>
+            <button disabled={tab === 0} onClick={() => setTab(tab - 1)}
+              className={`rounded border px-3 py-1 text-xs ${tab === 0 ? T.chipIdle : T.btn}`}>
+              ← Back{tab > 0 ? `: ${TABS[tab - 1].title}` : ""}
+            </button>
+            <span className={`font-mono text-xs ${T.faint}`}>Step {tab + 1} of {TABS.length} — {TABS[tab].title}</span>
+            <button disabled={tab === TABS.length - 1} onClick={() => setTab(tab + 1)}
+              className={`rounded border px-3 py-1 text-xs ${tab === TABS.length - 1 ? T.chipIdle : T.chip}`}>
+              {tab < TABS.length - 1 ? `Next: ${TABS[tab + 1].title}` : "End"} →
+            </button>
+          </div>
 
           <footer className={`border-t pt-2 text-xs ${T.rule} ${T.faint}`}>
-            Phases 1 and 2 complete. Next — Phase 3: the three adequacy checks (energy, power, dynamic) reported separately, and the sizing bill of materials.
+            Phases 1 to 3 complete. Next — Phase 4: the cost defaults library, the LCOE formula written out with its assumptions on screen, and the cost breakdown by component.
           </footer>
         </div>
       </div>
