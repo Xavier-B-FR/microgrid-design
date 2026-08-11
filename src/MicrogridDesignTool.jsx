@@ -3884,15 +3884,12 @@ export default function MicrogridDesignTool() {
               </Field>
             </div>
 
-            <Advanced key={`loc-${density}`} title="Advanced — site physics, tariff structure and monthly shapes" count={7} defaultOpen={showAll}>
+            <Advanced key={`loc-${density}`} title="Advanced — site physics and monthly shapes" count={4} defaultOpen={showAll}>
               <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
                 <Field label="Latitude" unit="°"><Num value={loc.lat} step={0.01} onChange={(v) => setLocOverride((s) => ({ ...s, lat: v }))} /></Field>
                 <Field label="Mean wind speed @100 m" source="library" unit="m/s"><Num value={loc.windMean_m_s_100m} step={0.1} onChange={(v) => setLocOverride((s) => ({ ...s, windMean_m_s_100m: v }))} /></Field>
                 <Field label="Weibull shape k" source="library" unit="—"><Num value={loc.weibullK} step={0.1} onChange={(v) => setLocOverride((s) => ({ ...s, weibullK: v }))} /></Field>
                 <Field label="Diurnal swing" source="library" unit="°C"><Num value={loc.diurnalSwingC} step={0.5} onChange={(v) => setLocOverride((s) => ({ ...s, diurnalSwingC: v }))} /></Field>
-                <Field label="Grid fees" source="library" unit="€/MWh"><Num value={loc.gridFee_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridFee_EUR_per_MWh: v }))} /></Field>
-                <Field label="Capacity charge" source="library" unit="€/kW/yr"><Num value={loc.capacityCharge_EUR_per_kW_yr} onChange={(v) => setLocOverride((s) => ({ ...s, capacityCharge_EUR_per_kW_yr: v }))} /></Field>
-                <Field label="Grid emission factor" source="library" unit="gCO₂/kWh"><Num value={loc.gridCO2_g_per_kWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridCO2_g_per_kWh: v }))} /></Field>
                 <Field computed label="Average air temperature" unit="°C" explain="Plain air temperature, no humidity allowance."><Txt value={fmt(annualMeanT, 1)} readOnly /></Field>
               </div>
 
@@ -3980,11 +3977,23 @@ export default function MicrogridDesignTool() {
                   explain="Your contracted energy price, before grid fees.">
                   <Num value={loc.importTariff_EUR_per_MWh} onChange={(v) => setLocOverride((s2) => ({ ...s2, importTariff_EUR_per_MWh: v }))} />
                 </Field>
+                <Field tier="critical" label="Demand charge" source="site" unit="€/kW/yr"
+                  explain="Charged on the highest power drawn each month. This is what peak shaving is worth.">
+                  <Num value={loc.capacityCharge_EUR_per_kW_yr} onChange={(v) => setLocOverride((s2) => ({ ...s2, capacityCharge_EUR_per_kW_yr: v }))} />
+                </Field>
                 <Field tier="critical" label="Diesel price" source="site" unit="€/litre">
                   <Num value={loc.diesel_EUR_per_litre} step={0.05} onChange={(v) => setLocOverride((s2) => ({ ...s2, diesel_EUR_per_litre: v }))} />
                 </Field>
                 <Field tier="critical" label="Gas price" source="site" unit="€/MWh th">
                   <Num value={loc.gas_EUR_per_MWh_th} onChange={(v) => setLocOverride((s2) => ({ ...s2, gas_EUR_per_MWh_th: v }))} />
+                </Field>
+                <Field label="Grid fees and levies" source="library" unit="€/MWh"
+                  explain="Network and levy charges added to every MWh imported.">
+                  <Num value={loc.gridFee_EUR_per_MWh} onChange={(v) => setLocOverride((s2) => ({ ...s2, gridFee_EUR_per_MWh: v }))} />
+                </Field>
+                <Field label="Grid carbon intensity" source="library" unit="gCO₂/kWh"
+                  explain="Emissions per MWh imported, used for the avoided-CO₂ figure.">
+                  <Num value={loc.gridCO2_g_per_kWh} onChange={(v) => setLocOverride((s2) => ({ ...s2, gridCO2_g_per_kWh: v }))} />
                 </Field>
               </div>
 
@@ -4035,6 +4044,20 @@ export default function MicrogridDesignTool() {
                       ...(uploadedPrice ? [{ value: "uploaded", label: "Your uploaded price curve" }] : []),
                     ]} />
                 </Field>
+                {res.tariff.structure === "tou" && (
+                  <Field label="Peak multiplier" source="library" unit="× base"
+                    explain="What a peak-period hour costs, against the base tariff.">
+                    <Num value={res.tariff.peakMultiplier} step={0.05}
+                      onChange={(v) => setRes((s2) => ({ ...s2, tariff: { ...s2.tariff, peakMultiplier: v } }))} />
+                  </Field>
+                )}
+                {res.tariff.structure === "tou" && (
+                  <Field label="Off-peak multiplier" source="library" unit="× base"
+                    explain="What an off-peak hour costs, against the base tariff.">
+                    <Num value={res.tariff.offPeakMultiplier} step={0.05}
+                      onChange={(v) => setRes((s2) => ({ ...s2, tariff: { ...s2.tariff, offPeakMultiplier: v } }))} />
+                  </Field>
+                )}
                 <Stat label="Average price paid" value={fmt(priceStats.mean, 1)} unit="€/MWh" tone="cyan" />
                 <Stat label="Cheapest hour" value={fmt(priceStats.lo, 1)} unit="€/MWh" tone="emerald" />
                 <Stat label="Most expensive hour" value={fmt(priceStats.hi, 1)} unit="€/MWh" tone="rose" />
@@ -4532,26 +4555,6 @@ export default function MicrogridDesignTool() {
               )}
             </div>
 
-            {/* Grid and tariff */}
-            <div className={`mt-3 rounded border p-2 ${T.tile}`}>
-              <div className="mb-2 flex items-center justify-between">
-                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Grid connection and electricity price</span>
-                <span className={`font-mono text-xs ${T.ghost}`}>{ctx.gridStatus === "none" ? "no connection" : `cap ${fmt(ctx.importCapKW / 1000, 1)} MW`}</span>
-              </div>
-              {ctx.gridStatus !== "none" && (
-                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                  <Field tier="critical" label="Tariff structure" unit="—">
-                    <Sel value={res.tariff.structure} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, structure: v } }))}
-                      options={[{ value: "flat", label: "Flat" }, { value: "tou", label: "Time of use" }]} />
-                  </Field>
-                  <Field computed label="Demand charge" unit="€/kW/yr" explain="Charged on the highest power drawn each month.">
-                    <Txt value={fmt(loc.capacityCharge_EUR_per_kW_yr, 1)} readOnly />
-                  </Field>
-                  <Field label="Peak multiplier" unit="× base"><Num value={res.tariff.peakMultiplier} step={0.05} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, peakMultiplier: v } }))} /></Field>
-                  <Field label="Off-peak multiplier" unit="× base"><Num value={res.tariff.offPeakMultiplier} step={0.05} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, offPeakMultiplier: v } }))} /></Field>
-                </div>
-              )}
-            </div>
           </Panel>
 
           )}
