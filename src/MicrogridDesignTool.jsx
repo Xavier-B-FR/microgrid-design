@@ -345,6 +345,16 @@ export const LOCATION_LIBRARY = {
     gridCO2_g_per_kWh: 400, importTariff_EUR_per_MWh: 135, gridFee_EUR_per_MWh: 25,
     capacityCharge_EUR_per_kW_yr: 40, diesel_EUR_per_litre: 1.10, gas_EUR_per_MWh_th: 30,
   },
+  CUSTOM_SITE: {
+    label: "Custom site — enter your own data", country: "OTHER", lat: 45.0,
+    specificYield_kWh_per_kWp: 1200,
+    monthlyYieldShare: [3.5, 5.0, 7.8, 10.0, 12.0, 12.6, 13.0, 11.8, 9.2, 6.5, 4.2, 3.4],
+    tempMeanC: [4, 5, 9, 12, 16, 20, 22, 22, 18, 13, 8, 5],
+    diurnalSwingC: 9,
+    windMean_m_s_100m: 6.5, weibullK: 2.0,
+    gridCO2_g_per_kWh: 250, importTariff_EUR_per_MWh: 100, gridFee_EUR_per_MWh: 30,
+    capacityCharge_EUR_per_kW_yr: 50, diesel_EUR_per_litre: 1.30, gas_EUR_per_MWh_th: 45,
+  },
   REMOTE_ISLAND: {
     label: "Tropical island / off-grid reference", country: "XX", lat: -21.10,
     specificYield_kWh_per_kWp: 1520,
@@ -2931,6 +2941,15 @@ function Seg({ value, onChange, options }) {
   );
 }
 
+/* Countries represented in the site library, for the country selector. */
+export const COUNTRY_NAMES = {
+  FR: "France", NL: "Netherlands", DE: "Germany", UK: "United Kingdom", ES: "Spain",
+  SA: "Saudi Arabia", AE: "United Arab Emirates", CL: "Chile", SG: "Singapore",
+  XX: "Off-grid / island reference", OTHER: "Other — not listed",
+};
+export const COUNTRY_OPTIONS = Array.from(new Set(Object.values(LOCATION_LIBRARY).map((v) => v.country)))
+  .map((c) => ({ value: c, label: COUNTRY_NAMES[c] || c }));
+
 export const TABS = [
   { n: 1,  title: "Project",     sub: "what the project has to achieve, and the grid it connects to" },
   { n: 2,  title: "Location",    sub: "sunshine, wind, temperature and electricity prices at this site" },
@@ -3158,6 +3177,9 @@ export default function MicrogridDesignTool() {
 
   const notices = useMemo(() => {
     const n = [];
+    if (ctx.locationId === "CUSTOM_SITE") {
+      n.push({ level: "warn", text: `Custom site: the solar yield (${fmt(loc.specificYield_kWh_per_kWp, 0)} kWh/kWp), monthly shape, temperatures and wind speed are generic placeholders, not data for your location. Get the yield and the monthly profile from PVGIS for the real coordinates, or upload an hourly file, before quoting any LCOE.` });
+    }
     if (resourceSource.pv === "library") {
       n.push({ level: "warn", text: `Specific yield ${fmt(loc.specificYield_kWh_per_kWp, 0)} kWh/kWp is a library default for ${loc.label}, not site data. Uncertainty band ±${CONSTANTS.LIBRARY_YIELD_UNCERTAINTY_PCT}%. Two bidders' LCOEs usually differ because their yield assumptions differ, not their equipment.` });
     }
@@ -3872,6 +3894,33 @@ export default function MicrogridDesignTool() {
             </div>
           </nav>
 
+          {/* HOW TO READ THIS TOOL */}
+          {tab === 0 && (
+            <Panel title="How to read this tool" step="—" sub="what the colours and marks mean">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                <div className={`rounded border p-2 ${T.soft.amber}`}>
+                  <div className={`mb-1 rounded border px-2 py-1 text-xs ${T.inputSite}`}>21 310</div>
+                  <div className={`text-xs ${T.title}`}>Yellow — specific to your project</div>
+                  <div className={`text-xs ${T.faint}`}>Nobody can guess it for you: the site load, the location, the grid terms, the contracted prices.</div>
+                </div>
+                <div className={`rounded border p-2 ${T.soft.slate}`}>
+                  <div className={`mb-1 rounded border px-2 py-1 text-xs ${T.inputLib}`}>88.0</div>
+                  <div className={`text-xs ${T.title}`}>Grey text — a default that usually holds</div>
+                  <div className={`text-xs ${T.faint}`}>Round-trip efficiency, minimum stable load, soiling. Leave them unless you know better for this equipment.</div>
+                </div>
+                <div className={`rounded border p-2 ${T.soft.cyan}`}>
+                  <div className={`mb-1 border-l-2 pl-2 text-xs ${T.critRule} ${T.title}`}>a field with a blue rule</div>
+                  <div className={`text-xs ${T.title}`}>Blue rule — you can change it</div>
+                  <div className={`text-xs ${T.faint}`}>No rule means the tool worked the number out. Hover any label for a one-line explanation.</div>
+                </div>
+              </div>
+              <div className={`mt-2 text-xs ${T.faint}`}>
+                Work left to right through the tabs, then press <strong>Run the year</strong> at the top. Results appear on
+                Dispatch, Reliability, Costs and Report, and go stale — the button turns amber — as soon as you change an input.
+              </div>
+            </Panel>
+          )}
+
           {/* PROJECT FILE */}
           {tab === 0 && (
             <Panel title="Project file" step="—" sub="save the whole configuration, or reload a saved one"
@@ -3884,7 +3933,7 @@ export default function MicrogridDesignTool() {
               }>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
                 <Field tier="critical" label="Project name" source="site" unit="text">
-                  <Txt value={projectName} placeholder="e.g. Maasvlakte II BESS" onChange={setProjectName} />
+                  <Txt value={projectName} placeholder="name this project" onChange={setProjectName} />
                 </Field>
                 <Field label="Notes" unit="text">
                   <Txt value={projectNotes} placeholder="revision, client, what changed since the last version" onChange={setProjectNotes} />
@@ -3892,11 +3941,6 @@ export default function MicrogridDesignTool() {
                 <Field computed label="Last file imported" unit="—" explain="Where this session was loaded from. Inputs may have changed since.">
                   <Txt value={lastImported || "none — inputs entered by hand"} readOnly />
                 </Field>
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-4">
-                <span className={`rounded border px-2 py-0.5 text-xs ${T.inputSite}`}>Yellow — specific to your project</span>
-                <span className={`rounded border px-2 py-0.5 text-xs ${T.inputLib}`}>Grey text — not project specific, a default that usually holds</span>
-                <span className={`border-l-2 pl-2 text-xs ${T.critRule} ${T.muted}`}>Blue rule — you can edit it. No rule means the tool worked it out.</span>
               </div>
               <p className={`mt-2 text-xs ${T.faint}`}>
                 Project JSON file contains every input, every cost override, the saved scenarios and any uploaded load or
@@ -3937,10 +3981,43 @@ export default function MicrogridDesignTool() {
                   <Txt value={fmt(effectiveImportCapKW, 0)} readOnly />
                 </Field>
               )}
-              <Field tier="critical" label="Location" source="site" unit="—">
-                <Sel value={ctx.locationId} onChange={(v) => { setCtx((s) => ({ ...s, locationId: v })); setLocOverride({}); setUploadedResource(null); setResourceSource({ pv: "library", temp: "library", note: null }); }}
-                  options={Object.entries(LOCATION_LIBRARY).map(([k, v]) => ({ value: k, label: v.label }))} />
+              <Field tier="critical" label="Country" source="site" unit="—"
+                explain="Sets the wholesale price curve, grid fees, fuel prices and grid carbon intensity.">
+                <Sel value={loc.country}
+                  onChange={(cc) => {
+                    const first = Object.entries(LOCATION_LIBRARY).find(([, v]) => v.country === cc);
+                    if (first) { setCtx((s2) => ({ ...s2, locationId: first[0] })); setLocOverride({}); setUploadedResource(null); setResourceSource({ pv: "library", temp: "library", note: null }); }
+                  }}
+                  options={COUNTRY_OPTIONS} />
               </Field>
+              <Field tier="critical" label="Site" source="site" unit="—"
+                explain="A reference site in that country, or your own with data you enter.">
+                <Sel value={ctx.locationId} onChange={(v) => { setCtx((s2) => ({ ...s2, locationId: v })); setLocOverride({}); setUploadedResource(null); setResourceSource({ pv: "library", temp: "library", note: null }); }}
+                  options={Object.entries(LOCATION_LIBRARY).filter(([, v]) => v.country === loc.country)
+                    .map(([k, v]) => ({ value: k, label: v.label }))
+                    .concat(ctx.locationId === "CUSTOM_SITE" ? [] : [{ value: "CUSTOM_SITE", label: "Another site — I will enter its data" }])} />
+              </Field>
+              {ctx.locationId === "CUSTOM_SITE" && (<>
+                <Field tier="critical" label="Site name" source="site" unit="text"
+                  explain="A label only — it appears on the report and in the project file.">
+                  <Txt value={locOverride.label || ""} placeholder="town or site name"
+                    onChange={(v) => setLocOverride((s2) => ({ ...s2, label: v }))} />
+                </Field>
+                <Field tier="critical" label="Latitude" source="site" unit="°"
+                  explain="Positive north, negative south. Sets day length and the sun's height.">
+                  <Num value={loc.lat} step={0.1} onChange={(v) => setLocOverride((s2) => ({ ...s2, lat: v }))} />
+                </Field>
+                <Field tier="critical" label="Solar yield at this site" source="site" unit="kWh/kWp/yr"
+                  explain="Take it from PVGIS for the real coordinates — the default here is a placeholder.">
+                  <Num value={loc.specificYield_kWh_per_kWp} step={10}
+                    onChange={(v) => setLocOverride((s2) => ({ ...s2, specificYield_kWh_per_kWp: v }))} />
+                </Field>
+                <Field tier="critical" label="Grid import tariff" source="site" unit="€/MWh"
+                  explain="Your contracted energy price. With no published curve for this country it also sets the yearly average.">
+                  <Num value={loc.importTariff_EUR_per_MWh}
+                    onChange={(v) => setLocOverride((s2) => ({ ...s2, importTariff_EUR_per_MWh: v }))} />
+                </Field>
+              </>)}
             </div>
 
             <Advanced key={`ctx-${density}`} title="More options — export limit, non-firm terms, capacity steps" count={ctx.gridStatus === "flexible" ? 4 : 2} defaultOpen={showAll}>
@@ -4094,6 +4171,13 @@ export default function MicrogridDesignTool() {
                     ? `Your own hourly prices, with grid fees of ${fmt(loc.gridFee_EUR_per_MWh, 0)} €/MWh added on top.`
                     : "A fixed supply contract rather than market exposure. The battery has far less to earn from price movement on a fixed contract."}
               </div>
+              {!MARKET_PRICES_2025[loc.country] && res.tariff.structure === "market" && (
+                <div className={`mt-1 rounded border px-2 py-1 text-xs ${T.notice.warn}`}>
+                  No published 2025 curve for this country. The shape is modelled from residual demand as usual, but its yearly
+                  average is set by the import tariff you enter above rather than by a market operator's figure — so enter that
+                  tariff, or upload your own hourly prices.
+                </div>
+              )}
               {priceNote && <div className={`mt-1 rounded border px-2 py-1 text-xs ${T.notice.info}`}>{priceNote}</div>}
               <div className="mt-2 h-40">
                 <ResponsiveContainer width="100%" height="100%">
