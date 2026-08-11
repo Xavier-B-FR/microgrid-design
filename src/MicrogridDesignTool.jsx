@@ -1071,6 +1071,7 @@ function dispatch(cfg) {
   let turbOn = false, turbLastChangeH = -999, turbRunHours = 0;
 
   const meanPrice = price.reduce((a, v) => a + v, 0) / H;
+  const thermalFirst = cfg.meritOrder === "thermal-first";
 
   /* --- Look-ahead ---------------------------------------------------------
      A finite horizon over the same hourly series. This is a perfect forecast,
@@ -1161,18 +1162,22 @@ function dispatch(cfg) {
     else if (g.enabled && residual > 0.001 && capKW > 0) mark(curtailedHour ? RC.CURTAIL_SCHED : RC.IMPORT_CAP);
     else if (g.enabled && residual > 0.001 && capKW === 0 && curtailedHour) mark(RC.CURTAIL_SCHED);
 
-    /* --- 3. Battery discharge ---------------------------------------------
-       The hour's battery flow is accumulated in disKW and chargeKW and netted
-       at the end. A battery must not appear to charge and discharge in the
-       same hour: if an engine is later held at minimum load, its surplus first
-       backs off the discharge, and only the remainder charges the battery. */
+    /* --- 3 & 4. The discretionary middle of the merit order -----------------
+       Renewables always come first and load shedding always comes last — those
+       are physics and priority, not preference. What IS a choice is whether the
+       battery or the thermal plant covers the gap after grid import, and the
+       use case decides it: a cost-driven site discharges the battery first to
+       avoid fuel, while a resilience-driven site starts engines first and keeps
+       the battery in reserve. Both orders are run by the same code below.     */
     let disKW = 0;
-    if (b.enabled && residual > 0.001) {
+    let engineExcess = 0;
+    let batteryDone = false;
+
+    const runBattery = () => {
+      if (!b.enabled || residual <= 0.001) { batteryDone = true; return; }
       const availKWh = Math.max(0, (soc - reserveFloorPct) / 100 * b.energyKWh) * effOneWay;
       let want = residual;
-      // RULE 1 — peak levelling. Only applies where the battery is discharging
-      // for economics (a demand-charge target), never where the alternative is
-      // unserved load: reliability always outranks the forecast.
+      // RULE 1 — peak levelling, economics only, never at the cost of served load
       if (LA && g.enabled && g.shaveEnabled && g.shaveTargetKW > 0) {
         const level = levelForHorizon(i, availKWh, shaveCap);
         const allowed = Math.max(0, (load[i] - pvAvail - windAvail - shaveCap) - level);
@@ -1187,89 +1192,87 @@ function dispatch(cfg) {
       }
       if (residual > 0.001) {
         if (soc <= reserveFloorPct + 0.01) {
-          // Ring-fenced by the resilience reserve, or genuinely flat — not the same finding
           mark(reserveFloorPct > b.socMinPct + 0.01 ? RC.SOC_RESERVE : RC.BESS_EMPTY);
         } else if (dis >= powerLimitKW - 0.001 && powerLimitKW > 0) mark(RC.BESS_POWER);
       }
-    }
+      batteryDone = true;
+    };
 
-    /* --- 3b. Backstop import ------------------------------------------------
-       If shaving was active and the battery could not hold the peak, import the
-       remainder up to the real connection cap before starting any engine. */
+    const runThermal = () => {
+      /* --- Engines --------------------------------------------------------- */
+      if (e.enabled && e.units > 0) {
+        const derate = 1 - Math.max(0, temp[i] - 25) * CONSTANTS.ENGINE_DERATE_PCT_PER_C_ABOVE_25 / 100;
+        const unitKW = e.unitKW * derate;
+        const unitMin = unitKW * e.minStableLoadPct / 100;
+
+        const needSpinning = !g.enabled && !(b.enabled && b.gridForming && soc > reserveFloorPct + 1) && loadKW > 0;
+        let desired = residual > 0.001 ? Math.ceil(residual / unitKW) : 0;
+        if (needSpinning && desired === 0) desired = 1;
+        desired = Math.min(desired, e.units);
+
+        const budgetLeft = engineRunHours < e.annualHourLimit;
+        if (!budgetLeft && desired > unitsOn) { desired = unitsOn; if (residual > 0.001) mark(RC.ENGINE_HOURS); }
+
+        if (desired > unitsOn) {
+          if (i - lastChangeH >= e.minDownTimeH) {
+            unitsOn = desired; lastChangeH = i;
+            if (e.startTimeMin > 60) { startingUntil = i + Math.ceil(e.startTimeMin / 60); mark(RC.ENGINE_START); }
+          } else if (residual > 0.001) mark(RC.MIN_UP_DOWN);
+        } else if (desired < unitsOn) {
+          if (i - lastChangeH >= e.minUpTimeH) { unitsOn = desired; lastChangeH = i; }
+        }
+
+        const online = i < startingUntil ? 0 : unitsOn;
+        if (online > 0) {
+          const fleetMax = online * unitKW, fleetMin = online * unitMin;
+          const outKW = Math.min(Math.max(residual, fleetMin), fleetMax);
+          if (outKW > residual + 0.001) { engineExcess = outKW - residual; mark(RC.ENGINE_MIN_LOAD); }
+          else mark(RC.ENGINE_ON);
+          out.engine[i] = outKW;
+          out.enginesOn[i] = online;
+          residual = Math.max(0, residual - outKW);
+          engineRunHours++;
+
+          const loadPct = 100 * (outKW / online) / unitKW;
+          if (e.fuelType === "diesel") out.fuelL[i] = outKW * partLoadValue(e.sfcDiesel, loadPct);
+          else { const eff = partLoadValue(e.effGas, loadPct) / 100; out.fuelTh[i] = eff > 0 ? outKW / eff : 0; }
+        }
+      }
+
+      /* --- Gas turbine ------------------------------------------------------ */
+      if (t.enabled && residual > 0.001) {
+        const derate = 1 - Math.max(0, temp[i] - 15) * CONSTANTS.TURBINE_DERATE_PCT_PER_C_ABOVE_15 / 100;
+        const ratedKW = t.ratedKW * derate, minKW = ratedKW * t.minLoadPct / 100;
+        const want = residual > 0.001;
+        if (want && !turbOn && i - turbLastChangeH >= t.minDownTimeH) { turbOn = true; turbLastChangeH = i; }
+        else if (!want && turbOn && i - turbLastChangeH >= t.minUpTimeH) { turbOn = false; turbLastChangeH = i; }
+        if (turbOn) {
+          const outKW = Math.min(Math.max(residual, minKW), ratedKW);
+          if (outKW > residual + 0.001) { engineExcess += outKW - residual; mark(RC.ENGINE_MIN_LOAD); }
+          else mark(RC.TURBINE_ON);
+          out.turbine[i] = outKW;
+          residual = Math.max(0, residual - outKW);
+          turbRunHours++;
+          const eff = partLoadValue(t.effCurve, 100 * outKW / ratedKW) / 100;
+          out.fuelTh[i] += eff > 0 ? outKW / eff : 0;
+        }
+      }
+    };
+
+    if (thermalFirst) { runThermal(); runBattery(); } else { runBattery(); runThermal(); }
+
+    /* --- Backstop import: the full connection cap, before anything is shed --- */
     if (g.enabled && residual > 0.001 && capKW > out.imp[i]) {
       const extraImp = Math.min(residual, capKW - out.imp[i]);
       if (extraImp > 0.001) { out.imp[i] += extraImp; residual -= extraImp; }
       if (residual > 0.001) mark(curtailedHour ? RC.CURTAIL_SCHED : RC.IMPORT_CAP);
     }
 
-    /* --- 4. Engines -------------------------------------------------------- */
-    let engineExcess = 0;
-    if (e.enabled && e.units > 0) {
-      // Ambient derating — never use the ISO rating for on-site plant
-      const derate = 1 - Math.max(0, temp[i] - 25) * CONSTANTS.ENGINE_DERATE_PCT_PER_C_ABOVE_25 / 100;
-      const unitKW = e.unitKW * derate;
-      const unitMin = unitKW * e.minStableLoadPct / 100;
-
-      // Off-grid systems need a spinning source unless the battery is grid-forming
-      const needSpinning = !g.enabled && !(b.enabled && b.gridForming && soc > reserveFloorPct + 1) && loadKW > 0;
-      let desired = residual > 0.001 ? Math.ceil(residual / unitKW) : 0;
-      if (needSpinning && desired === 0) desired = 1;
-      desired = Math.min(desired, e.units);
-
-      const budgetLeft = engineRunHours < e.annualHourLimit;
-      if (!budgetLeft && desired > unitsOn) { desired = unitsOn; if (residual > 0.001) mark(RC.ENGINE_HOURS); }
-
-      if (desired > unitsOn) {
-        if (i - lastChangeH >= e.minDownTimeH) {
-          unitsOn = desired; lastChangeH = i;
-          if (e.startTimeMin > 60) { startingUntil = i + Math.ceil(e.startTimeMin / 60); mark(RC.ENGINE_START); }
-        } else if (residual > 0.001) mark(RC.MIN_UP_DOWN);
-      } else if (desired < unitsOn) {
-        if (i - lastChangeH >= e.minUpTimeH) { unitsOn = desired; lastChangeH = i; }
-      }
-
-      const online = i < startingUntil ? 0 : unitsOn;
-      if (online > 0) {
-        const fleetMax = online * unitKW, fleetMin = online * unitMin;
-        let outKW = Math.min(Math.max(residual, fleetMin), fleetMax);
-        if (outKW > residual + 0.001) { engineExcess = outKW - residual; mark(RC.ENGINE_MIN_LOAD); }
-        else if (reason !== RC.ENGINE_START && reason !== RC.ENGINE_HOURS && reason !== RC.MIN_UP_DOWN) mark(RC.ENGINE_ON);
-        out.engine[i] = outKW;
-        out.enginesOn[i] = online;
-        residual = Math.max(0, residual - outKW);
-        engineRunHours++;
-
-        // Fuel — specific consumption at the actual part load, not the rated point
-        const loadPct = 100 * (outKW / online) / unitKW;
-        if (e.fuelType === "diesel") out.fuelL[i] = outKW * partLoadValue(e.sfcDiesel, loadPct);
-        else { const eff = partLoadValue(e.effGas, loadPct) / 100; out.fuelTh[i] = eff > 0 ? outKW / eff : 0; }
-      }
-    }
-
-    /* --- 4b. Gas turbine ---------------------------------------------------- */
-    if (t.enabled && residual > 0.001) {
-      const derate = 1 - Math.max(0, temp[i] - 15) * CONSTANTS.TURBINE_DERATE_PCT_PER_C_ABOVE_15 / 100;
-      const ratedKW = t.ratedKW * derate, minKW = ratedKW * t.minLoadPct / 100;
-      const want = residual > 0.001;
-      if (want && !turbOn && i - turbLastChangeH >= t.minDownTimeH) { turbOn = true; turbLastChangeH = i; }
-      else if (!want && turbOn && i - turbLastChangeH >= t.minUpTimeH) { turbOn = false; turbLastChangeH = i; }
-      if (turbOn) {
-        const outKW = Math.min(Math.max(residual, minKW), ratedKW);
-        if (outKW > residual + 0.001) { engineExcess += outKW - residual; mark(RC.ENGINE_MIN_LOAD); }
-        else mark(RC.TURBINE_ON);
-        out.turbine[i] = outKW;
-        residual = Math.max(0, residual - outKW);
-        turbRunHours++;
-        const eff = partLoadValue(t.effCurve, 100 * outKW / ratedKW) / 100;
-        out.fuelTh[i] += eff > 0 ? outKW / eff : 0;
-      }
-    }
-
-    /* --- 4c. Engine surplus backs off the battery before charging it -------- */
+    /* --- Engine surplus backs off the battery before charging it ------------ */
     if (b.enabled && engineExcess > 0.001 && disKW > 0.001) {
       const back = Math.min(disKW, engineExcess);
       disKW -= back; engineExcess -= back;
-      soc += (back / effOneWay) / b.energyKWh * 100;   // undo that part of the discharge
+      soc += (back / effOneWay) / b.energyKWh * 100;
       throughputKWh -= back;
     }
 
@@ -2632,6 +2635,10 @@ export const THEMES = {
     critRule: "border-cyan-600",
     critLabel: "text-slate-100",
     advLabel: "text-slate-500",
+    termUnderline: "decoration-slate-500",
+    head: "text-cyan-300",
+    headBg: "bg-slate-900",
+    soft: { cyan: "bg-cyan-950", amber: "bg-amber-950", emerald: "bg-emerald-950", violet: "bg-violet-950", rose: "bg-rose-950", slate: "bg-slate-900" },
     chart: { grid: "#1e293b", axis: "#475569", tipBg: "#020617", tipBorder: "#1e293b", load: "#22d3ee", loadFill: "#0e7490", temp: "#f59e0b", pv: "#a78bfa", bar1: "#0e7490", bar2: "#f59e0b", ref: "#64748b", refWarn: "#f43f5e", wind: "#38bdf8", imp: "#06b6d4", bessC: "#a78bfa", engineC: "#fb923c", turbineC: "#f472b6", socC: "#94a3b8", unservedC: "#f43f5e" },
   },
   light: {
@@ -2663,6 +2670,10 @@ export const THEMES = {
     critRule: "border-cyan-600",
     critLabel: "text-slate-900",
     advLabel: "text-slate-500",
+    termUnderline: "decoration-slate-400",
+    head: "text-cyan-800",
+    headBg: "bg-cyan-50",
+    soft: { cyan: "bg-cyan-50", amber: "bg-amber-50", emerald: "bg-emerald-50", violet: "bg-violet-50", rose: "bg-rose-50", slate: "bg-slate-50" },
     chart: { grid: "#e2e8f0", axis: "#64748b", tipBg: "#ffffff", tipBorder: "#cbd5e1", load: "#0891b2", loadFill: "#a5f3fc", temp: "#d97706", pv: "#7c3aed", bar1: "#0891b2", bar2: "#f59e0b", ref: "#94a3b8", refWarn: "#e11d48", wind: "#0284c7", imp: "#0e7490", bessC: "#7c3aed", engineC: "#ea580c", turbineC: "#db2777", socC: "#64748b", unservedC: "#e11d48" },
   },
 };
@@ -2681,10 +2692,10 @@ function Panel({ title, step, right, children, sub }) {
   const T = useT();
   return (
     <section className={`rounded border ${T.panel}`}>
-      <header className={`flex items-center justify-between gap-3 border-b px-3 py-2 ${T.rule}`}>
+      <header className={`flex items-center justify-between gap-3 border-b px-3 py-2 ${T.rule} ${T.headBg}`}>
         <div className="flex items-baseline gap-2 min-w-0">
           {step && <span className={`font-mono text-xs shrink-0 ${T.tone.cyan}`}>{step}</span>}
-          <h2 className={`text-sm font-semibold truncate ${T.title}`}>{title}</h2>
+          <h2 className={`text-sm font-semibold truncate ${T.head}`}>{title}</h2>
           {sub && <span className={`text-xs truncate hidden sm:inline ${T.faint}`}>{sub}</span>}
         </div>
         <div className="shrink-0">{right}</div>
@@ -2694,13 +2705,26 @@ function Panel({ title, step, right, children, sub }) {
   );
 }
 
-function Field({ label, unit, children, hint, flag, tier = "advanced" }) {
+/** A term with an explanation on hover. Dotted underline marks it as explainable. */
+function Term({ children, explain }) {
+  const T = useT();
+  if (!explain) return <>{children}</>;
+  return (
+    <span title={explain} className={`cursor-help underline decoration-dotted underline-offset-2 ${T.termUnderline}`}>
+      {children}
+    </span>
+  );
+}
+
+function Field({ label, unit, children, hint, flag, explain, tier = "advanced" }) {
   const T = useT();
   const crit = tier === "critical";
   return (
     <label className={`block border-l-2 pl-2 ${crit ? T.critRule : "border-transparent"}`}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className={`text-xs ${crit ? `font-medium ${T.critLabel}` : T.advLabel}`}>{label}</span>
+        <span className={`text-xs ${crit ? `font-medium ${T.critLabel}` : T.advLabel}`}>
+          <Term explain={explain}>{label}</Term>
+        </span>
         <span className={`font-mono text-xs ${T.ghost}`}>{unit}</span>
       </div>
       {children}
@@ -2894,21 +2918,22 @@ export const TABS = [
   { n: 2,  title: "Location",    sub: "sunshine, wind, temperature and electricity prices at this site" },
   { n: 3,  title: "Load",        sub: "how much power the site needs, hour by hour" },
   { n: 4,  title: "Equipment",   sub: "what generating and storage equipment is installed" },
-  { n: 5,  title: "Dispatch",    sub: "what each piece of equipment does in every hour of the year" },
-  { n: 6,  title: "Reliability", sub: "can the design actually keep the lights on" },
-  { n: 7,  title: "System",      sub: "the equipment list and how it all connects" },
-  { n: 8,  title: "Costs",       sub: "what it costs to build and run, and the cost per MWh" },
-  { n: 9,  title: "Auto-size",   sub: "search for a cheaper design that still passes every check" },
-  { n: 10, title: "Report",      sub: "the need, the solution, and what it delivers" },
-  { n: 11, title: "Compare",     sub: "put several designs side by side" },
-  { n: 12, title: "Checks",      sub: "things worth a second look — warnings, never blockers" },
+  { n: 5,  title: "Microgrid",   sub: "what the microgrid is for, and the operating logic that follows" },
+  { n: 6,  title: "Dispatch",    sub: "what each piece of equipment does in every hour of the year" },
+  { n: 7,  title: "Reliability", sub: "can the design actually keep the lights on" },
+  { n: 8,  title: "System",      sub: "the equipment list and how it all connects" },
+  { n: 9,  title: "Costs",       sub: "what it costs to build and run, and the cost per MWh" },
+  { n: 10, title: "Auto-size",   sub: "search for a cheaper design that still passes every check" },
+  { n: 11, title: "Report",      sub: "the need, the solution, and what it delivers" },
+  { n: 12, title: "Compare",     sub: "put several designs side by side" },
+  { n: 13, title: "Checks",      sub: "things worth a second look — warnings, never blockers" },
 ];
 
 export const TAB_STAGES = [
-  { name: "Define", from: 0, to: 3 },
-  { name: "Analyse", from: 4, to: 7 },
-  { name: "Optimise", from: 8, to: 8 },
-  { name: "Report", from: 9, to: 11 },
+  { name: "Define", from: 0, to: 4 },
+  { name: "Analyse", from: 5, to: 8 },
+  { name: "Optimise", from: 9, to: 9 },
+  { name: "Report", from: 10, to: 12 },
 ];
 
 export const SCENARIO_ROWS = [
@@ -2948,6 +2973,11 @@ export const COST_FIELDS = [
   { k: "AUGMENTATION_YEARS", label: "Augmentation year(s)", unit: "comma-separated" },
   { k: "EXPORT_PRICE_EUR_PER_MWH", label: "Export value", unit: "€/MWh", step: 5 },
 ];
+
+function DetailToggle({ value, onChange }) {
+  return <Seg value={value} onChange={onChange}
+    options={[{ value: "summary", label: "Summary" }, { value: "detail", label: "Detailed" }]} />;
+}
 
 const PHASES = [
   { n: 1, label: "Context · resource · load", done: true },
@@ -3023,6 +3053,10 @@ export default function MicrogridDesignTool() {
   const [tab, setTab] = useState(0);
   const [noticesOpen, setNoticesOpen] = useState(true);
   const [selfTestOpen, setSelfTestOpen] = useState(false);
+  const [logicApplied, setLogicApplied] = useState(false);
+  const [justRan, setJustRan] = useState(false);
+  const [detail, setDetail] = useState({ dispatch: "summary", reliability: "summary", report: "summary" });
+  const [lastImported, setLastImported] = useState(null);
   const [lcoeBoundary, setLcoeBoundary] = useState("facility");
   const [costs, setCosts] = useState({ ...CONSTANTS.COST_DEFAULTS });
   const [fin, setFin] = useState({ enabled: false, gearingPct: 70, tenorYears: 12, interestPct: 5.5, creditBaselineCapex: false });
@@ -3057,6 +3091,7 @@ export default function MicrogridDesignTool() {
       peakMultiplier: CONSTANTS.TOU_PEAK_MULTIPLIER, offPeakMultiplier: CONSTANTS.TOU_OFFPEAK_MULTIPLIER },
     shave: { enabled: false, targetKW: 0 },
     lookahead: { enabled: true, horizonH: CONSTANTS.LOOKAHEAD_HOURS },
+    meritOrder: "storage-first",
   });
 
   /* --- Derived ------------------------------------------------------------ */
@@ -3240,6 +3275,7 @@ export default function MicrogridDesignTool() {
     engine: { ...res.engine, sfcDiesel: CONSTANTS.DIESEL_SFC_L_PER_KWH, effGas: CONSTANTS.GAS_ENGINE_EFF_PCT },
     turbine: { ...res.turbine, effCurve: CONSTANTS.TURBINE_EFF_PCT },
     lookahead: res.lookahead,
+    meritOrder: res.meritOrder,
   }), [load, pvOut, windGen, price, temp, cal, char.shed1Pct, char.shed2Pct, ctx, mode, aidc.gridStrategy,
        curtailFlags, res, reserveApplies, effectiveImportCapKW]);
 
@@ -3285,6 +3321,8 @@ export default function MicrogridDesignTool() {
     const dg = dispatchDiagnostics(d, dispatchInputs, loc);
     const myopic = dispatch({ ...dispatchInputs, lookahead: { ...res.lookahead, enabled: false } });
     const msWithTest = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+    setJustRan(true);
+    if (typeof window !== "undefined") window.setTimeout(() => setJustRan(false), 4000);
     setRunOut({ sig: runSig, disp: d, adeq: ad, bom: b, ms, msWithTest, selfTest: st, diag: dg, myopicPeakKW: myopic.summary.peakImportKW, myopicCurtailMWh: myopic.summary.curtailRenewMWh, at: new Date().toLocaleTimeString() });
   };
 
@@ -3546,7 +3584,7 @@ export default function MicrogridDesignTool() {
       bess: { ...s2.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
       engine: { ...s2.engine, enabled: c.units > 0, units: c.units },
     }));
-    setTab(4);
+    setTab(3);
   };
 
   /* --- AIDC phased build-out: the design tested at every ramp year ---------- */
@@ -3661,6 +3699,57 @@ export default function MicrogridDesignTool() {
     });
   };
 
+  /* --- The merit order, written out from the current settings -------------- */
+  const meritOrderSteps = useMemo(() => {
+    const steps = [{ label: "Serve the load from solar and wind — free at the margin, so always first", fixed: true }];
+    if (ctx.gridStatus !== "none") {
+      steps.push({
+        label: res.shave.enabled && res.shave.targetKW > 0
+          ? `Import from the grid, but only up to ${fmt(res.shave.targetKW / 1000, 1)} MW so the demand charge stays down`
+          : `Import from the grid up to the ${fmt(effectiveImportCapKW / 1000, 1)} MW connection limit`,
+        fixed: false,
+      });
+    }
+    const bat = {
+      label: res.bess.enabled
+        ? `Discharge the battery, never below the ${fmt(res.bess.reserveSocPct, 0)} % held back for an outage`
+        : "Battery not installed",
+      fixed: false,
+    };
+    const thermal = {
+      label: res.engine.enabled || res.turbine.enabled
+        ? `Run generators, each at or above ${fmt(res.engine.minStableLoadPct, 0)} % of its rating`
+        : "No generators installed",
+      fixed: false,
+    };
+    if (res.meritOrder === "thermal-first") { steps.push(thermal, bat); } else { steps.push(bat, thermal); }
+    if (ctx.gridStatus !== "none" && res.shave.enabled && res.shave.targetKW > 0) {
+      steps.push({ label: "If still short, import above the target rather than fail to serve the load", fixed: true });
+    }
+    steps.push({
+      label: res.bess.arbitrage && ctx.gridStatus !== "none"
+        ? "Charge the battery from surplus renewables, then from the cheapest hours ahead"
+        : "Charge the battery from surplus renewables only",
+      fixed: false,
+    });
+    steps.push({ label: ctx.exportCapKW > 0 ? "Export what is left, then curtail the rest" : "Curtail any renewable surplus that cannot be stored", fixed: true });
+    steps.push({ label: "Only as a last resort, shed load by tier, then record it as unserved", fixed: true });
+    return steps;
+  }, [ctx, res, effectiveImportCapKW]);
+
+  /* Set the operating logic from the stated use case. */
+  const applyUseCaseLogic = () => {
+    const k = ctx.useCase;
+    const thermalFirst = k === "resilience" || k === "access";
+    setRes((s2) => ({
+      ...s2,
+      meritOrder: thermalFirst ? "thermal-first" : "storage-first",
+      bess: { ...s2.bess, arbitrage: k === "cost" || k === "decarb",
+        reserveSocPct: k === "resilience" ? 50 : k === "deferral" ? 30 : k === "access" ? 20 : 10 },
+      lookahead: { ...s2.lookahead, enabled: true },
+    }));
+  };
+
   const parasiticKW = parasiticKWval;
   const NeedsRun = () => <NeedsRunCard T={T} onRun={runDispatch} />;
 
@@ -3690,6 +3779,7 @@ export default function MicrogridDesignTool() {
       if (c.lcoeBoundary) setLcoeBoundary(c.lcoeBoundary);
       if (Array.isArray(c.scenarios)) setScenarios(c.scenarios.slice(0, 6));
       setProjectName(c.projectName || "");
+      setLastImported(`${f.name}${c.savedAt ? ` (saved ${c.savedAt.slice(0, 10)})` : ""}`);
       setProjectNotes(c.notes || "");
       if (c.uploadedLoad && c.uploadedLoad.length === H) {
         setCsvResult({ load: Float32Array.from(c.uploadedLoad), notes: c.uploadedLoadNotes || ["Restored from a project file."], rowsIn: H, detected: "hourly" });
@@ -3725,20 +3815,20 @@ export default function MicrogridDesignTool() {
           {/* Header */}
           <header className={`flex flex-wrap items-end justify-between gap-3 border-b pb-3 ${T.rule}`}>
             <div>
-              <div className="flex flex-wrap items-baseline gap-2">
-                <h1 className={`text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
-                {projectName && <span className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chip}`}>{projectName}</span>}
-              </div>
+              <h1 className={`text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
               <p className={`text-xs ${T.faint}`}>Microgrid pre-feasibility study: sizing &amp; LCOE</p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
                 {!runOut ? "Run the year" : stale ? "Inputs changed — run again" : "Run again"}
               </button>
-              <span className={`text-xs ${stale ? T.tone.amber : T.faint}`}>
-                {!runOut ? "not run yet" : stale ? `last run ${runOut.at}, now out of date` : `last run ${runOut.at}`}
+              <span className={`rounded px-2 py-1 text-xs ${justRan ? `${T.chipOk} font-medium` : stale ? T.tone.amber : T.faint}`}>
+                {justRan ? `✓ Run complete — 8760 h in ${fmt(dispatchMs, 0)} ms, all checks passed`
+                  : !runOut ? "not run yet"
+                    : stale ? `last run ${runOut.at}, now out of date`
+                      : `last run ${runOut.at}`}
               </span>
-              <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} />
+              <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} />
               <Seg value={density} onChange={setDensity} options={[{ value: "essential", label: "Essentials" }, { value: "full", label: "Advanced" }]} />
               <Seg value={mode} onChange={setMode} options={[{ value: "standard", label: "Standard project" }, { value: "aidc", label: "AIDC" }]} />
             </div>
@@ -3779,16 +3869,17 @@ export default function MicrogridDesignTool() {
                 <Field tier="critical" label="Project name" unit="text">
                   <Txt value={projectName} placeholder="e.g. Maasvlakte II BESS" onChange={setProjectName} />
                 </Field>
-                <div className="md:col-span-2">
-                  <Field label="Notes" unit="text">
-                    <Txt value={projectNotes} placeholder="revision, client, what changed since the last version" onChange={setProjectNotes} />
-                  </Field>
-                </div>
+                <Field label="Notes" unit="text">
+                  <Txt value={projectNotes} placeholder="revision, client, what changed since the last version" onChange={setProjectNotes} />
+                </Field>
+                <Field label="Last file imported" unit="—" explain="The file this session was loaded from. Inputs may have been edited since, so treat it as provenance, not a description of what is currently on screen.">
+                  <Txt value={lastImported || "none — inputs entered by hand"} readOnly />
+                </Field>
               </div>
               <p className={`mt-2 text-xs ${T.faint}`}>
-                The file is plain JSON containing every input, every cost override, the saved scenarios and any uploaded
-                load or resource series — so a project reopens exactly as it was, and two revisions can be compared in a text
-                editor. Results are not stored; the dispatch is re-run on load.
+                Project JSON file contains every input, every cost override, the saved scenarios and any uploaded load or
+                resource series — so a project reopens exactly as it was. Results are not stored; the dispatch and results
+                are re-run on load.
               </p>
               {configMsgs && (
                 <div className="mt-2 space-y-1">
@@ -3824,20 +3915,9 @@ export default function MicrogridDesignTool() {
                   <Txt value={fmt(effectiveImportCapKW, 0)} readOnly />
                 </Field>
               )}
-              <Field tier="critical" label="Islanding requirement" unit="—">
-                <Sel value={ctx.islanding} onChange={(v) => setCtx((s) => ({ ...s, islanding: v }))}
-                  options={[{ value: "none", label: "None" }, { value: "planned", label: "Planned islanding" }, { value: "unplanned", label: "Unplanned islanding" }]} />
-              </Field>
-              <Field tier="critical" label="Required autonomy at critical load" unit="h">
-                <Num value={ctx.autonomyH} onChange={(v) => setCtx((s) => ({ ...s, autonomyH: v }))} disabled={ctx.islanding === "none"} />
-              </Field>
               <Field tier="critical" label="Location" unit="—">
                 <Sel value={ctx.locationId} onChange={(v) => { setCtx((s) => ({ ...s, locationId: v })); setLocOverride({}); setUploadedResource(null); setResourceSource({ pv: "library", temp: "library", note: null }); }}
                   options={Object.entries(LOCATION_LIBRARY).map(([k, v]) => ({ value: k, label: v.label }))} />
-              </Field>
-              <Field tier="critical" label="Project life" unit="years"><Num value={ctx.lifeYears} onChange={(v) => setCtx((s) => ({ ...s, lifeYears: v }))} /></Field>
-              <Field tier="critical" label="Discount rate (real)" unit="%/yr" hint="LCOE moves with this as much as with capex">
-                <Num value={ctx.discountPct} step={0.1} onChange={(v) => setCtx((s) => ({ ...s, discountPct: v }))} />
               </Field>
             </div>
 
@@ -3885,7 +3965,7 @@ export default function MicrogridDesignTool() {
               </div>
             }>
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-              <Field tier="critical" label="Specific yield" unit="kWh/kWp/yr" flag={resourceSource.pv === "library" ? "library default" : null}>
+              <Field tier="critical" label="Solar yield" unit="kWh/kWp/yr" explain="How many kilowatt-hours one installed kilowatt-peak of panels produces in a year at this site. It is the single number that moves LCOE most — more than any plausible difference in equipment price." flag={resourceSource.pv === "library" ? "library default" : null}>
                 <Num value={loc.specificYield_kWh_per_kWp} step={10} onChange={(v) => setLocOverride((s) => ({ ...s, specificYield_kWh_per_kWp: v }))} />
               </Field>
               <Field tier="critical" label="Grid import tariff" unit="€/MWh"><Num value={loc.importTariff_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, importTariff_EUR_per_MWh: v }))} /></Field>
@@ -3902,7 +3982,7 @@ export default function MicrogridDesignTool() {
                 <Field label="Grid fees" unit="€/MWh"><Num value={loc.gridFee_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridFee_EUR_per_MWh: v }))} /></Field>
                 <Field label="Capacity charge" unit="€/kW/yr"><Num value={loc.capacityCharge_EUR_per_kW_yr} onChange={(v) => setLocOverride((s) => ({ ...s, capacityCharge_EUR_per_kW_yr: v }))} /></Field>
                 <Field label="Grid emission factor" unit="gCO₂/kWh"><Num value={loc.gridCO2_g_per_kWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridCO2_g_per_kWh: v }))} /></Field>
-                <Field label="Annual mean dry bulb" unit="°C"><Txt value={fmt(annualMeanT, 1)} readOnly /></Field>
+                <Field label="Average air temperature" unit="°C" explain="Dry bulb is simply the air temperature a normal thermometer reads, with no allowance for humidity. It is used three ways here: solar panels lose output as they heat up, engines and turbines lose rating above 25 °C, and cooling plant can run on outside air alone when it is cold enough."><Txt value={fmt(annualMeanT, 1)} readOnly /></Field>
               </div>
 
               <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
@@ -3920,7 +4000,7 @@ export default function MicrogridDesignTool() {
                   </div>
                 </div>
                 <div>
-                  <div className={`mb-1 text-xs ${T.faint}`}>Monthly mean dry bulb (°C) — PV derate, free cooling, thermal plant derating</div>
+                  <div className={`mb-1 text-xs ${T.faint}`}>Average air temperature by month (°C) — drives panel losses, free cooling hours and engine derating</div>
                   <div className="grid grid-cols-6 gap-1">
                     {loc.tempMeanC.map((v, i) => (
                       <div key={i}>
@@ -4068,8 +4148,8 @@ export default function MicrogridDesignTool() {
 
               <Advanced key={`aidc-${density}`} title="Advanced — thermal design point, UPS, footprints and site limits" count={11} defaultOpen={showAll}>
                 <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                  <Field label="Design ambient for that PUE" unit="°C"><Num value={aidc.designAmbientC} onChange={(v) => setAidc((s) => ({ ...s, designAmbientC: v }))} /></Field>
-                  <Field label="Free cooling below" unit="°C dry bulb"><Num value={aidc.freeCoolingBelowC} onChange={(v) => setAidc((s) => ({ ...s, freeCoolingBelowC: v }))} /></Field>
+                  <Field label="Air temperature the PUE is quoted at" unit="°C" explain="Cooling plant is sized for a hot day. The design PUE applies at this temperature; on a typical day the site does better, which is why the annualised PUE below comes out lower."><Num value={aidc.designAmbientC} onChange={(v) => setAidc((s) => ({ ...s, designAmbientC: v }))} /></Field>
+                  <Field label="Free cooling below" unit="°C air temp" explain="Below this outside air temperature the cooling plant can reject heat without running chillers, so it uses only fan and pump power. The colder the site, the more hours of the year this applies."><Num value={aidc.freeCoolingBelowC} onChange={(v) => setAidc((s) => ({ ...s, freeCoolingBelowC: v }))} /></Field>
                   <Field label="IT utilisation" unit="% of installed"><Num value={aidc.itUtilisationPct} onChange={(v) => setAidc((s) => ({ ...s, itUtilisationPct: v }))} /></Field>
                   <Field label="Swing timescale" unit="s"><Num value={aidc.loadSwingSeconds} onChange={(v) => setAidc((s) => ({ ...s, loadSwingSeconds: v }))} /></Field>
                   <Field label="UPS / ride-through" unit="—">
@@ -4118,8 +4198,14 @@ export default function MicrogridDesignTool() {
           {/* 2. LOAD INPUT */}
           {tab === 2 && mode === "standard" && (
             <Panel title="Load" step="3"
-              right={<Seg value={loadCfg.path} onChange={(v) => setLoadCfg((s) => ({ ...s, path: v }))}
-                options={[{ value: "csv", label: "Upload CSV" }, { value: "parametric", label: "Parametric" }]} />}>
+              right={
+                <div className="flex items-center gap-2">
+                  <button onClick={() => downloadCSV("load-profile-template.csv", buildLoadTemplateCSV(cal))}
+                    className={`rounded border px-2 py-1 text-xs ${T.btn}`}>Download template</button>
+                  <Seg value={loadCfg.path} onChange={(v) => setLoadCfg((s) => ({ ...s, path: v }))}
+                    options={[{ value: "csv", label: "Upload a file" }, { value: "parametric", label: "Build from figures" }]} />
+                </div>
+              }>
               {loadCfg.path === "csv" ? (
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
@@ -4188,10 +4274,13 @@ export default function MicrogridDesignTool() {
               <Field tier="critical" label="Critical load (served in island)" unit="% of load">
                 <Num value={char.critPct} onChange={(v) => setChar((s) => ({ ...s, critPct: v, touched: true }))} />
               </Field>
-              <Field tier="critical" label="Largest single load step" unit="kW" hint={mode === "aidc" ? "pre-filled from the compute swing" : "drives the dynamic adequacy check"}>
+              <Field tier="critical" label="Biggest sudden jump in demand" unit="kW"
+                explain="The largest amount of load that can switch on at once — a compressor bank, a crane hoist, a block of servers starting a training job. It cannot be read off the hourly profile, because an hourly average hides a step that happens in two seconds. It decides how much instant response the design needs."
+                hint={mode === "aidc" ? "pre-filled from the compute swing" : "must be entered — an hourly profile cannot show it"}>
                 <Num value={mode === "aidc" && !char.touched ? Math.round(aidcOut.stepKW) : char.stepKW} step={10} onChange={(v) => setChar((s) => ({ ...s, stepKW: v, touched: true }))} />
               </Field>
-              <Field tier="critical" label="Largest motor start" unit="kW"><Num value={char.motorKW} step={10} onChange={(v) => setChar((s) => ({ ...s, motorKW: v, touched: true }))} /></Field>
+              <Field tier="critical" label="Biggest motor started direct" unit="kW"
+                explain="A motor draws several times its rated power for a few seconds while it runs up to speed — around six times when switched straight on, three with a soft starter, barely any with a variable-speed drive. Enter the motor's rating; the tool applies the multiplier for the starting method."><Num value={char.motorKW} step={10} onChange={(v) => setChar((s) => ({ ...s, motorKW: v, touched: true }))} /></Field>
               <Field tier="critical" label="Critical load at peak" unit="kW"><Txt value={fmt(stats.peakKW * char.critPct / 100, 0)} readOnly /></Field>
             </div>
 
@@ -4199,7 +4288,7 @@ export default function MicrogridDesignTool() {
               <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
                 <Field label="Sheddable tier 1" unit="% of load"><Num value={char.shed1Pct} onChange={(v) => setChar((s) => ({ ...s, shed1Pct: v, touched: true }))} /></Field>
                 <Field label="Sheddable tier 2" unit="% of load"><Num value={char.shed2Pct} onChange={(v) => setChar((s) => ({ ...s, shed2Pct: v, touched: true }))} /></Field>
-                <Field label="Starting method" unit="—">
+                <Field label="How that motor is started" unit="—" explain="Direct on line is cheapest to install and worst for the generator. A variable-speed drive removes the problem almost entirely.">
                   <Sel value={char.motorMethod} onChange={(v) => setChar((s) => ({ ...s, motorMethod: v }))}
                     options={[{ value: "DOL", label: "Direct on line" }, { value: "SOFT", label: "Soft starter" }, { value: "VSD", label: "VSD" }]} />
                 </Field>
@@ -4256,7 +4345,7 @@ export default function MicrogridDesignTool() {
 
             <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
               <div>
-                <div className={`mb-1 text-xs ${T.faint}`}>Load duration curve — kW against % of hours exceeded</div>
+                <div className={`mb-1 text-xs ${T.faint}`} title="Take all 8760 hours, sort them from the highest demand to the lowest, and plot them. It answers 'how often is demand actually that high?'. A curve that drops away steeply on the left means the peak lasts only a few hours a year, which is exactly the shape a battery can shave cheaply. A flat curve means the site sits near its peak most of the year, and shaving it needs far more energy.">Load duration curve — every hour of the year sorted from highest demand to lowest</div>
                 <div className="h-48">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={ldc} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
@@ -4383,26 +4472,25 @@ export default function MicrogridDesignTool() {
                   <Field tier="critical" label="Energy capacity" unit="kWh" hint={`${fmt(res.bess.energyKWh / Math.max(1, res.bess.powerKW), 2)} h at rated power`}>
                     <Num value={res.bess.energyKWh} step={100} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, energyKWh: v } }))} />
                   </Field>
-                  <Field tier="critical" label="Reserve SOC held for resilience" unit="%"
-                    hint={reserveApplies ? "hard constraint — dispatch may not go below" : "islanding not required, so not enforced"}>
-                    <Num value={res.bess.reserveSocPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, reserveSocPct: v } }))} />
+                  <Field tier="critical" label="Duration at rated power" unit="hours"
+                    explain="Energy divided by power. Two hours means the battery can hold its full rated output for two hours before it is empty.">
+                    <Txt value={`${fmt(res.bess.energyKWh / Math.max(1, res.bess.powerKW), 2)} h`} readOnly />
                   </Field>
-                  <Field tier="critical" label="Grid-forming" unit="—" hint="carries the island and the load step">
+                  <Field tier="critical" label="Can it run the site on its own?" unit="—" explain="A grid-forming battery sets voltage and frequency itself, so it can hold an island with no generator running and can absorb a sudden load step instantly. A grid-following one can only inject power alongside a source that is already setting the frequency.">
                     <Sel value={res.bess.gridForming ? "yes" : "no"} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, gridForming: v === "yes" } }))}
                       options={[{ value: "yes", label: "Grid-forming" }, { value: "no", label: "Grid-following" }]} />
                   </Field>
                 </div>
                 <Advanced key={`bess-${density}`} title="Advanced — efficiency, SOC window, C-rate, arbitrage" count={6} defaultOpen={showAll}>
                   <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                    <Field label="Round-trip efficiency (AC–AC)" unit="%"><Num value={res.bess.rtePct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, rtePct: v } }))} /></Field>
-                    <Field label="C-rate limit" unit="1/h"><Num value={res.bess.cRate} step={0.05} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, cRate: v } }))} /></Field>
+                    <Field label="Round-trip efficiency (AC–AC)" unit="%" explain="Of every 100 kWh put into the battery, this is how much comes back out at the same point in the network. The rest is lost in the inverter and the cells. It sets how big a price spread arbitrage needs before it pays."><Num value={res.bess.rtePct} step={0.5} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, rtePct: v } }))} /></Field>
+                    <Field label="C-rate limit" unit="1/h" explain="Rated power divided by energy capacity. A 0.5 C battery can deliver its full energy over two hours; 1 C over one hour. It caps how fast the battery may charge or discharge, independently of the inverter size."><Num value={res.bess.cRate} step={0.05} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, cRate: v } }))} /></Field>
                     <Field label="SOC window, minimum" unit="%"><Num value={res.bess.socMinPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, socMinPct: v } }))} /></Field>
                     <Field label="SOC window, maximum" unit="%"><Num value={res.bess.socMaxPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, socMaxPct: v } }))} /></Field>
                     <Field label="Starting SOC" unit="%"><Num value={res.bess.startSocPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, startSocPct: v } }))} /></Field>
                     <Field label="Grid-forming step capability" unit="% of rating"><Num value={res.bess.gridFormingStepPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, gridFormingStepPct: v } }))} /></Field>
-                    <Field label="Charge from cheap grid hours" unit="—">
-                      <Sel value={res.bess.arbitrage ? "yes" : "no"} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, arbitrage: v === "yes" } }))}
-                        options={[{ value: "no", label: "No" }, { value: "yes", label: "Yes" }]} />
+                    <Field label="Depth of discharge" unit="%" explain="Not entered separately: it is the SOC window above. 4 % to 96 % is a 92 % depth of discharge.">
+                      <Txt value={`${fmt(res.bess.socMaxPct - res.bess.socMinPct, 0)} % (from the SOC window)`} readOnly />
                     </Field>
                   </div>
                 </Advanced>
@@ -4422,7 +4510,7 @@ export default function MicrogridDesignTool() {
                   <Field tier="critical" label="Unit rating" unit="kW" hint={`fleet ${fmt(res.engine.units * res.engine.unitKW / 1000, 1)} MW`}>
                     <Num value={res.engine.unitKW} step={100} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, unitKW: v } }))} />
                   </Field>
-                  <Field tier="critical" label="Minimum stable load" unit="% of unit"
+                  <Field tier="critical" label="Lowest load a unit can run at" unit="% of unit" explain="A running engine cannot be turned down below roughly a third of its rating without fouling and damage. If the site needs less than that, the engine still produces its minimum and the surplus is wasted — which is why oversized generators ruin an otherwise good design."
                     hint={`one unit will not run below ${fmt(res.engine.unitKW * res.engine.minStableLoadPct / 100, 0)} kW`}>
                     <Num value={res.engine.minStableLoadPct} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, minStableLoadPct: v } }))} />
                   </Field>
@@ -4476,9 +4564,8 @@ export default function MicrogridDesignTool() {
                     <Sel value={res.tariff.structure} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, structure: v } }))}
                       options={[{ value: "flat", label: "Flat" }, { value: "tou", label: "Time of use" }]} />
                   </Field>
-                  <Field tier="critical" label="Peak-shaving target" unit="kW" hint="0 = no shaving; drives the demand charge">
-                    <Num value={res.shave.enabled ? res.shave.targetKW : 0} step={50}
-                      onChange={(v) => setRes((s) => ({ ...s, shave: { enabled: v > 0, targetKW: v } }))} />
+                  <Field label="Demand charge" unit="€/kW/yr" explain="Charged on the highest power drawn in each month. This is what peak shaving on the Microgrid tab is worth.">
+                    <Txt value={fmt(loc.capacityCharge_EUR_per_kW_yr, 1)} readOnly />
                   </Field>
                   <Field label="Peak multiplier" unit="× base"><Num value={res.tariff.peakMultiplier} step={0.05} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, peakMultiplier: v } }))} /></Field>
                   <Field label="Off-peak multiplier" unit="× base"><Num value={res.tariff.offPeakMultiplier} step={0.05} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, offPeakMultiplier: v } }))} /></Field>
@@ -4489,12 +4576,121 @@ export default function MicrogridDesignTool() {
 
           )}
 
+          {/* ================= MICROGRID — WHAT IT IS FOR, AND THE LOGIC THAT FOLLOWS ========= */}
+          {tab === 4 && (
+            <Panel title="Microgrid" step="5" sub="what the microgrid is for, and the operating logic that follows"
+              right={
+                <button onClick={() => { applyUseCaseLogic(); setLogicApplied(true); }}
+                  className={`rounded border px-3 py-1 text-xs ${T.chip}`}>Apply the use case</button>
+              }>
+              <div className={`mb-3 rounded border px-2 py-2 text-xs ${T.soft.cyan} ${T.muted}`}>
+                Everything on this tab describes <em>intent</em>: what the microgrid is being built to do. The operating
+                logic underneath follows from it. Press <strong>Apply the use case</strong> to set the logic from the intent,
+                then override anything you disagree with — the dispatch uses whatever is showing here, not the use case label.
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Field tier="critical" label="What is this microgrid for?" unit="—"
+                  explain="Sets the operating logic below: which asset covers the gap first, whether the battery is held in reserve, and whether it is allowed to trade on price.">
+                  <Sel value={ctx.useCase} onChange={applyUseCase}
+                    options={Object.entries(USE_CASE_FAMILIES).map(([k, v]) => ({ value: k, label: v.label }))} />
+                </Field>
+                <Field tier="critical" label="Must it run without the grid?" unit="—"
+                  explain="Planned islanding: you can charge the battery in advance because you know the outage is coming (a scheduled grid outage, a test). Unplanned: the outage arrives without warning, so only the energy already reserved is available.">
+                  <Sel value={ctx.islanding} onChange={(v) => setCtx((s2) => ({ ...s2, islanding: v }))}
+                    options={[{ value: "none", label: "No — grid is always there" },
+                      { value: "planned", label: "Yes, with warning (planned)" },
+                      { value: "unplanned", label: "Yes, without warning (unplanned)" }]} />
+                </Field>
+                <Field tier="critical" label="For how long, at critical load?" unit="hours"
+                  explain="How long the site must keep its critical load running with no grid. This is what sizes the reserve held in the battery, and it is checked on the Reliability tab.">
+                  <Num value={ctx.autonomyH} onChange={(v) => setCtx((s2) => ({ ...s2, autonomyH: v }))} disabled={ctx.islanding === "none"} />
+                </Field>
+                <Field tier="critical" label="Cap on power drawn from the grid" unit="kW"
+                  explain="A demand-charge target. The battery discharges to hold the meter below this level, because European tariffs bill the highest power drawn in each month. Set 0 to switch peak shaving off.">
+                  <Num value={res.shave.enabled ? res.shave.targetKW : 0} step={50}
+                    onChange={(v) => setRes((s2) => ({ ...s2, shave: { enabled: v > 0, targetKW: v } }))} />
+                </Field>
+              </div>
+
+              {/* The resulting logic */}
+              <div className={`mt-3 rounded border ${T.tile}`}>
+                <div className={`flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1.5 ${T.rule}`}>
+                  <span className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Operating logic — the merit order</span>
+                  <span className={`font-mono text-xs ${T.ghost}`}>
+                    {logicApplied ? "set from the use case, editable below" : "current settings"}
+                  </span>
+                </div>
+                <div className="p-2">
+                  <ol className="space-y-1">
+                    {meritOrderSteps.map((st2, i) => (
+                      <li key={i} className={`flex items-baseline gap-2 rounded px-2 py-1 ${st2.fixed ? T.soft.slate : T.soft.cyan}`}>
+                        <span className={`w-5 shrink-0 font-mono text-xs ${T.tone.cyan}`}>{i + 1}</span>
+                        <span className={`text-xs ${T.title}`}>{st2.label}</span>
+                        <span className={`ml-auto shrink-0 font-mono text-xs ${T.ghost}`}>{st2.fixed ? "fixed" : "your choice"}</span>
+                      </li>
+                    ))}
+                  </ol>
+                  <div className={`mt-2 text-xs ${T.faint}`}>
+                    Steps marked “fixed” are not preferences: renewables are free at the margin so they always go first, and
+                    shedding load is always the last resort. The order of the middle steps is the real decision, and it is
+                    yours to make.
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Field tier="critical" label="Who covers the gap first?" unit="—"
+                  explain="After renewables and grid import, something has to cover what is left. Discharging the battery first saves fuel but leaves less stored energy for an outage. Running engines first keeps the battery full for resilience but burns more fuel.">
+                  <Sel value={res.meritOrder} onChange={(v) => setRes((s2) => ({ ...s2, meritOrder: v }))}
+                    options={[{ value: "storage-first", label: "Battery first — save fuel" },
+                      { value: "thermal-first", label: "Engines first — keep the battery charged" }]} />
+                </Field>
+                <Field tier="critical" label="Energy held back for an outage" unit="% state of charge"
+                  explain="A hard floor the dispatch may never cross while the grid is present. It is what turns a battery that saves money into a battery you can also rely on. Higher means more security and less earning.">
+                  <Num value={res.bess.reserveSocPct} onChange={(v) => setRes((s2) => ({ ...s2, bess: { ...s2.bess, reserveSocPct: v } }))} disabled={!res.bess.enabled} />
+                </Field>
+                <Field tier="critical" label="Buy cheap power to store it?" unit="—"
+                  explain="Whether the battery is allowed to charge from the grid in low-price hours and use that energy later. This is a commercial choice, not a property of the battery — it needs a variable tariff to be worth anything.">
+                  <Sel value={res.bess.arbitrage ? "yes" : "no"} onChange={(v) => setRes((s2) => ({ ...s2, bess: { ...s2.bess, arbitrage: v === "yes" } }))}
+                    options={[{ value: "no", label: "No — self-consumption only" }, { value: "yes", label: "Yes — trade on price" }]} />
+                </Field>
+                <Field tier="critical" label="Look ahead when deciding" unit="hours"
+                  explain="How far forward the battery rules may look. With a horizon it spreads its energy across the peaks it can see and avoids charging just before free solar arrives. Set the toggle to off for pure merit order with no foresight.">
+                  <div className="flex gap-1">
+                    <Sel value={res.lookahead.enabled ? "on" : "off"} onChange={(v) => setRes((s2) => ({ ...s2, lookahead: { ...s2.lookahead, enabled: v === "on" } }))}
+                      options={[{ value: "on", label: "On" }, { value: "off", label: "Off" }]} />
+                    <Num value={res.lookahead.horizonH} step={6} onChange={(v) => setRes((s2) => ({ ...s2, lookahead: { ...s2.lookahead, horizonH: v } }))} />
+                  </div>
+                </Field>
+              </div>
+
+              <Advanced key={`mg-${density}`} title="Advanced — export, sheddable tiers, non-firm connection terms" count={4} defaultOpen={showAll}>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field label="Power allowed back to the grid" unit="kW" explain="Export limit. Zero means surplus renewable output has to be stored or thrown away.">
+                    <Num value={ctx.exportCapKW} step={100} onChange={(v) => setCtx((s2) => ({ ...s2, exportCapKW: v }))} />
+                  </Field>
+                  <Field label="Load that may be dropped first" unit="% of load" explain="Tier 2: the lowest-priority load. In a shortage the dispatch drops this before anything else.">
+                    <Num value={char.shed2Pct} onChange={(v) => setChar((s2) => ({ ...s2, shed2Pct: v, touched: true }))} />
+                  </Field>
+                  <Field label="Load that may be dropped second" unit="% of load" explain="Tier 1: dropped only once tier 2 is already off.">
+                    <Num value={char.shed1Pct} onChange={(v) => setChar((s2) => ({ ...s2, shed1Pct: v, touched: true }))} />
+                  </Field>
+                  <Field label="Load that must never be dropped" unit="% of load" explain="The critical load. This is what the autonomy requirement is measured against.">
+                    <Num value={char.critPct} onChange={(v) => setChar((s2) => ({ ...s2, critPct: v, touched: true }))} />
+                  </Field>
+                </div>
+              </Advanced>
+            </Panel>
+          )}
+
           {/* ================= DISPATCH ================= */}
-          {tab === 4 && !runOut && <NeedsRun />}
-          {tab === 4 && runOut && (
-          <Panel title="Dispatch" step="5" sub="deterministic priority merit order — every hour is readable"
+          {tab === 5 && !runOut && <NeedsRun />}
+          {tab === 5 && runOut && (
+          <Panel title="Dispatch" step="6" sub="what each piece of equipment does in every hour of the year"
             right={
               <div className="flex flex-wrap items-center gap-2">
+                <DetailToggle value={detail.dispatch} onChange={(v) => setDetail((s2) => ({ ...s2, dispatch: v }))} />
                 <Seg value={view.span} onChange={(v) => setView((s) => ({ ...s, span: v }))}
                   options={[{ value: "day", label: "Day" }, { value: "week", label: "Week" }, { value: "month", label: "Month" }]} />
                 <input type="range" min={0} max={364} value={view.startDay} className="w-40"
@@ -4502,11 +4698,13 @@ export default function MicrogridDesignTool() {
                 <span className={`font-mono text-xs ${T.faint}`}>from {dayLabel(view.startDay)}</span>
               </div>
             }>
+            {detail.dispatch === "detail" && (
             <div className={`mb-2 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
               Order every hour: renewables → grid import to the cap → battery above the reserve → engines at or above minimum
               stable load → turbine → charge from surplus, then from cheap grid hours → export or curtail → shed by tier, then unserved.
               The reason code names the highest-severity constraint that bound the hour.
             </div>
+            )}
 
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
@@ -4547,6 +4745,7 @@ export default function MicrogridDesignTool() {
               <Stat label="Billed peak (mean of 12 monthly)" value={fmt(disp.summary.meanMonthlyPeakKW / 1000, 2)} unit="MW" tone="cyan" />
             </div>
 
+            {detail.dispatch === "detail" && (<>
             {/* Engine self-test — reliability shown, not asserted */}
             <div className={`mt-3 rounded border ${T.tile}`}>
               <div className={`flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1.5 ${T.rule}`}>
@@ -4591,15 +4790,9 @@ export default function MicrogridDesignTool() {
               <div className={`flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1.5 ${T.rule}`}>
                 <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Dispatch quality</span>
                 <div className="flex items-center gap-2">
-                  <span className={`text-xs ${T.faint}`}>Look-ahead horizon</span>
-                  <Seg value={res.lookahead.enabled ? "on" : "off"}
-                    onChange={(v) => setRes((s2) => ({ ...s2, lookahead: { ...s2.lookahead, enabled: v === "on" } }))}
-                    options={[{ value: "off", label: "Merit order only" }, { value: "on", label: "With look-ahead" }]} />
-                  <div style={{ width: 90 }}>
-                    <Num value={res.lookahead.horizonH} step={6}
-                      onChange={(v) => setRes((s2) => ({ ...s2, lookahead: { ...s2.lookahead, horizonH: v } }))} />
-                  </div>
-                  <span className={`font-mono text-xs ${T.ghost}`}>h</span>
+                  <span className={`font-mono text-xs ${T.ghost}`}>
+                    {res.lookahead.enabled ? `${res.lookahead.horizonH} h look-ahead` : "no look-ahead"} · set on the Microgrid tab
+                  </span>
                   <Badge v={runOut.diag.clean ? "PASS" : "MARGINAL"} />
                 </div>
               </div>
@@ -4673,7 +4866,10 @@ export default function MicrogridDesignTool() {
               </div>
             </div>
 
+            </>)}
+
             {/* Hourly audit table */}
+            {detail.dispatch === "detail" && (
             <div className="mt-3">
               <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2">
                 <span className={`text-xs ${T.faint}`}>
@@ -4722,13 +4918,15 @@ export default function MicrogridDesignTool() {
                 Dispatch runs in {fmt(dispatchMs, 0)} ms.
               </p>
             </div>
+            )}
           </Panel>
           )}
 
           {/* ================= PHASE 3 — ADEQUACY ================= */}
-          {tab === 5 && !runOut && <NeedsRun />}
-          {tab === 5 && runOut && (<>
-            <Panel title="Reliability" step="6" sub="three independent verdicts — never combined into one score">
+          {tab === 6 && !runOut && <NeedsRun />}
+          {tab === 6 && runOut && (<>
+            <Panel title="Reliability" step="7" sub="can the design actually keep the lights on"
+              right={<DetailToggle value={detail.reliability} onChange={(v) => setDetail((s2) => ({ ...s2, reliability: v }))} />}>
               <div className={`mb-3 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
                 A design that fails dynamic adequacy is not viable because energy and power pass. Each check below shows the
                 number that governs it. Dynamic adequacy is assessed in island mode, since that is when the microgrid must
@@ -4752,7 +4950,7 @@ export default function MicrogridDesignTool() {
                         </ul>
                       </div>
                     )}
-                    <Trace lines={[
+                    {detail.reliability === "detail" && <Trace lines={[
                       { label: "Unserved energy", expr: `over 8760 h, ${fmt(adeq.energy.unservedPct, 3)} % of annual load`, result: `${fmt(adeq.energy.unservedMWh, 2)} MWh/yr` },
                       { label: "Load shed", expr: "tier 1 + tier 2 curtailed by the dispatch", result: `${fmt(adeq.energy.shedMWh, 2)} MWh/yr` },
                       { label: "Island load", expr: `${fmt(char.critPct, 0)} % critical of ${fmt(stats.peakKW / 1000, 2)} MW peak + parasitics`, result: `${fmt(adeq.energy.islandLoadKW / 1000, 2)} MW` },
@@ -4760,7 +4958,7 @@ export default function MicrogridDesignTool() {
                       { label: "Autonomy achieved", expr: `stored energy ÷ island load, against ${fmt(adeq.energy.autonomyRequiredH, 0)} h required`, result: `${fmt(adeq.energy.autonomyFromBessH, 1)} h` },
                       { label: "Engines in island", expr: `${fmt(adeq.energy.engineFirmKW / 1000, 2)} MW firm against ${fmt(adeq.energy.islandLoadKW / 1000, 2)} MW island load`, result: adeq.energy.enginesCarryIsland ? "can carry it" : "cannot carry it alone" },
                       { label: `Worst ${adeq.energy.worstWindowH} h renewable spell`, expr: `from ${adeq.energy.worstWindowLabel} — renewables cover ${fmt(adeq.energy.worstRenewableShare * 100, 1)} % of load`, result: `${fmt(adeq.energy.worstDeficitMWh, 0)} MWh from storage and fuel` },
-                    ]} />
+                    ]} />}
                   </div>
                 </div>
 
@@ -4780,14 +4978,14 @@ export default function MicrogridDesignTool() {
                         </ul>
                       </div>
                     )}
-                    <Trace lines={[
+                    {detail.reliability === "detail" && <Trace lines={[
                       { label: "Coincident peak", expr: `site peak ${fmt(stats.peakKW / 1000, 2)} MW + parasitics ${fmt(adeq.power.parasiticKW / 1000, 2)} MW`, result: `${fmt(adeq.power.coincidentPeakKW / 1000, 2)} MW` },
                       { label: "Firm capacity, all", expr: "grid + engines + turbine + BESS power; renewables count zero", result: `${fmt(adeq.power.firmKW / 1000, 2)} MW` },
                       { label: "Largest single unit", expr: adeq.power.largestUnit ? `${adeq.power.largestUnit.name}${adeq.power.losesGridForming ? " — also the grid-forming source" : ""}` : "none", result: `${fmt((adeq.power.largestUnit?.kW || 0) / 1000, 2)} MW` },
                       { label: "Firm after N-1", expr: "largest unit removed", result: `${fmt(adeq.power.firmAfterN1KW / 1000, 2)} MW` },
                       { label: "Margin", expr: "firm after N-1 − coincident peak", result: `${fmt(adeq.power.marginKW / 1000, 2)} MW` },
-                    ]} />
-                    <div className={`mt-2 max-h-32 overflow-auto rounded border ${T.panel}`}>
+                    ]} />}
+                    {detail.reliability === "detail" && <div className={`mt-2 max-h-32 overflow-auto rounded border ${T.panel}`}>
                       <table className="w-full text-right font-mono text-xs">
                         <tbody>
                           {adeq.power.units.map((u, i) => (
@@ -4800,7 +4998,7 @@ export default function MicrogridDesignTool() {
                           ))}
                         </tbody>
                       </table>
-                    </div>
+                    </div>}
                   </div>
                 </div>
 
@@ -4820,7 +5018,7 @@ export default function MicrogridDesignTool() {
                         </ul>
                       </div>
                     )}
-                    <Trace lines={[
+                    {detail.reliability === "detail" && <Trace lines={[
                       { label: "Largest load step", expr: mode === "aidc" ? "collective compute swing" : "specified separately from the profile", result: `${fmt(adeq.dynamic.loadStepKW / 1000, 2)} MW` },
                       { label: "Motor start", expr: `${fmt(char.motorKW, 0)} kW × ${fmt(adeq.dynamic.inrush, 1)} inrush (${adeq.dynamic.motorMethod})`, result: `${fmt(adeq.dynamic.motorStepKW / 1000, 2)} MW` },
                       { label: "Governing step", expr: "the larger of the two", result: `${fmt(adeq.dynamic.worstStepKW / 1000, 2)} MW` },
@@ -4829,11 +5027,11 @@ export default function MicrogridDesignTool() {
                       { label: "System inertia", expr: `rotating plant only, H ${fmt(CONSTANTS.INERTIA_H_ENGINE_S, 1)} s engines / ${fmt(CONSTANTS.INERTIA_H_TURBINE_S, 1)} s turbine`, result: `${fmt(adeq.dynamic.inertiaMWs, 1)} MW·s` },
                       { label: "RoCoF", expr: `ΔP ${fmt(adeq.dynamic.deficitMW, 2)} MW × 50 Hz ÷ (2 × ΣH·S)`, result: adeq.dynamic.rocof === Infinity ? "no inertia" : `${fmt(adeq.dynamic.rocof, 2)} Hz/s` },
                       { label: "Frequency nadir", expr: `RoCoF × ${fmt(CONSTANTS.GOVERNOR_RESPONSE_TIME_S, 1)} s governor response`, result: adeq.dynamic.nadirHz === Infinity ? "collapse" : `−${fmt(adeq.dynamic.nadirHz, 2)} Hz` },
-                    ]} />
-                    <p className={`mt-2 text-xs ${T.faint}`}>
+                    ]} />}
+                    {detail.reliability === "detail" && <p className={`mt-2 text-xs ${T.faint}`}>
                       First-order estimate. Thresholds: RoCoF {fmt(CONSTANTS.ROCOF_PASS_HZ_PER_S, 1)} / {fmt(CONSTANTS.ROCOF_MARGINAL_HZ_PER_S, 1)} Hz/s,
                       nadir {fmt(CONSTANTS.FREQ_NADIR_PASS_HZ, 1)} / {fmt(CONSTANTS.FREQ_NADIR_MARGINAL_HZ, 1)} Hz. Not a substitute for an EMT study.
-                    </p>
+                    </p>}
                   </div>
                 </div>
               </div>
@@ -4841,9 +5039,9 @@ export default function MicrogridDesignTool() {
           </>)}
 
           {/* ================= PHASE 3 — BOM ================= */}
-          {tab === 6 && !runOut && <NeedsRun />}
-          {tab === 6 && runOut && (
-            <Panel title="System" step="7" sub="the equipment list and how it all connects">
+          {tab === 7 && !runOut && <NeedsRun />}
+          {tab === 7 && runOut && (
+            <Panel title="System" step="8" sub="the equipment list and how it all connects">
               <div className={`rounded border p-2 ${T.tile}`}>
                 <div className={`mb-1 text-xs uppercase tracking-wide ${T.faint}`}>How the system connects</div>
                 <SystemDiagram T={T} res={res} gridOn={gridForBom.enabled}
@@ -4902,9 +5100,9 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= PHASE 4 — COSTS AND LCOE ================= */}
-          {tab === 7 && !runOut && <NeedsRun />}
-          {tab === 7 && runOut && cost && (
-            <Panel title="Costs" step="8" sub="every assumption that produced the number is on this screen"
+          {tab === 8 && !runOut && <NeedsRun />}
+          {tab === 8 && runOut && cost && (
+            <Panel title="Costs" step="9" sub="every assumption that produced the number is on this screen"
               right={<span className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chipWarn}`}>estimate class: AACE Class 5 (−30 % / +50 %)</span>}>
 
               {/* The formula, written out */}
@@ -5038,8 +5236,8 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= AUTO-SIZE ================= */}
-          {tab === 8 && (
-            <Panel title="Auto-size" step="9" sub="a bounded sweep ranked by LCOE — not an optimiser, and not an answer"
+          {tab === 9 && (
+            <Panel title="Auto-size" step="10" sub="a bounded sweep ranked by LCOE — not an optimiser, and not an answer"
               right={
                 <button onClick={runAutoSize} disabled={sweeping}
                   className={`rounded border px-3 py-1 text-xs ${sweeping ? T.chipIdle : T.chip}`}>
@@ -5199,10 +5397,13 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= REPORT ================= */}
-          {tab === 9 && (
-            <Panel title="Report" step="10" sub="energy and financial analytics for the current design"
+          {tab === 10 && (
+            <Panel title="Report" step="11" sub="the need, the solution, and what it delivers"
               right={
+                <div className="flex items-center gap-2">
+                <DetailToggle value={detail.report} onChange={(v) => setDetail((s2) => ({ ...s2, report: v }))} />
                 <button onClick={doExport} className={`rounded border px-3 py-1 text-xs ${T.chip}`}>Export Excel workbook</button>
+                </div>
               }>
               {!runOut ? <NeedsRun /> : (<>
                 {/* 1 — WHAT THE PROJECT HAS TO DO */}
@@ -5298,6 +5499,7 @@ export default function MicrogridDesignTool() {
                   </div>
                 </div>
 
+                {detail.report === "detail" && (<>
                 {/* Energy analytics */}
                 <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
                   <div>
@@ -5387,6 +5589,7 @@ export default function MicrogridDesignTool() {
                   </>)}
                 </div>
 
+                </>)}
                 <p className={`mt-2 text-xs ${T.faint}`}>
                   Estimate class AACE 5 (−30 % / +50 %). Pre-feasibility only — not a substitute for a protection study, an EMT
                   study, or a contractor's price. The Excel workbook contains every input and default used, with units.
@@ -5396,8 +5599,8 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= SCENARIOS ================= */}
-          {tab === 10 && (
-            <Panel title="Compare" step="11" sub="up to six saved in this session"
+          {tab === 11 && (
+            <Panel title="Compare" step="12" sub="up to six saved in this session"
               right={
                 <div className="flex items-center gap-2">
                   <input className={inpCls(T)} style={{ width: 160 }} value={scenarioName} placeholder="name this scenario"
@@ -5459,8 +5662,8 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= CHECKS AND NOTES ================= */}
-          {tab === 11 && (
-            <Panel title="Checks" step="12" sub="warnings, never blockers"
+          {tab === 12 && (
+            <Panel title="Checks" step="13" sub="warnings, never blockers"
               right={
                 <div className="flex items-center gap-2">
                   <span className={`rounded px-2 py-0.5 font-mono text-xs ${notices.some((n) => n.level === "warn") ? T.chipWarn : T.chipOk}`}>
