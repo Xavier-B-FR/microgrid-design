@@ -2613,6 +2613,8 @@ export const THEMES = {
     rule: "border-slate-800",
     tile: "border-slate-800 bg-slate-950",
     input: "border-slate-700 bg-slate-950 text-slate-100 focus:border-cyan-500",
+    inputSite: "border-amber-800 bg-amber-950 text-amber-50 focus:border-amber-500",
+    inputLib: "border-slate-800 bg-slate-900 text-slate-400 focus:border-cyan-500",
     micro: "border-slate-800 bg-slate-950 text-slate-300",
     title: "text-slate-50",
     muted: "text-slate-400",
@@ -2648,6 +2650,8 @@ export const THEMES = {
     rule: "border-slate-200",
     tile: "border-slate-200 bg-slate-50",
     input: "border-slate-300 bg-white text-slate-900 focus:border-cyan-600",
+    inputSite: "border-amber-300 bg-yellow-50 text-slate-900 focus:border-amber-500",
+    inputLib: "border-slate-200 bg-slate-50 text-slate-500 focus:border-cyan-600",
     micro: "border-slate-200 bg-white text-slate-700",
     title: "text-slate-900",
     muted: "text-slate-600",
@@ -2680,6 +2684,14 @@ export const THEMES = {
 
 const ThemeCtx = createContext(THEMES.dark);
 const useT = () => useContext(ThemeCtx);
+
+/* Where the value in a control has to come from, so the control can colour itself. */
+const SourceCtx = createContext(null);
+const useSource = () => useContext(SourceCtx);
+const SOURCE_HELP = {
+  site: "Specific to your project — the library cannot guess it",
+  library: "Library default — usually fine, editable if you know better",
+};
 
 /* ============================================================================
    UI PRIMITIVES
@@ -2716,19 +2728,6 @@ function Term({ children, explain }) {
   );
 }
 
-/** Where a number has to come from: your project, or the built-in library. */
-function SourceTag({ kind }) {
-  const T = useT();
-  if (!kind) return null;
-  const site = kind === "site";
-  return (
-    <span title={site ? "Specific to your project — the library cannot guess it" : "Library default — usually fine, editable if you know better"}
-      className={`ml-1 cursor-help rounded px-1 font-mono text-xs ${site ? T.chipWarn : T.chipIdle}`}>
-      {site ? "site" : "lib"}
-    </span>
-  );
-}
-
 function Field({ label, unit, children, hint, flag, explain, source, tier = "advanced" }) {
   const T = useT();
   const crit = tier === "critical";
@@ -2738,36 +2737,37 @@ function Field({ label, unit, children, hint, flag, explain, source, tier = "adv
         <span className={`text-xs ${crit ? `font-medium ${T.critLabel}` : T.advLabel}`}>
           <Term explain={explain}>{label}</Term>
         </span>
-        <span className={`shrink-0 font-mono text-xs ${T.ghost}`}>{unit}<SourceTag kind={source} /></span>
+        <span className={`shrink-0 font-mono text-xs ${T.ghost}`}>{unit}</span>
       </div>
-      {children}
+      <SourceCtx.Provider value={source || null}>{children}</SourceCtx.Provider>
       {hint && <div className={`mt-0.5 text-xs ${T.faint}`}>{hint}</div>}
       {flag && <div className={`mt-0.5 font-mono text-xs ${T.tone.amber}`}>{flag}</div>}
     </label>
   );
 }
 
-const inpCls = (T) => `mt-0.5 w-full rounded border px-2 py-1 font-mono text-sm focus:outline-none ${T.input}`;
+const inpCls = (T, src) => `mt-0.5 w-full rounded border px-2 py-1 font-mono text-sm focus:outline-none ${
+  src === "site" ? T.inputSite : src === "library" ? T.inputLib : T.input}`;
 
 function Num({ value, onChange, step = 1, min, max, disabled }) {
-  const T = useT();
+  const T = useT(); const src = useSource();
   return (
-    <input type="number" className={inpCls(T)} value={value === "" || value === null ? "" : value}
+    <input type="number" className={inpCls(T, src)} title={SOURCE_HELP[src]} value={value === "" || value === null ? "" : value}
       step={step} min={min} max={max} disabled={disabled}
       onChange={(e) => onChange(e.target.value === "" ? "" : Number(e.target.value))} />
   );
 }
 
 function Txt({ value, onChange, placeholder, readOnly }) {
-  const T = useT();
-  return <input className={inpCls(T)} value={value} placeholder={placeholder} readOnly={readOnly}
+  const T = useT(); const src = useSource();
+  return <input className={inpCls(T, src)} title={SOURCE_HELP[src]} value={value} placeholder={placeholder} readOnly={readOnly}
     onChange={onChange ? (e) => onChange(e.target.value) : undefined} />;
 }
 
 function Sel({ value, onChange, options, disabled }) {
-  const T = useT();
+  const T = useT(); const src = useSource();
   return (
-    <select className={inpCls(T)} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+    <select className={inpCls(T, src)} title={SOURCE_HELP[src]} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
       {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
     </select>
   );
@@ -3411,7 +3411,7 @@ export default function MicrogridDesignTool() {
     return { totalTCO2: gridT + fuelT, gridTCO2: gridT, fuelTCO2: fuelT };
   }, [disp, loc, res.engine.fuelType]);
 
-  const energyBalance = useMemo(() => (disp ? [
+  const energyBalance = useMemo(() => (disp ? ([
     { name: "Load served", value: +(disp.summary.loadMWh - disp.summary.unservedMWh).toFixed(0) },
     { name: "PV generated", value: +disp.summary.pvMWh.toFixed(0) },
     { name: "Wind generated", value: +disp.summary.windMWh.toFixed(0) },
@@ -3420,7 +3420,7 @@ export default function MicrogridDesignTool() {
     { name: "Curtailed", value: +disp.summary.curtailRenewMWh.toFixed(0) },
     { name: "Exported", value: +disp.summary.exportMWh.toFixed(0) },
     { name: "Unserved", value: +disp.summary.unservedMWh.toFixed(2) },
-  ] : []), [disp]);
+  ].filter((r) => r.value > 0)) : []), [disp]);
 
   const monthlyMix = useMemo(() => {
     if (!disp) return [];
@@ -3887,6 +3887,10 @@ export default function MicrogridDesignTool() {
                 <Field label="Last file imported" unit="—" explain="Where this session was loaded from. Inputs may have changed since.">
                   <Txt value={lastImported || "none — inputs entered by hand"} readOnly />
                 </Field>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-4">
+                <span className={`rounded border px-2 py-0.5 text-xs ${T.inputSite}`}>Yellow — specific to your project</span>
+                <span className={`rounded border px-2 py-0.5 text-xs ${T.inputLib}`}>Grey — library default, edit only if you know better</span>
               </div>
               <p className={`mt-2 text-xs ${T.faint}`}>
                 Project JSON file contains every input, every cost override, the saved scenarios and any uploaded load or
@@ -4748,15 +4752,15 @@ export default function MicrogridDesignTool() {
                   <YAxis yAxisId="r" orientation="right" tick={axis} domain={[0, 100]} label={{ value: "SOC %", angle: 90, position: "insideRight", fill: T.chart.axis, fontSize: 10 }} />
                   <Tooltip contentStyle={tip} />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
-                  <Area yAxisId="l" type="step" stackId="s" dataKey="pv" name="PV" stroke={T.chart.temp} fill={T.chart.temp} fillOpacity={0.55} />
-                  <Area yAxisId="l" type="step" stackId="s" dataKey="wind" name="Wind" stroke={T.chart.wind} fill={T.chart.wind} fillOpacity={0.55} />
-                  <Area yAxisId="l" type="step" stackId="s" dataKey="imp" name="Grid import" stroke={T.chart.imp} fill={T.chart.imp} fillOpacity={0.45} />
-                  <Area yAxisId="l" type="step" stackId="s" dataKey="bessDis" name="BESS discharge" stroke={T.chart.bessC} fill={T.chart.bessC} fillOpacity={0.55} />
-                  <Area yAxisId="l" type="step" stackId="s" dataKey="engine" name="Engines" stroke={T.chart.engineC} fill={T.chart.engineC} fillOpacity={0.55} />
-                  <Area yAxisId="l" type="step" stackId="s" dataKey="turbine" name="Turbine" stroke={T.chart.turbineC} fill={T.chart.turbineC} fillOpacity={0.55} />
-                  <Area yAxisId="l" type="step" stackId="s" dataKey="unserved" name="Unserved" stroke={T.chart.unservedC} fill={T.chart.unservedC} fillOpacity={0.8} />
+                  {res.pv.enabled && <Area yAxisId="l" type="step" stackId="s" dataKey="pv" name="Solar PV" stroke={T.chart.temp} fill={T.chart.temp} fillOpacity={0.55} />}
+                  {res.wind.enabled && <Area yAxisId="l" type="step" stackId="s" dataKey="wind" name="Wind" stroke={T.chart.wind} fill={T.chart.wind} fillOpacity={0.55} />}
+                  {gridForBom.enabled && <Area yAxisId="l" type="step" stackId="s" dataKey="imp" name="Grid import" stroke={T.chart.imp} fill={T.chart.imp} fillOpacity={0.45} />}
+                  {res.bess.enabled && <Area yAxisId="l" type="step" stackId="s" dataKey="bessDis" name="Battery" stroke={T.chart.bessC} fill={T.chart.bessC} fillOpacity={0.55} />}
+                  {res.engine.enabled && <Area yAxisId="l" type="step" stackId="s" dataKey="engine" name="Generators" stroke={T.chart.engineC} fill={T.chart.engineC} fillOpacity={0.55} />}
+                  {res.turbine.enabled && <Area yAxisId="l" type="step" stackId="s" dataKey="turbine" name="Turbine" stroke={T.chart.turbineC} fill={T.chart.turbineC} fillOpacity={0.55} />}
+                  {disp.summary.unservedMWh > 0 && <Area yAxisId="l" type="step" stackId="s" dataKey="unserved" name="Not served" stroke={T.chart.unservedC} fill={T.chart.unservedC} fillOpacity={0.8} />}
                   <Line yAxisId="l" type="step" dataKey="load" name="Load" stroke={T.chart.load} dot={false} strokeWidth={1.5} />
-                  <Line yAxisId="r" type="monotone" dataKey="soc" name="SOC (%)" stroke={T.chart.socC} dot={false} strokeWidth={1} strokeDasharray="3 2" />
+                  {res.bess.enabled && <Line yAxisId="r" type="monotone" dataKey="soc" name="Battery charge (%)" stroke={T.chart.socC} dot={false} strokeWidth={1} strokeDasharray="3 2" />}
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
@@ -5556,10 +5560,10 @@ export default function MicrogridDesignTool() {
                           <YAxis tick={axis} />
                           <Tooltip contentStyle={tip} />
                           <Legend wrapperStyle={{ fontSize: 11 }} />
-                          <Bar stackId="a" dataKey="pv" name="PV" fill={T.chart.temp} />
-                          <Bar stackId="a" dataKey="wind" name="Wind" fill={T.chart.wind} />
-                          <Bar stackId="a" dataKey="imp" name="Import" fill={T.chart.imp} />
-                          <Bar stackId="a" dataKey="engine" name="Engines" fill={T.chart.engineC} />
+                          {res.pv.enabled && <Bar stackId="a" dataKey="pv" name="Solar PV" fill={T.chart.temp} />}
+                          {res.wind.enabled && <Bar stackId="a" dataKey="wind" name="Wind" fill={T.chart.wind} />}
+                          {gridForBom.enabled && <Bar stackId="a" dataKey="imp" name="Grid import" fill={T.chart.imp} />}
+                          {(res.engine.enabled || res.turbine.enabled) && <Bar stackId="a" dataKey="engine" name="Generators" fill={T.chart.engineC} />}
                         </BarChart>
                       </ResponsiveContainer>
                     </div>
@@ -5633,7 +5637,7 @@ export default function MicrogridDesignTool() {
             <Panel title="Compare" step="11" sub="up to six saved in this session"
               right={
                 <div className="flex items-center gap-2">
-                  <input className={inpCls(T)} style={{ width: 160 }} value={scenarioName} placeholder="name this scenario"
+                  <input className={inpCls(T, null)} style={{ width: 160 }} value={scenarioName} placeholder="name this scenario"
                     onChange={(e) => setScenarioName(e.target.value)} />
                   <button onClick={saveScenario} disabled={!runOut || scenarios.length >= 6}
                     className={`rounded border px-3 py-1 text-xs ${!runOut || scenarios.length >= 6 ? T.chipIdle : T.chip}`}>Save current</button>
