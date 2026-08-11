@@ -2614,8 +2614,8 @@ export const THEMES = {
     tile: "border-slate-800 bg-slate-950",
     input: "border-slate-700 bg-slate-950 text-slate-100 focus:border-cyan-500",
     inputSite: "border-amber-800 bg-amber-950 text-amber-50 focus:border-amber-500",
-    inputLib: "border-slate-800 bg-slate-900 text-slate-400 focus:border-cyan-500",
-    micro: "border-slate-800 bg-slate-950 text-slate-300",
+    inputLib: "border-slate-700 bg-slate-950 text-slate-400 focus:border-cyan-500",
+    micro: "border-slate-700 bg-slate-950 text-slate-400",
     title: "text-slate-50",
     muted: "text-slate-400",
     faint: "text-slate-500",
@@ -2651,8 +2651,8 @@ export const THEMES = {
     tile: "border-slate-200 bg-slate-50",
     input: "border-slate-300 bg-white text-slate-900 focus:border-cyan-600",
     inputSite: "border-amber-300 bg-yellow-50 text-slate-900 focus:border-amber-500",
-    inputLib: "border-slate-200 bg-slate-50 text-slate-500 focus:border-cyan-600",
-    micro: "border-slate-200 bg-white text-slate-700",
+    inputLib: "border-slate-300 bg-white text-slate-500 focus:border-cyan-600",
+    micro: "border-slate-300 bg-white text-slate-500",
     title: "text-slate-900",
     muted: "text-slate-600",
     faint: "text-slate-500",
@@ -2688,10 +2688,9 @@ const useT = () => useContext(ThemeCtx);
 /* Where the value in a control has to come from, so the control can colour itself. */
 const SourceCtx = createContext(null);
 const useSource = () => useContext(SourceCtx);
-const SOURCE_HELP = {
-  site: "Specific to your project — the library cannot guess it",
-  library: "Library default — usually fine, editable if you know better",
-};
+const sourceHelp = (src) => (src === "site"
+  ? "Specific to your project — the library cannot guess it"
+  : "Not project specific — a default that is usually fine, editable if you know better");
 
 /* ============================================================================
    UI PRIMITIVES
@@ -2728,11 +2727,15 @@ function Term({ children, explain }) {
   );
 }
 
-function Field({ label, unit, children, hint, flag, explain, source, tier = "advanced" }) {
+/**
+ * computed = this is a result the tool worked out, not something you set.
+ * Editable fields carry the blue rule on the left; computed ones do not.
+ */
+function Field({ label, unit, children, hint, flag, explain, source, computed, tier = "advanced" }) {
   const T = useT();
   const crit = tier === "critical";
   return (
-    <label className={`block border-l-2 pl-2 ${crit ? T.critRule : "border-transparent"}`}>
+    <label className={`block border-l-2 pl-2 ${computed ? "border-transparent" : T.critRule}`}>
       <div className="flex items-baseline justify-between gap-2">
         <span className={`text-xs ${crit ? `font-medium ${T.critLabel}` : T.advLabel}`}>
           <Term explain={explain}>{label}</Term>
@@ -2746,13 +2749,15 @@ function Field({ label, unit, children, hint, flag, explain, source, tier = "adv
   );
 }
 
+/* Only two states. Yellow: this number is specific to your project and the
+   library cannot supply it. Grey text on white: everything else. */
 const inpCls = (T, src) => `mt-0.5 w-full rounded border px-2 py-1 font-mono text-sm focus:outline-none ${
-  src === "site" ? T.inputSite : src === "library" ? T.inputLib : T.input}`;
+  src === "site" ? T.inputSite : T.inputLib}`;
 
 function Num({ value, onChange, step = 1, min, max, disabled }) {
   const T = useT(); const src = useSource();
   return (
-    <input type="number" className={inpCls(T, src)} title={SOURCE_HELP[src]} value={value === "" || value === null ? "" : value}
+    <input type="number" className={inpCls(T, src)} title={sourceHelp(src)} value={value === "" || value === null ? "" : value}
       step={step} min={min} max={max} disabled={disabled}
       onChange={(e) => onChange(e.target.value === "" ? "" : Number(e.target.value))} />
   );
@@ -2760,14 +2765,14 @@ function Num({ value, onChange, step = 1, min, max, disabled }) {
 
 function Txt({ value, onChange, placeholder, readOnly }) {
   const T = useT(); const src = useSource();
-  return <input className={inpCls(T, src)} title={SOURCE_HELP[src]} value={value} placeholder={placeholder} readOnly={readOnly}
+  return <input className={inpCls(T, src)} title={sourceHelp(src)} value={value} placeholder={placeholder} readOnly={readOnly}
     onChange={onChange ? (e) => onChange(e.target.value) : undefined} />;
 }
 
 function Sel({ value, onChange, options, disabled }) {
   const T = useT(); const src = useSource();
   return (
-    <select className={inpCls(T, src)} title={SOURCE_HELP[src]} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+    <select className={inpCls(T, src)} title={sourceHelp(src)} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
       {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
     </select>
   );
@@ -3884,13 +3889,14 @@ export default function MicrogridDesignTool() {
                 <Field label="Notes" unit="text">
                   <Txt value={projectNotes} placeholder="revision, client, what changed since the last version" onChange={setProjectNotes} />
                 </Field>
-                <Field label="Last file imported" unit="—" explain="Where this session was loaded from. Inputs may have changed since.">
+                <Field computed label="Last file imported" unit="—" explain="Where this session was loaded from. Inputs may have changed since.">
                   <Txt value={lastImported || "none — inputs entered by hand"} readOnly />
                 </Field>
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-4">
                 <span className={`rounded border px-2 py-0.5 text-xs ${T.inputSite}`}>Yellow — specific to your project</span>
-                <span className={`rounded border px-2 py-0.5 text-xs ${T.inputLib}`}>Grey — library default, edit only if you know better</span>
+                <span className={`rounded border px-2 py-0.5 text-xs ${T.inputLib}`}>Grey text — not project specific, a default that usually holds</span>
+                <span className={`border-l-2 pl-2 text-xs ${T.critRule} ${T.muted}`}>Blue rule — you can edit it. No rule means the tool worked it out.</span>
               </div>
               <p className={`mt-2 text-xs ${T.faint}`}>
                 Project JSON file contains every input, every cost override, the saved scenarios and any uploaded load or
@@ -3927,7 +3933,7 @@ export default function MicrogridDesignTool() {
                 <Field tier="critical" label="Import cap" source="site" unit="kW"><Num value={ctx.importCapKW} step={100} onChange={(v) => setCtx((s) => ({ ...s, importCapKW: v }))} /></Field>
               )}
               {ctx.gridStatus === "phased" && (
-                <Field tier="critical" label={`Import cap in force, year ${simYear}`} unit="kW" hint="steps are set in the advanced group below">
+                <Field computed tier="critical" label={`Import cap in force, year ${simYear}`} unit="kW" hint="steps are set in the advanced group below">
                   <Txt value={fmt(effectiveImportCapKW, 0)} readOnly />
                 </Field>
               )}
@@ -3940,7 +3946,7 @@ export default function MicrogridDesignTool() {
             <Advanced key={`ctx-${density}`} title="More options — export limit, non-firm terms, capacity steps" count={ctx.gridStatus === "flexible" ? 4 : 2} defaultOpen={showAll}>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
                 <Field label="Export cap" unit="kW" hint="0 = no export allowed"><Num value={ctx.exportCapKW} step={100} onChange={(v) => setCtx((s) => ({ ...s, exportCapKW: v }))} /></Field>
-                <Field label="Currency" unit="—"><Txt value="EUR" readOnly /></Field>
+                <Field computed label="Currency" unit="—"><Txt value="EUR" readOnly /></Field>
                 {ctx.gridStatus === "flexible" && (<>
                   <Field label="Reduced cap when curtailed" unit="kW"><Num value={ctx.flexReducedCapKW} step={100} onChange={(v) => setCtx((s) => ({ ...s, flexReducedCapKW: v }))} /></Field>
                   <Field label="Hours at reduced cap" unit="% of year"><Num value={ctx.flexPctHours} onChange={(v) => setCtx((s) => ({ ...s, flexPctHours: v }))} /></Field>
@@ -3998,7 +4004,7 @@ export default function MicrogridDesignTool() {
                 <Field label="Grid fees" source="library" unit="€/MWh"><Num value={loc.gridFee_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridFee_EUR_per_MWh: v }))} /></Field>
                 <Field label="Capacity charge" source="library" unit="€/kW/yr"><Num value={loc.capacityCharge_EUR_per_kW_yr} onChange={(v) => setLocOverride((s) => ({ ...s, capacityCharge_EUR_per_kW_yr: v }))} /></Field>
                 <Field label="Grid emission factor" source="library" unit="gCO₂/kWh"><Num value={loc.gridCO2_g_per_kWh} onChange={(v) => setLocOverride((s) => ({ ...s, gridCO2_g_per_kWh: v }))} /></Field>
-                <Field label="Average air temperature" unit="°C" explain="Plain air temperature, no humidity allowance."><Txt value={fmt(annualMeanT, 1)} readOnly /></Field>
+                <Field computed label="Average air temperature" unit="°C" explain="Plain air temperature, no humidity allowance."><Txt value={fmt(annualMeanT, 1)} readOnly /></Field>
               </div>
 
               <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
@@ -4259,7 +4265,7 @@ export default function MicrogridDesignTool() {
                           options={[{ value: "winter", label: "Winter peaking" }, { value: "summer", label: "Summer peaking" }, { value: "none", label: "No seasonality" }]} />
                       </Field>
                       <Field label="Weekend factor" unit="× weekday"><Num value={loadCfg.weekendFactor} step={0.05} onChange={(v) => setLoadCfg((s) => ({ ...s, weekendFactor: v }))} /></Field>
-                      <Field label="Shape exponent γ solved" unit="—" hint="load = base + (peak − base) · shape^γ"><Txt value={fmt(synth?.gamma, 3)} readOnly /></Field>
+                      <Field computed label="Shape exponent γ solved" unit="—" hint="load = base + (peak − base) · shape^γ"><Txt value={fmt(synth?.gamma, 3)} readOnly /></Field>
                       {loadCfg.shapeKey === "custom" && (
                         <div className="md:col-span-4">
                           {[["customWeekday", "Weekday"], ["customWeekend", "Weekend"]].map(([key, lbl]) => (
@@ -4297,7 +4303,7 @@ export default function MicrogridDesignTool() {
               </Field>
               <Field tier="critical" label="Biggest motor started direct" source="site" unit="kW"
                 explain="Motor rating. Starting draws up to 6× this for a few seconds."><Num value={char.motorKW} step={10} onChange={(v) => setChar((s) => ({ ...s, motorKW: v, touched: true }))} /></Field>
-              <Field tier="critical" label="Critical load at peak" unit="kW"><Txt value={fmt(stats.peakKW * char.critPct / 100, 0)} readOnly /></Field>
+              <Field computed tier="critical" label="Critical load at peak" unit="kW"><Txt value={fmt(stats.peakKW * char.critPct / 100, 0)} readOnly /></Field>
             </div>
 
             <Advanced key={`char-${density}`} title="Advanced — shedding tiers, starting method and parasitics" count={4} defaultOpen={showAll}>
@@ -4435,7 +4441,7 @@ export default function MicrogridDesignTool() {
                     <Num value={res.pv.dcacRatio} step={0.05} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, dcacRatio: v } }))} />
                   </Field>
                   <Field label="Annual degradation" source="library" unit="%/yr"><Num value={res.pv.degradationPctPerYr} step={0.1} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, degradationPctPerYr: v } }))} /></Field>
-                  <Field label="Clipped hours" unit="h/yr"><Txt value={fmt(pvOut.clippedHours, 0)} readOnly /></Field>
+                  <Field computed label="Clipped hours" unit="h/yr"><Txt value={fmt(pvOut.clippedHours, 0)} readOnly /></Field>
                 </div>
                 <Advanced key={`pv-${density}`} title="Advanced — soiling, bifacial gain, availability, other losses" count={4} defaultOpen={showAll}>
                   <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -4461,8 +4467,8 @@ export default function MicrogridDesignTool() {
                   <Field tier="critical" label="Hub height" unit="m" hint={`site mean ${fmt(loc.windMean_m_s_100m, 1)} m/s at 100 m`}>
                     <Num value={res.wind.hubHeightM} step={5} onChange={(v) => setRes((s) => ({ ...s, wind: { ...s.wind, hubHeightM: v } }))} />
                   </Field>
-                  <Field label="Capacity factor achieved" unit="%"><Txt value={fmt(windCF * 100, 1)} readOnly /></Field>
-                  <Field label="Mean speed at hub" unit="m/s"><Txt value={fmt(windMeanHub, 2)} readOnly /></Field>
+                  <Field computed label="Capacity factor achieved" unit="%"><Txt value={fmt(windCF * 100, 1)} readOnly /></Field>
+                  <Field computed label="Mean speed at hub" unit="m/s"><Txt value={fmt(windMeanHub, 2)} readOnly /></Field>
                 </div>
                 <Advanced key={`wind-${density}`} title="Advanced — power curve and availability" count={4} defaultOpen={showAll}>
                   <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -4488,7 +4494,7 @@ export default function MicrogridDesignTool() {
                   <Field tier="critical" label="Energy capacity" source="site" unit="kWh" hint={`${fmt(res.bess.energyKWh / Math.max(1, res.bess.powerKW), 2)} h at rated power`}>
                     <Num value={res.bess.energyKWh} step={100} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, energyKWh: v } }))} />
                   </Field>
-                  <Field tier="critical" label="Duration at rated power" unit="hours"
+                  <Field computed tier="critical" label="Duration at rated power" unit="hours"
                     explain="How long it can hold full output before it is empty.">
                     <Txt value={`${fmt(res.bess.energyKWh / Math.max(1, res.bess.powerKW), 2)} h`} readOnly />
                   </Field>
@@ -4505,7 +4511,7 @@ export default function MicrogridDesignTool() {
                     <Field label="SOC window, maximum" source="library" unit="%"><Num value={res.bess.socMaxPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, socMaxPct: v } }))} /></Field>
                     <Field label="Starting SOC" source="library" unit="%"><Num value={res.bess.startSocPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, startSocPct: v } }))} /></Field>
                     <Field label="Grid-forming step capability" source="library" unit="% of rating"><Num value={res.bess.gridFormingStepPct} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, gridFormingStepPct: v } }))} /></Field>
-                    <Field label="Depth of discharge" unit="%" explain="Comes from the SOC window — not entered separately.">
+                    <Field computed label="Depth of discharge" unit="%" explain="Comes from the SOC window — not entered separately.">
                       <Txt value={`${fmt(res.bess.socMaxPct - res.bess.socMinPct, 0)} % (from the SOC window)`} readOnly />
                     </Field>
                   </div>
@@ -4542,7 +4548,7 @@ export default function MicrogridDesignTool() {
                     <Field label="Minimum up time" source="library" unit="h"><Num value={res.engine.minUpTimeH} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, minUpTimeH: v } }))} /></Field>
                     <Field label="Minimum down time" source="library" unit="h"><Num value={res.engine.minDownTimeH} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, minDownTimeH: v } }))} /></Field>
                     <Field label="Permitted running hours" unit="h/yr"><Num value={res.engine.annualHourLimit} step={50} onChange={(v) => setRes((s) => ({ ...s, engine: { ...s.engine, annualHourLimit: v } }))} /></Field>
-                    <Field label={res.engine.fuelType === "diesel" ? "Specific consumption at 25/50/75/100 %" : "Electrical efficiency at 25/50/75/100 %"}
+                    <Field computed label={res.engine.fuelType === "diesel" ? "Specific consumption at 25/50/75/100 %" : "Electrical efficiency at 25/50/75/100 %"}
                       unit={res.engine.fuelType === "diesel" ? "l/kWh" : "%"}>
                       <Txt value={(res.engine.fuelType === "diesel" ? CONSTANTS.DIESEL_SFC_L_PER_KWH : CONSTANTS.GAS_ENGINE_EFF_PCT).join(" / ")} readOnly />
                     </Field>
@@ -4563,7 +4569,7 @@ export default function MicrogridDesignTool() {
                   <Field tier="critical" label="Site rating (not ISO)" source="site" unit="kW"><Num value={res.turbine.ratedKW} step={100} onChange={(v) => setRes((s) => ({ ...s, turbine: { ...s.turbine, ratedKW: v } }))} /></Field>
                   <Field tier="critical" label="Minimum load" unit="% of rating"><Num value={res.turbine.minLoadPct} onChange={(v) => setRes((s) => ({ ...s, turbine: { ...s.turbine, minLoadPct: v } }))} /></Field>
                   <Field label="Minimum up time" source="library" unit="h"><Num value={res.turbine.minUpTimeH} onChange={(v) => setRes((s) => ({ ...s, turbine: { ...s.turbine, minUpTimeH: v } }))} /></Field>
-                  <Field label="Ambient derating" unit="%/°C above 15" ><Txt value={fmt(CONSTANTS.TURBINE_DERATE_PCT_PER_C_ABOVE_15, 2)} readOnly /></Field>
+                  <Field computed label="Ambient derating" unit="%/°C above 15" ><Txt value={fmt(CONSTANTS.TURBINE_DERATE_PCT_PER_C_ABOVE_15, 2)} readOnly /></Field>
                 </div>
               )}
             </div>
@@ -4580,7 +4586,7 @@ export default function MicrogridDesignTool() {
                     <Sel value={res.tariff.structure} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, structure: v } }))}
                       options={[{ value: "flat", label: "Flat" }, { value: "tou", label: "Time of use" }]} />
                   </Field>
-                  <Field label="Demand charge" unit="€/kW/yr" explain="Charged on the highest power drawn each month.">
+                  <Field computed label="Demand charge" unit="€/kW/yr" explain="Charged on the highest power drawn each month.">
                     <Txt value={fmt(loc.capacityCharge_EUR_per_kW_yr, 1)} readOnly />
                   </Field>
                   <Field label="Peak multiplier" unit="× base"><Num value={res.tariff.peakMultiplier} step={0.05} onChange={(v) => setRes((s) => ({ ...s, tariff: { ...s.tariff, peakMultiplier: v } }))} /></Field>
@@ -4660,7 +4666,7 @@ export default function MicrogridDesignTool() {
                               <span className={`font-mono text-xs ${T.ghost}`}>cap kW</span>
                               <input type="number" step={50} value={res.shave.enabled ? res.shave.targetKW : 0}
                                 onChange={(e) => setRes((s3) => ({ ...s3, shave: { enabled: Number(e.target.value) > 0, targetKW: Number(e.target.value) } }))}
-                                className={`w-24 rounded border px-1 py-0.5 text-right font-mono text-xs ${T.input}`} />
+                                className={`w-24 rounded border px-1 py-0.5 text-right font-mono text-xs ${T.inputSite}`} />
                             </span>
                           )}
                           <span className={`font-mono text-xs ${T.ghost}`}>{st2.fixed ? "fixed" : "editable"}</span>
@@ -5102,6 +5108,22 @@ export default function MicrogridDesignTool() {
                     : `per MWh at the facility busbar — ${fmt(cost.servedMWh, 0)} MWh/yr served`}.
                   These are different numbers; comparing one against the other makes a scenario comparison meaningless.
                 </div>
+              </div>
+
+              {/* The money assumptions live here, with the number they produce */}
+              <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Field tier="critical" source="site" label="Project life" unit="years"
+                  explain="Years of costs and energy in the levelised cost.">
+                  <Num value={ctx.lifeYears} onChange={(v) => setCtx((s2) => ({ ...s2, lifeYears: v }))} />
+                </Field>
+                <Field tier="critical" source="site" label="Discount rate, real" unit="%/yr"
+                  explain="Return the capital must earn, inflation stripped out.">
+                  <Num value={ctx.discountPct} step={0.1} onChange={(v) => setCtx((s2) => ({ ...s2, discountPct: v }))} />
+                </Field>
+                <Field computed label="Currency" unit="—"><Txt value="EUR" readOnly /></Field>
+                <Field computed label="Cost boundary" unit="—" explain="Measured at the busbar, or after cooling losses at the IT.">
+                  <Txt value={lcoeBoundary === "it" ? "delivered to IT" : "at the facility busbar"} readOnly />
+                </Field>
               </div>
 
               {/* Assumptions on the same screen as the number */}
