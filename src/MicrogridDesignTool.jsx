@@ -3725,13 +3725,22 @@ export default function MicrogridDesignTool() {
           {/* Header */}
           <header className={`flex flex-wrap items-end justify-between gap-3 border-b pb-3 ${T.rule}`}>
             <div>
-              <h1 className={`text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
-              <p className={`text-xs ${T.faint}`}>Microgrid pre-feasibility study: sizing &amp; LCOE. Not a substitute for a protection study, an EMT study or a contractor's price.</p>
+              <div className="flex flex-wrap items-baseline gap-2">
+                <h1 className={`text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
+                {projectName && <span className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chip}`}>{projectName}</span>}
+              </div>
+              <p className={`text-xs ${T.faint}`}>Microgrid pre-feasibility study: sizing &amp; LCOE</p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
+                {!runOut ? "Run the year" : stale ? "Inputs changed — run again" : "Run again"}
+              </button>
+              <span className={`text-xs ${stale ? T.tone.amber : T.faint}`}>
+                {!runOut ? "not run yet" : stale ? `last run ${runOut.at}, now out of date` : `last run ${runOut.at}`}
+              </span>
               <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} />
-              <Seg value={density} onChange={setDensity} options={[{ value: "essential", label: "Essentials" }, { value: "full", label: "Every parameter" }]} />
-              <Seg value={mode} onChange={setMode} options={[{ value: "standard", label: "Standard project" }, { value: "aidc", label: "AIDC design" }]} />
+              <Seg value={density} onChange={setDensity} options={[{ value: "essential", label: "Essentials" }, { value: "full", label: "Advanced" }]} />
+              <Seg value={mode} onChange={setMode} options={[{ value: "standard", label: "Standard project" }, { value: "aidc", label: "AIDC" }]} />
             </div>
           </header>
 
@@ -3755,18 +3764,6 @@ export default function MicrogridDesignTool() {
               ))}
             </div>
           </nav>
-
-          {/* One control: run the year, and say plainly whether the results are current */}
-          <div className="flex flex-wrap items-center gap-3">
-            <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
-              {!runOut ? "Run the year" : stale ? "Inputs changed — run again" : "Run again"}
-            </button>
-            <span className={`text-xs ${stale ? T.tone.amber : T.faint}`}>
-              {!runOut ? "Nothing calculated yet. Fill in steps 1 to 4, then run."
-                : stale ? `Results below are from ${runOut.at} and no longer match the inputs.`
-                  : `Last run ${runOut.at} — ${TABS[tab].sub}`}
-            </span>
-          </div>
 
           {/* PROJECT FILE */}
           {tab === 0 && (
@@ -5505,9 +5502,7 @@ export default function MicrogridDesignTool() {
             </button>
           </div>
 
-          <footer className={`border-t pt-2 text-xs ${T.rule} ${T.faint}`}>
-            Phases 1 to 4 complete. Next — Phase 5: the auto-size sweep presented as a ranked set with the trade-off visible, then AIDC design mode with its constraint set and the phased-ramp check.
-          </footer>
+
         </div>
       </div>
     </ThemeCtx.Provider>
