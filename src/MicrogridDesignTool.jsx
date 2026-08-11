@@ -161,6 +161,24 @@ export const CONSTANTS = {
   TOU_OFFPEAK_MULTIPLIER: 0.6,          // ×       of the base import tariff
   ARBITRAGE_CHARGE_THRESHOLD: 0.8,      // ×       charge from grid below this × mean price
 
+  /* --- Price formation ----------------------------------------------------
+     Wholesale price follows RESIDUAL demand — national demand less what wind
+     and solar are producing at that moment — through a convex supply curve.
+     The solar term uses the same irradiance series that drives the site's own
+     PV, so a sunny hour is a cheap hour in the same model run. Decoupling the
+     two would value both self-consumption and arbitrage wrongly.            */
+  PRICE_RESIDUAL_ELASTICITY: 2.2,       // -   price index = (residual / mean residual) ^ this
+  PRICE_DAMPING: 0.35,                  // -   interconnection, hydro and flexible plant damp both
+                                        //     tails; without it the synthetic curve is about twice
+                                        //     as volatile as the real 2025 day-ahead series
+  PRICE_CAP_MULTIPLE: 5.0,              // -   ceiling on the index, so scarcity does not run away
+  PRICE_NEGATIVE_HOUR_SHARE: 0.06,      // -   share of hours that clear below zero. In 2025 France,
+                                        //     Germany, the Netherlands and Spain all reached about 6 %
+                                        //     (IEA Electricity 2026); the threshold is set at that
+                                        //     percentile of residual demand rather than a fixed level,
+                                        //     because it is must-run inflexibility that sets it.
+  PRICE_NEGATIVE_DEPTH: 0.6,           // -   index units subtracted as residual falls to zero
+
   /* --- Dispatch look-ahead -----------------------------------------------
      Pure merit order is myopic: it discharges into the first peak it meets and
      charges on a static price threshold. These rules give it a finite horizon
@@ -361,15 +379,26 @@ export const MARKET_PRICES_2025 = {
   OTHER: { label: "Generic — scaled to the site tariff", annualAvg_EUR_per_MWh: null, source: "no published 2025 curve for this market; the site tariff is used as the annual mean" },
 };
 
-/* Monthly index, 2025 European pattern: expensive winter, cheap solar spring. */
-export const MARKET_MONTHLY_INDEX = [1.45, 1.30, 1.00, 0.72, 0.65, 0.80, 0.90, 0.88, 0.90, 1.05, 1.10, 1.25];
+/* National electricity DEMAND shape — the starting point for the price model.
+   Winter-weighted, morning ramp, evening peak, overnight trough. */
+export const DEMAND_MONTHLY_INDEX = [1.15, 1.12, 1.05, 0.96, 0.90, 0.88, 0.88, 0.87, 0.92, 1.00, 1.08, 1.14];
+export const DEMAND_HOURLY_INDEX = {
+  weekday: [0.72, 0.68, 0.66, 0.65, 0.67, 0.73, 0.85, 0.95, 1.00, 1.00, 0.99, 0.98,
+    0.96, 0.95, 0.94, 0.95, 1.00, 1.08, 1.10, 1.05, 0.98, 0.90, 0.82, 0.76],
+  weekend: [0.68, 0.65, 0.63, 0.62, 0.63, 0.66, 0.72, 0.80, 0.87, 0.91, 0.93, 0.93,
+    0.92, 0.91, 0.90, 0.91, 0.95, 1.02, 1.04, 1.00, 0.94, 0.87, 0.80, 0.73],
+};
 
-/* Intraday index: overnight trough, morning ramp, midday solar dip, evening peak. */
-export const MARKET_HOURLY_INDEX = {
-  weekday: [0.80, 0.75, 0.72, 0.72, 0.75, 0.85, 1.00, 1.15, 1.10, 0.95, 0.80, 0.70,
-    0.65, 0.65, 0.70, 0.85, 1.05, 1.30, 1.45, 1.35, 1.20, 1.05, 0.95, 0.85],
-  weekend: [0.78, 0.74, 0.71, 0.70, 0.72, 0.76, 0.82, 0.90, 0.92, 0.85, 0.74, 0.66,
-    0.62, 0.62, 0.66, 0.76, 0.92, 1.12, 1.22, 1.15, 1.05, 0.95, 0.88, 0.82],
+/* Share of national annual demand met by solar and by wind, 2025.
+   These set how hard the price is pushed down when the resource is running —
+   and they are what tie the price curve to the same weather the PV model uses. */
+export const VRE_PENETRATION_2025 = {
+  FR: { solar: 0.05, wind: 0.09 },
+  NL: { solar: 0.20, wind: 0.26 },
+  DE: { solar: 0.14, wind: 0.28 },
+  ES: { solar: 0.22, wind: 0.23 },
+  UK: { solar: 0.05, wind: 0.29 },
+  OTHER: { solar: 0.08, wind: 0.10 },
 };
 
 export const LOAD_SHAPES = {
@@ -821,7 +850,7 @@ function buildPVGen(pvUnit, pv, year) {
  *             annual average, plus the site's grid fees
  *   uploaded— an 8760 series supplied by the user, plus grid fees
  */
-function buildTariff(loc, cal, tariff, uploadedPrice) {
+function buildTariff(loc, cal, tariff, uploadedPrice, solarProfile, windProfile) {
   const p = new Float32Array(H);
   const base = loc.importTariff_EUR_per_MWh + loc.gridFee_EUR_per_MWh;
 
@@ -833,16 +862,66 @@ function buildTariff(loc, cal, tariff, uploadedPrice) {
   if (tariff.structure === "market") {
     const mkt = MARKET_PRICES_2025[loc.country] || MARKET_PRICES_2025.OTHER;
     const target = mkt.annualAvg_EUR_per_MWh || loc.importTariff_EUR_per_MWh;
-    const raw = new Float32Array(H);
-    let sum = 0;
+    const vre = VRE_PENETRATION_2025[loc.country] || VRE_PENETRATION_2025.OTHER;
+
+    // Normalise the site's own solar and wind series to a mean of one, so they can
+    // stand in for national output. Same arrays the PV plant and wind farm use.
+    const norm = (arr) => {
+      if (!arr) return null;
+      let m = 0; for (let i = 0; i < H; i++) m += arr[i];
+      m /= H; if (m <= 0) return null;
+      const out = new Float32Array(H);
+      for (let i = 0; i < H; i++) out[i] = arr[i] / m;
+      return out;
+    };
+    const solarN = norm(solarProfile);
+    const windN = norm(windProfile);
+
+    // Residual demand = national demand shape − solar − wind
+    const resid = new Float32Array(H);
+    let residSum = 0;
     for (let i = 0; i < H; i++) {
       const weekend = cal.dow[i] === 0 || cal.dow[i] === 6;
-      const idx = MARKET_MONTHLY_INDEX[cal.month[i]]
-        * (weekend ? MARKET_HOURLY_INDEX.weekend : MARKET_HOURLY_INDEX.weekday)[cal.hourOfDay[i]];
-      raw[i] = idx; sum += idx;
+      const dem = DEMAND_MONTHLY_INDEX[cal.month[i]]
+        * (weekend ? DEMAND_HOURLY_INDEX.weekend : DEMAND_HOURLY_INDEX.weekday)[cal.hourOfDay[i]];
+      const solar = solarN ? vre.solar * solarN[i] : 0;
+      const wind = windN ? vre.wind * windN[i] : vre.wind;
+      resid[i] = dem - solar - wind;
+      residSum += resid[i];
     }
-    const k = target / (sum / H);           // scale so the annual mean matches the published average
-    for (let i = 0; i < H; i++) p[i] = raw[i] * k + loc.gridFee_EUR_per_MWh;
+    const residMean = residSum / H;
+
+    // The hours that clear below zero are the lowest-residual hours of the year.
+    // The threshold is the percentile matching the observed share, not a fixed level.
+    const sortedR = Array.from(resid).sort((x, y) => x - y);
+    // Residual itself can be negative in a high-renewable market, so the threshold
+    // is kept on the raw ratio rather than the clamped one.
+    const negThreshold = sortedR[Math.floor(H * CONSTANTS.PRICE_NEGATIVE_HOUR_SHARE)] / (residMean || 1);
+    const negSpan = Math.max(0.10, Math.abs(negThreshold) + 0.10);
+
+    // Convex supply curve: price rises steeply as residual demand approaches the
+    // top of the merit order, and collapses when wind and solar cover the load.
+    const idx = new Float32Array(H);
+    let rawSum = 0;
+    for (let i = 0; i < H; i++) {
+      const r = residMean > 0 ? Math.max(0, resid[i] / residMean) : 1;
+      idx[i] = Math.min(CONSTANTS.PRICE_CAP_MULTIPLE, Math.pow(r, CONSTANTS.PRICE_RESIDUAL_ELASTICITY));
+      rawSum += idx[i];
+    }
+    // Damp both tails for interconnection, hydro and flexible plant, then apply the
+    // negative-price adjustment so the share of sub-zero hours is preserved.
+    const rawMean = rawSum / H;
+    let idxSum = 0;
+    for (let i = 0; i < H; i++) {
+      let v = rawMean + (idx[i] - rawMean) * (1 - CONSTANTS.PRICE_DAMPING);
+      const rRaw = residMean > 0 ? resid[i] / residMean : 1;
+      if (rRaw < negThreshold) {
+        v -= CONSTANTS.PRICE_NEGATIVE_DEPTH * Math.min(2, (negThreshold - rRaw) / negSpan);
+      }
+      idx[i] = v; idxSum += v;
+    }
+    const k = idxSum > 0 ? target / (idxSum / H) : 0;   // scale to the published annual average
+    for (let i = 0; i < H; i++) p[i] = idx[i] * k + loc.gridFee_EUR_per_MWh;
     return p;
   }
 
@@ -1266,6 +1345,13 @@ function dispatch(cfg) {
   const reasonCount = new Array(REASON_CODES.length).fill(0);
   for (let i = 0; i < H; i++) reasonCount[out.reason[i]]++;
 
+  // European kW-max charges are billed on each month's peak, not the annual one.
+  // Billing on the annual peak alone understates what a battery is worth, because
+  // it only ever gets credit for flattening one hour of the year.
+  const monthlyPeakKW = new Array(12).fill(0);
+  for (let i = 0; i < H; i++) if (out.imp[i] > monthlyPeakKW[cal.month[i]]) monthlyPeakKW[cal.month[i]] = out.imp[i];
+  const meanMonthlyPeakKW = monthlyPeakKW.reduce((a, v) => a + v, 0) / 12;
+
   return {
     ...out,
     summary: {
@@ -1291,6 +1377,7 @@ function dispatch(cfg) {
       equivalentFullCycles: b.enabled && b.energyKWh > 0 ? throughputKWh / 2 / b.energyKWh : 0,
       minSoc: b.enabled ? Math.min(...Array.from(out.soc)) : 0,
       peakImportKW: Math.max(...Array.from(out.imp)),
+      monthlyPeakKW, meanMonthlyPeakKW,
       hoursAboveShaveTarget: g.shaveEnabled && g.shaveTargetKW > 0 ? out.imp.reduce((a, v) => a + (v > g.shaveTargetKW + 0.001 ? 1 : 0), 0) : 0,
       reasonCount,
     },
@@ -1993,7 +2080,10 @@ function computeCosts(a) {
   let importCostY1 = 0;
   if (gridEnabled) for (let i = 0; i < H; i++) importCostY1 += disp.imp[i] * price[i] / 1000;
   const exportRevenueY1 = s.exportMWh * costs.EXPORT_PRICE_EUR_PER_MWH;
-  const capacityChargeY1 = gridEnabled ? (s.peakImportKW * loc.capacityCharge_EUR_per_kW_yr) : 0;
+  // Billed on each month's peak (the mean of the twelve equals the annual bill
+  // when the rate is quoted per kW-month), not on the single annual maximum.
+  const billedPeakKW = s.meanMonthlyPeakKW !== undefined ? s.meanMonthlyPeakKW : s.peakImportKW;
+  const capacityChargeY1 = gridEnabled ? (billedPeakKW * loc.capacityCharge_EUR_per_kW_yr) : 0;
   const fuelCostY1 = res.engine.fuelType === "diesel"
     ? s.fuelLitres * loc.diesel_EUR_per_litre
     : s.fuelMWhTh * loc.gas_EUR_per_MWh_th;
@@ -2137,15 +2227,19 @@ function lcoeSensitivity(a, base) {
 function computeBaseline(a) {
   const { load, price, loc, gridEnabled, res, costs, cal } = a;
   let energyMWh = 0, peakKW = 0, gridCost = 0;
+  const monthlyPeak = new Array(12).fill(0);
   for (let i = 0; i < H; i++) {
     energyMWh += load[i] / 1000;
     if (load[i] > peakKW) peakKW = load[i];
+    if (load[i] > monthlyPeak[cal.month[i]]) monthlyPeak[cal.month[i]] = load[i];
     gridCost += load[i] * price[i] / 1000;
   }
+  // Same billing basis as the project case — monthly peaks, not the annual one
+  const billedPeakKW = monthlyPeak.reduce((a, v) => a + v, 0) / 12;
   if (gridEnabled) {
     return {
-      mode: "grid", energyMWh, peakKW,
-      annualCost: gridCost + peakKW * loc.capacityCharge_EUR_per_kW_yr,
+      mode: "grid", energyMWh, peakKW, billedPeakKW,
+      annualCost: gridCost + billedPeakKW * loc.capacityCharge_EUR_per_kW_yr,
       capex: peakKW * costs.GRID_CONNECTION_EUR_PER_KW,
       label: "all load imported from the grid at the site tariff",
     };
@@ -2469,6 +2563,7 @@ function buildConfig(a) {
     // Uploaded series travel with the file, otherwise the project cannot be reproduced
     uploadedLoad: a.csvResult && a.csvResult.load ? Array.from(a.csvResult.load).map((v) => +v.toFixed(2)) : null,
     uploadedLoadNotes: a.csvResult ? a.csvResult.notes : null,
+    uploadedPrice: a.uploadedPrice ? Array.from(a.uploadedPrice).map((v) => +v.toFixed(3)) : null,
     uploadedResource: a.uploadedResource ? {
       pvUnit: a.uploadedResource.pvUnit ? Array.from(a.uploadedResource.pvUnit).map((v) => +v.toFixed(5)) : null,
       temp: a.uploadedResource.temp ? Array.from(a.uploadedResource.temp).map((v) => +v.toFixed(2)) : null,
@@ -2527,6 +2622,7 @@ export const THEMES = {
     chipWarn: "bg-amber-950 text-amber-300",
     chipOk: "bg-emerald-950 text-emerald-300",
     chipIdle: "border-slate-800 bg-slate-900 text-slate-600",
+    chipAlert: "border-amber-500 bg-amber-600 text-slate-950",
     notice: {
       warn: "border-amber-700 bg-amber-950 text-amber-200",
       info: "border-slate-700 bg-slate-950 text-slate-300",
@@ -2557,6 +2653,7 @@ export const THEMES = {
     chipWarn: "bg-amber-100 text-amber-800",
     chipOk: "bg-emerald-100 text-emerald-800",
     chipIdle: "border-slate-200 bg-slate-50 text-slate-400",
+    chipAlert: "border-amber-600 bg-amber-500 text-white",
     notice: {
       warn: "border-amber-300 bg-amber-50 text-amber-900",
       info: "border-slate-300 bg-slate-50 text-slate-700",
@@ -2870,7 +2967,7 @@ export default function MicrogridDesignTool() {
   const fileRef = useRef(null);
   const resFileRef = useRef(null);
 
-  const [themeKey, setThemeKey] = useState("dark");
+  const [themeKey, setThemeKey] = useState("light");
   const T = THEMES[themeKey];
   const [density, setDensity] = useState("essential"); // "essential" | "full"
   const showAll = density === "full";
@@ -3070,11 +3167,19 @@ export default function MicrogridDesignTool() {
   const simYear = mode === "aidc" ? aidc.analysisYear : 1;
   const pvOut = useMemo(() => (res.pv.enabled ? buildPVGen(pvUnit, res.pv, simYear)
     : { gen: new Float32Array(H), clippedHours: 0, acLimitKW: 0 }), [pvUnit, res.pv, simYear]);
-  const windSpeed = useMemo(() => (res.wind.enabled ? buildWindSpeed(loc, cal, res.wind.hubHeightM) : null), [loc, cal, res.wind.enabled, res.wind.hubHeightM]);
-  const windGen = useMemo(() => (windSpeed ? buildWindGen(windSpeed, temp, res.wind) : new Float32Array(H)), [windSpeed, temp, res.wind]);
+  // Built regardless of whether a wind farm is installed: the national price model
+  // needs a wind output series for this site's weather.
+  const windSpeed = useMemo(() => buildWindSpeed(loc, cal, res.wind.enabled ? res.wind.hubHeightM : CONSTANTS.WIND_REFERENCE_HEIGHT_M),
+    [loc, cal, res.wind.enabled, res.wind.hubHeightM]);
+  const nationalWindProfile = useMemo(() => buildWindGen(windSpeed, temp, {
+    ratedKW: 1000, cutInMs: CONSTANTS.WIND_CUT_IN_M_S, ratedMs: CONSTANTS.WIND_RATED_M_S,
+    cutOutMs: CONSTANTS.WIND_CUT_OUT_M_S, availabilityPct: 100,
+  }), [windSpeed, temp]);
+  const windGen = useMemo(() => (res.wind.enabled ? buildWindGen(windSpeed, temp, res.wind) : new Float32Array(H)), [windSpeed, temp, res.wind]);
   const windMeanHub = useMemo(() => { if (!windSpeed) return 0; let s2 = 0; for (let i = 0; i < H; i++) s2 += windSpeed[i]; return s2 / H; }, [windSpeed]);
   const windCF = useMemo(() => { if (!res.wind.enabled || !res.wind.ratedKW) return 0; let s2 = 0; for (let i = 0; i < H; i++) s2 += windGen[i]; return s2 / (res.wind.ratedKW * H); }, [windGen, res.wind]);
-  const price = useMemo(() => buildTariff(loc, cal, res.tariff, uploadedPrice), [loc, cal, res.tariff, uploadedPrice]);
+  const price = useMemo(() => buildTariff(loc, cal, res.tariff, uploadedPrice, pvUnit, nationalWindProfile),
+    [loc, cal, res.tariff, uploadedPrice, pvUnit, nationalWindProfile]);
   const priceStats = useMemo(() => {
     let sum = 0, lo = Infinity, hi = -Infinity;
     const monthly = new Float64Array(12), count = new Float64Array(12);
@@ -3561,7 +3666,7 @@ export default function MicrogridDesignTool() {
 
   const saveProject = () => {
     const cfg = buildConfig({ projectName, projectNotes, mode, ctx, locOverride, aidc, loadCfg, char, res,
-      costs, fin, sweep, lcoeBoundary, scenarios, csvResult, uploadedResource, resourceSource });
+      costs, fin, sweep, lcoeBoundary, scenarios, csvResult, uploadedResource, uploadedPrice, resourceSource });
     const slug = (projectName.trim() || "microgrid-project").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
     downloadJSON(`${slug}.json`, cfg);
   };
@@ -3595,6 +3700,10 @@ export default function MicrogridDesignTool() {
         if (c.uploadedResource.temp) nx.temp = Float32Array.from(c.uploadedResource.temp);
         setUploadedResource(nx);
       }
+      if (c.uploadedPrice && c.uploadedPrice.length === H) {
+        setUploadedPrice(Float32Array.from(c.uploadedPrice));
+        setPriceNote("Price curve restored from the project file.");
+      }
       if (c.resourceSource) setResourceSource(c.resourceSource);
       setRunOut(null);
       setSweepOut(null);
@@ -3617,7 +3726,7 @@ export default function MicrogridDesignTool() {
           <header className={`flex flex-wrap items-end justify-between gap-3 border-b pb-3 ${T.rule}`}>
             <div>
               <h1 className={`text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
-              <p className={`text-xs ${T.faint}`}>Pre-feasibility sizing, dispatch and LCOE. Not a substitute for a protection study, an EMT study or a contractor's price.</p>
+              <p className={`text-xs ${T.faint}`}>Microgrid pre-feasibility study: sizing &amp; LCOE. Not a substitute for a protection study, an EMT study or a contractor's price.</p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "dark", label: "Dark" }, { value: "light", label: "Light" }]} />
@@ -3649,13 +3758,13 @@ export default function MicrogridDesignTool() {
 
           {/* One control: run the year, and say plainly whether the results are current */}
           <div className="flex flex-wrap items-center gap-3">
-            <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm ${stale ? T.chip : T.btn}`}>
+            <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
               {!runOut ? "Run the year" : stale ? "Inputs changed — run again" : "Run again"}
             </button>
             <span className={`text-xs ${stale ? T.tone.amber : T.faint}`}>
               {!runOut ? "Nothing calculated yet. Fill in steps 1 to 4, then run."
-                : stale ? "The results below were calculated with older inputs."
-                  : `Calculated at ${runOut.at} — ${TABS[tab].sub}`}
+                : stale ? `Results below are from ${runOut.at} and no longer match the inputs.`
+                  : `Last run ${runOut.at} — ${TABS[tab].sub}`}
             </span>
           </div>
 
@@ -4437,7 +4546,8 @@ export default function MicrogridDesignTool() {
               <Stat label="Engine surplus dumped" value={fmt(disp.summary.curtailEngineMWh, 0)} unit="MWh/yr" tone="rose" />
               <Stat label="Battery cycles" value={fmt(disp.summary.equivalentFullCycles, 0)} unit="EFC/yr" tone="violet" />
               <Stat label="Minimum SOC reached" value={fmt(disp.summary.minSoc, 0)} unit="%" tone="violet" />
-              <Stat label="Peak import" value={fmt(disp.summary.peakImportKW / 1000, 2)} unit="MW" tone="cyan" />
+              <Stat label="Peak import (annual)" value={fmt(disp.summary.peakImportKW / 1000, 2)} unit="MW" tone="cyan" />
+              <Stat label="Billed peak (mean of 12 monthly)" value={fmt(disp.summary.meanMonthlyPeakKW / 1000, 2)} unit="MW" tone="cyan" />
             </div>
 
             {/* Engine self-test — reliability shown, not asserted */}
