@@ -6,6 +6,11 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine,
 } from "recharts";
 import * as XLSX from "xlsx";
+import {
+  LOCATION_LIBRARY, MARKET_PRICES_2025, VRE_PENETRATION_2025,
+  DEMAND_MONTHLY_INDEX, DEMAND_HOURLY_INDEX,
+} from "./data/library-2025.js";
+export { LOCATION_LIBRARY, MARKET_PRICES_2025, VRE_PENETRATION_2025 };
 
 /* ============================================================================
    MICROGRID DESIGN TOOL — PHASE 1
@@ -235,180 +240,6 @@ export const CONSTANTS = {
     CO2_KG_PER_LITRE_DIESEL: 2.68,      // kgCO2/l
     CO2_KG_PER_MWH_GAS: 202,            // kgCO2/MWh_th  natural gas combustion
   },
-};
-
-/* ============================================================================
-   LOCATION AND RESOURCE LIBRARY
-   Every entry is an indicative reference value, not site data. Yields are P50
-   annual specific yield for a fixed, optimally tilted, ground-mounted system.
-   monthlyYieldShare is normalised in code — the numbers below are relative.
-   ========================================================================== */
-
-export const LOCATION_LIBRARY = {
-  FR_PARIS: {
-    label: "Paris, France", country: "FR", lat: 48.86,
-    specificYield_kWh_per_kWp: 1180,
-    monthlyYieldShare: [2.5, 4.0, 7.5, 10.5, 12.5, 13.0, 13.5, 12.0, 9.0, 6.0, 3.0, 2.0],
-    tempMeanC: [5, 6, 9, 12, 16, 19, 21, 21, 17, 13, 8, 5],
-    diurnalSwingC: 8,
-    windMean_m_s_100m: 6.5, weibullK: 2.0,
-    gridCO2_g_per_kWh: 60, importTariff_EUR_per_MWh: 95, gridFee_EUR_per_MWh: 28,
-    capacityCharge_EUR_per_kW_yr: 42, diesel_EUR_per_litre: 1.25, gas_EUR_per_MWh_th: 45,
-  },
-  FR_MARSEILLE: {
-    label: "Marseille, France", country: "FR", lat: 43.30,
-    specificYield_kWh_per_kWp: 1500,
-    monthlyYieldShare: [4.5, 5.8, 8.5, 10.0, 11.5, 12.5, 13.0, 11.8, 9.5, 6.8, 4.5, 3.8],
-    tempMeanC: [7, 8, 11, 14, 18, 22, 25, 25, 21, 17, 11, 8],
-    diurnalSwingC: 9,
-    windMean_m_s_100m: 7.5, weibullK: 1.9,
-    gridCO2_g_per_kWh: 60, importTariff_EUR_per_MWh: 95, gridFee_EUR_per_MWh: 28,
-    capacityCharge_EUR_per_kW_yr: 42, diesel_EUR_per_litre: 1.25, gas_EUR_per_MWh_th: 45,
-  },
-  NL_AMSTERDAM: {
-    label: "Amsterdam, Netherlands", country: "NL", lat: 52.37,
-    specificYield_kWh_per_kWp: 1050,
-    monthlyYieldShare: [2.0, 3.5, 7.0, 10.5, 12.8, 13.2, 13.5, 11.8, 8.8, 5.5, 2.6, 1.6],
-    tempMeanC: [4, 4, 7, 10, 14, 17, 19, 18, 15, 11, 8, 5],
-    diurnalSwingC: 6,
-    windMean_m_s_100m: 8.5, weibullK: 2.1,
-    gridCO2_g_per_kWh: 300, importTariff_EUR_per_MWh: 105, gridFee_EUR_per_MWh: 35,
-    capacityCharge_EUR_per_kW_yr: 55, diesel_EUR_per_litre: 1.45, gas_EUR_per_MWh_th: 42,
-  },
-  DE_FRANKFURT: {
-    label: "Frankfurt, Germany", country: "DE", lat: 50.11,
-    specificYield_kWh_per_kWp: 1080,
-    monthlyYieldShare: [2.2, 3.8, 7.2, 10.5, 12.6, 13.0, 13.4, 12.0, 9.0, 5.8, 2.8, 1.8],
-    tempMeanC: [2, 3, 7, 11, 15, 18, 20, 20, 15, 11, 6, 3],
-    diurnalSwingC: 9,
-    windMean_m_s_100m: 6.0, weibullK: 2.0,
-    gridCO2_g_per_kWh: 350, importTariff_EUR_per_MWh: 120, gridFee_EUR_per_MWh: 45,
-    capacityCharge_EUR_per_kW_yr: 90, diesel_EUR_per_litre: 1.40, gas_EUR_per_MWh_th: 45,
-  },
-  UK_LONDON: {
-    label: "London, United Kingdom", country: "UK", lat: 51.51,
-    specificYield_kWh_per_kWp: 1010,
-    monthlyYieldShare: [2.2, 3.6, 6.8, 10.2, 12.5, 13.0, 13.2, 11.8, 9.0, 5.8, 2.9, 1.9],
-    tempMeanC: [5, 5, 8, 10, 14, 17, 19, 19, 16, 12, 8, 6],
-    diurnalSwingC: 7,
-    windMean_m_s_100m: 8.0, weibullK: 2.1,
-    gridCO2_g_per_kWh: 200, importTariff_EUR_per_MWh: 130, gridFee_EUR_per_MWh: 40,
-    capacityCharge_EUR_per_kW_yr: 70, diesel_EUR_per_litre: 1.50, gas_EUR_per_MWh_th: 40,
-  },
-  ES_MADRID: {
-    label: "Madrid, Spain", country: "ES", lat: 40.42,
-    specificYield_kWh_per_kWp: 1650,
-    monthlyYieldShare: [5.0, 6.0, 8.6, 9.8, 11.2, 12.4, 13.2, 12.2, 9.6, 7.0, 5.0, 4.2],
-    tempMeanC: [6, 8, 11, 13, 17, 23, 26, 26, 21, 15, 10, 7],
-    diurnalSwingC: 12,
-    windMean_m_s_100m: 6.0, weibullK: 1.9,
-    gridCO2_g_per_kWh: 150, importTariff_EUR_per_MWh: 90, gridFee_EUR_per_MWh: 30,
-    capacityCharge_EUR_per_kW_yr: 35, diesel_EUR_per_litre: 1.30, gas_EUR_per_MWh_th: 42,
-  },
-  SA_RIYADH: {
-    label: "Riyadh, Saudi Arabia (sunbelt)", country: "SA", lat: 24.71,
-    specificYield_kWh_per_kWp: 1750,
-    monthlyYieldShare: [6.5, 7.2, 8.7, 9.0, 9.5, 9.8, 9.5, 9.4, 9.0, 8.2, 7.0, 6.2],
-    tempMeanC: [15, 17, 22, 27, 32, 34, 36, 36, 33, 28, 21, 16],
-    diurnalSwingC: 14,
-    windMean_m_s_100m: 6.0, weibullK: 2.2,
-    gridCO2_g_per_kWh: 600, importTariff_EUR_per_MWh: 45, gridFee_EUR_per_MWh: 8,
-    capacityCharge_EUR_per_kW_yr: 12, diesel_EUR_per_litre: 0.55, gas_EUR_per_MWh_th: 12,
-  },
-  AE_ABUDHABI: {
-    label: "Abu Dhabi, UAE (sunbelt)", country: "AE", lat: 24.45,
-    specificYield_kWh_per_kWp: 1700,
-    monthlyYieldShare: [6.6, 7.3, 8.6, 9.1, 9.6, 9.7, 9.3, 9.2, 9.1, 8.4, 7.1, 6.3],
-    tempMeanC: [19, 20, 23, 27, 32, 34, 36, 36, 33, 30, 25, 21],
-    diurnalSwingC: 11,
-    windMean_m_s_100m: 5.5, weibullK: 2.2,
-    gridCO2_g_per_kWh: 480, importTariff_EUR_per_MWh: 60, gridFee_EUR_per_MWh: 10,
-    capacityCharge_EUR_per_kW_yr: 15, diesel_EUR_per_litre: 0.75, gas_EUR_per_MWh_th: 18,
-  },
-  CL_ATACAMA: {
-    label: "Antofagasta / Atacama, Chile (remote mine)", country: "CL", lat: -23.65,
-    specificYield_kWh_per_kWp: 2100,
-    monthlyYieldShare: [10.2, 9.4, 9.0, 7.8, 6.6, 6.0, 6.4, 7.2, 8.4, 9.4, 9.8, 9.8],
-    tempMeanC: [21, 21, 20, 18, 16, 15, 14, 14, 15, 17, 18, 20],
-    diurnalSwingC: 8,
-    windMean_m_s_100m: 7.5, weibullK: 2.4,
-    gridCO2_g_per_kWh: 350, importTariff_EUR_per_MWh: 110, gridFee_EUR_per_MWh: 20,
-    capacityCharge_EUR_per_kW_yr: 25, diesel_EUR_per_litre: 1.35, gas_EUR_per_MWh_th: 55,
-  },
-  SG_SINGAPORE: {
-    label: "Singapore (hot-humid, AIDC reference)", country: "SG", lat: 1.35,
-    specificYield_kWh_per_kWp: 1250,
-    monthlyYieldShare: [8.2, 8.8, 9.0, 8.6, 8.4, 8.3, 8.4, 8.4, 8.3, 8.2, 7.6, 7.8],
-    tempMeanC: [27, 28, 28, 28, 28, 28, 28, 28, 28, 28, 27, 27],
-    diurnalSwingC: 6,
-    windMean_m_s_100m: 4.0, weibullK: 1.8,
-    gridCO2_g_per_kWh: 400, importTariff_EUR_per_MWh: 135, gridFee_EUR_per_MWh: 25,
-    capacityCharge_EUR_per_kW_yr: 40, diesel_EUR_per_litre: 1.10, gas_EUR_per_MWh_th: 30,
-  },
-  CUSTOM_SITE: {
-    label: "Custom site — enter your own data", country: "OTHER", lat: 45.0,
-    specificYield_kWh_per_kWp: 1200,
-    monthlyYieldShare: [3.5, 5.0, 7.8, 10.0, 12.0, 12.6, 13.0, 11.8, 9.2, 6.5, 4.2, 3.4],
-    tempMeanC: [4, 5, 9, 12, 16, 20, 22, 22, 18, 13, 8, 5],
-    diurnalSwingC: 9,
-    windMean_m_s_100m: 6.5, weibullK: 2.0,
-    gridCO2_g_per_kWh: 250, importTariff_EUR_per_MWh: 100, gridFee_EUR_per_MWh: 30,
-    capacityCharge_EUR_per_kW_yr: 50, diesel_EUR_per_litre: 1.30, gas_EUR_per_MWh_th: 45,
-  },
-  REMOTE_ISLAND: {
-    label: "Tropical island / off-grid reference", country: "XX", lat: -21.10,
-    specificYield_kWh_per_kWp: 1520,
-    monthlyYieldShare: [9.8, 9.2, 9.0, 8.2, 7.2, 6.6, 6.8, 7.6, 8.4, 9.0, 9.2, 9.0],
-    tempMeanC: [26, 27, 26, 25, 23, 21, 20, 20, 21, 23, 24, 25],
-    diurnalSwingC: 7,
-    windMean_m_s_100m: 7.0, weibullK: 2.0,
-    gridCO2_g_per_kWh: 700, importTariff_EUR_per_MWh: 220, gridFee_EUR_per_MWh: 0,
-    capacityCharge_EUR_per_kW_yr: 0, diesel_EUR_per_litre: 1.65, gas_EUR_per_MWh_th: 90,
-  },
-};
-
-/* ============================================================================
-   LOAD SHAPE LIBRARY — 24 hourly factors, weekday and weekend, range 0…1.
-   These are shapes only; magnitude comes from base / peak / annual energy.
-   ========================================================================== */
-
-/* ============================================================================
-   WHOLESALE MARKET PRICE REFERENCE — calendar year 2025
-   Annual day-ahead averages as published by the market operators. The monthly
-   and hourly shapes are typical Central-European patterns, scaled so the
-   annual mean matches the published figure. Indicative only: use your own
-   hourly series where the answer depends on it.
-   ========================================================================== */
-
-export const MARKET_PRICES_2025 = {
-  FR: { label: "France — EPEX FR", annualAvg_EUR_per_MWh: 61, source: "RTE annual review 2025 (about €4/MWh below Spain)" },
-  NL: { label: "Netherlands — EPEX NL", annualAvg_EUR_per_MWh: 87, source: "TenneT Annual Market Update 2025 (€86.8/MWh, +12 % on 2024)" },
-  DE: { label: "Germany — EPEX DE-LU", annualAvg_EUR_per_MWh: 90, source: "ENTSO-E day-ahead, 2025 average €89.9/MWh (+14 % on 2024)" },
-  ES: { label: "Spain — OMIE", annualAvg_EUR_per_MWh: 65, source: "Red Eléctrica system report 2025 (€65.29/MWh, +3.6 % on 2024)" },
-  UK: { label: "United Kingdom — N2EX", annualAvg_EUR_per_MWh: 105, source: "IEA Electricity 2026; UK wholesale rose ~40 % in H1 2025" },
-  OTHER: { label: "Generic — scaled to the site tariff", annualAvg_EUR_per_MWh: null, source: "no published 2025 curve for this market; the site tariff is used as the annual mean" },
-};
-
-/* National electricity DEMAND shape — the starting point for the price model.
-   Winter-weighted, morning ramp, evening peak, overnight trough. */
-export const DEMAND_MONTHLY_INDEX = [1.15, 1.12, 1.05, 0.96, 0.90, 0.88, 0.88, 0.87, 0.92, 1.00, 1.08, 1.14];
-export const DEMAND_HOURLY_INDEX = {
-  weekday: [0.72, 0.68, 0.66, 0.65, 0.67, 0.73, 0.85, 0.95, 1.00, 1.00, 0.99, 0.98,
-    0.96, 0.95, 0.94, 0.95, 1.00, 1.08, 1.10, 1.05, 0.98, 0.90, 0.82, 0.76],
-  weekend: [0.68, 0.65, 0.63, 0.62, 0.63, 0.66, 0.72, 0.80, 0.87, 0.91, 0.93, 0.93,
-    0.92, 0.91, 0.90, 0.91, 0.95, 1.02, 1.04, 1.00, 0.94, 0.87, 0.80, 0.73],
-};
-
-/* Share of national annual demand met by solar and by wind, 2025.
-   These set how hard the price is pushed down when the resource is running —
-   and they are what tie the price curve to the same weather the PV model uses. */
-export const VRE_PENETRATION_2025 = {
-  FR: { solar: 0.05, wind: 0.09 },
-  NL: { solar: 0.20, wind: 0.26 },
-  DE: { solar: 0.14, wind: 0.28 },
-  ES: { solar: 0.22, wind: 0.23 },
-  UK: { solar: 0.05, wind: 0.29 },
-  OTHER: { solar: 0.08, wind: 0.10 },
 };
 
 export const LOAD_SHAPES = {
@@ -1485,16 +1316,20 @@ function assessPowerAdequacy(a) {
   const marginKW = firmAfterN1KW - coincidentPeakKW;
 
   const losesGridForming = !!largest?.gridForming;
-  const pass = marginKW >= coincidentPeakKW * CONSTANTS.N_MINUS_1_MARGIN_PCT / 100 && !losesGridForming;
+  // No firm capacity at all is a failure, not a pass with a zero margin.
+  const pass = units.length > 0 && coincidentPeakKW > 0
+    && marginKW >= coincidentPeakKW * CONSTANTS.N_MINUS_1_MARGIN_PCT / 100 && !losesGridForming;
   const marginal = marginKW >= 0 && losesGridForming;
 
   return {
     verdict: verdict(pass, marginal),
     governing: marginKW < 0
-      ? `${(marginKW / 1000).toFixed(2)} MW short after losing ${largest?.name}`
+      ? `${(marginKW / 1000).toFixed(2)} MW short after losing ${largest ? largest.name : "the largest unit"}`
       : losesGridForming
-        ? `${(marginKW / 1000).toFixed(2)} MW spare, but losing ${largest?.name} also loses the grid-forming source`
-        : `${(marginKW / 1000).toFixed(2)} MW spare after losing ${largest?.name}`,
+        ? `${(marginKW / 1000).toFixed(2)} MW spare, but losing ${largest ? largest.name : "the largest unit"} also loses the grid-forming source`
+        : largest
+          ? `${(marginKW / 1000).toFixed(2)} MW spare after losing ${largest.name}`
+          : "No firm capacity installed — nothing to lose, and nothing to serve the peak",
     coincidentPeakKW, parasiticKW, firmKW, firmAfterN1KW, marginKW,
     largestUnit: largest, losesGridForming, units,
   };
@@ -1727,17 +1562,31 @@ function selfTest(disp, inp, cal) {
 
   /* 11. Unserved energy only when every source was genuinely exhausted */
   let unsFails = 0, unsH = -1, unsHours = 0;
+  // Engine availability is re-derived here, not taken from the dispatch: the
+  // permitted annual hours may be used up, or a unit may still be inside its
+  // minimum down time after stopping. Both make "no engine" a legitimate state.
+  const engHoursUsedBefore = new Int32Array(H);
+  let acc = 0;
+  for (let i = 0; i < H; i++) { engHoursUsedBefore[i] = acc; if (disp.enginesOn[i] > 0) acc++; }
   for (let i = 0; i < H; i++) {
     if (disp.unserved[i] <= tol) continue;
     unsHours++;
+    const budgetGone = e.enabled && engHoursUsedBefore[i] >= e.annualHourLimit;
+    let inDownTime = false;
+    if (e.enabled && e.minDownTimeH > 0) {
+      for (let k = Math.max(0, i - e.minDownTimeH); k < i; k++) if (disp.enginesOn[k] > 0) { inDownTime = true; break; }
+      inDownTime = inDownTime && disp.enginesOn[i] === 0;
+    }
     const cap = !g.enabled ? 0 : (g.nonFirm && g.curtailFlags[i] ? g.reducedCapKW : g.importCapKW);
     const gridExhausted = !g.enabled || disp.imp[i] >= cap - tol;
     const floor = b.reserveApplies ? Math.max(b.socMinPct, b.reserveSocPct) : b.socMinPct;
     const bessExhausted = !b.enabled || disp.soc[i] <= floor + 0.01 || Math.max(0, disp.bess[i]) >= Math.min(b.powerKW, b.energyKWh * b.cRate) - tol;
-    const engExhausted = !e.enabled || disp.enginesOn[i] >= e.units || disp.engine[i] >= e.units * e.unitKW - tol;
+    const engExhausted = !e.enabled || budgetGone || inDownTime
+      || disp.enginesOn[i] >= e.units || disp.engine[i] >= e.units * e.unitKW - tol;
     if (!(gridExhausted && bessExhausted && engExhausted)) { unsFails++; if (unsH < 0) unsH = i; }
   }
-  record("Unserved energy only when every source is exhausted", `${unsHours} hour(s) with unserved energy`,
+  record("Unserved energy only when every source is exhausted",
+    `${unsHours} hour(s) with unserved energy; engine hour budget and minimum down time counted as legitimate unavailability`,
     `${unsFails} unjustified hour(s)`, unsH, unsFails);
 
   /* 12. Annual totals reconcile with the hourly arrays */
@@ -2761,6 +2610,14 @@ function Field({ label, unit, children, hint, flag, explain, source, computed, t
 
 /* Only two states. Yellow: this number is specific to your project and the
    library cannot supply it. Grey text on white: everything else. */
+/* Empty yellow fields read as zero in the engine, never as NaN. */
+const numz = (v) => {
+  if (v === "" || v === null || v === undefined) return 0;
+  if (Array.isArray(v)) return v.map(numz);
+  if (typeof v === "object") { const o = {}; for (const k in v) o[k] = numz(v[k]); return o; }
+  return v;
+};
+
 const inpCls = (T, src) => `mt-0.5 w-full rounded border px-2 py-1 font-mono text-sm focus:outline-none ${
   src === "site" ? T.inputSite : T.inputLib}`;
 
@@ -3041,9 +2898,9 @@ export default function MicrogridDesignTool() {
   const [mode, setMode] = useState("aidc"); // "standard" | "aidc"
 
   const [ctx, setCtx] = useState({
-    useCase: "deferral", gridStatus: "phased", importCapKW: 8000, exportCapKW: 0,
+    useCase: "deferral", gridStatus: "phased", importCapKW: "", exportCapKW: 0,
     flexPctHours: 20, flexReducedCapKW: 4000,
-    phases: [{ year: 1, capKW: 8000 }, { year: 3, capKW: 20000 }],
+    phases: [{ year: 1, capKW: "" }],
     islanding: "planned", autonomyH: 4, locationId: "FR_PARIS", lifeYears: 20, discountPct: 7,
   });
 
@@ -3052,9 +2909,9 @@ export default function MicrogridDesignTool() {
   const [uploadedResource, setUploadedResource] = useState(null);
 
   const [aidc, setAidc] = useState({
-    targetMWIT: 20,
-    ramp: [{ year: 1, mwIT: 4 }, { year: 2, mwIT: 12 }, { year: 3, mwIT: 20 }],
-    analysisYear: 3,
+    targetMWIT: "",
+    ramp: [{ year: 1, mwIT: "" }],
+    analysisYear: 1,
     coolingType: "liquid", designPUE: 1.20,
     freeCoolingBelowC: CONSTANTS.COOLING.liquid.freeCoolingBelowC,
     designAmbientC: CONSTANTS.COOLING.liquid.designAmbientC,
@@ -3064,15 +2921,15 @@ export default function MicrogridDesignTool() {
     loadSwingPct: CONSTANTS.LOAD_SWING_PCT_DEFAULT,
     loadSwingSeconds: CONSTANTS.LOAD_SWING_SECONDS_DEFAULT,
     antiRecycleMin: CONSTANTS.ANTI_RECYCLE_TIMER_MIN_DEFAULT,
-    landPV_ha: 12, pvAreaPerKWp: CONSTANTS.PV_AREA_M2_PER_KWP,
-    landBESS_m2: 6000, bessFootprint: CONSTANTS.BESS_FOOTPRINT_M2_PER_MW,
-    landEngine_m2: 5000, engineFootprint: CONSTANTS.ENGINE_FOOTPRINT_M2_PER_MW,
-    gridStrategy: "capped", engineHoursLimit: 500, noiseLimitNote: "", waterAvailable: false,
+    landPV_ha: "", pvAreaPerKWp: CONSTANTS.PV_AREA_M2_PER_KWP,
+    landBESS_m2: "", bessFootprint: CONSTANTS.BESS_FOOTPRINT_M2_PER_MW,
+    landEngine_m2: "", engineFootprint: CONSTANTS.ENGINE_FOOTPRINT_M2_PER_MW,
+    gridStrategy: "capped", engineHoursLimit: "", noiseLimitNote: "", waterAvailable: false,
     pueTouched: false,
   });
 
   const [loadCfg, setLoadCfg] = useState({
-    path: "parametric", annualEnergyMWh: 12000, peakKW: 3000, baseKW: 400,
+    path: "parametric", annualEnergyMWh: "", peakKW: "", baseKW: "",
     shapeKey: "two_shift", seasonality: 12, seasonalPeak: "winter", weekendFactor: 1.0,
     customWeekday: [...LOAD_SHAPES.custom.weekday], customWeekend: [...LOAD_SHAPES.custom.weekend],
   });
@@ -3080,7 +2937,7 @@ export default function MicrogridDesignTool() {
 
   const [char, setChar] = useState({
     critPct: 85, shed1Pct: 10, shed2Pct: 5,
-    stepKW: 800, motorKW: 400, motorMethod: "VSD",
+    stepKW: "", motorKW: "", motorMethod: "VSD",
     parasiticMode: "pct", parasiticPct: 5, parasiticKW: 0, touched: false,
   });
 
@@ -3110,18 +2967,18 @@ export default function MicrogridDesignTool() {
   const cfgFileRef = useRef(null);
 
   const [res, setRes] = useState({
-    pv: { enabled: true, kWp: 10000, dcacRatio: CONSTANTS.PV_DCAC_RATIO_DEFAULT, soilingPct: CONSTANTS.PV_SOILING_PCT,
+    pv: { enabled: false, kWp: "", dcacRatio: CONSTANTS.PV_DCAC_RATIO_DEFAULT, soilingPct: CONSTANTS.PV_SOILING_PCT,
       bifacialGainPct: CONSTANTS.PV_BIFACIAL_GAIN_PCT, availabilityPct: CONSTANTS.PV_AVAILABILITY_PCT,
       otherLossesPct: CONSTANTS.PV_OTHER_LOSSES_PCT, degradationPctPerYr: CONSTANTS.PV_DEGRADATION_PCT_PER_YR },
-    wind: { enabled: false, ratedKW: 3000, hubHeightM: 100, cutInMs: CONSTANTS.WIND_CUT_IN_M_S, ratedMs: CONSTANTS.WIND_RATED_M_S,
+    wind: { enabled: false, ratedKW: "", hubHeightM: 100, cutInMs: CONSTANTS.WIND_CUT_IN_M_S, ratedMs: CONSTANTS.WIND_RATED_M_S,
       cutOutMs: CONSTANTS.WIND_CUT_OUT_M_S, availabilityPct: CONSTANTS.WIND_AVAILABILITY_PCT },
-    bess: { enabled: true, powerKW: 8000, energyKWh: 16000, cRate: CONSTANTS.BESS_C_RATE, rtePct: CONSTANTS.BESS_RTE_PCT,
+    bess: { enabled: false, powerKW: "", energyKWh: "", cRate: CONSTANTS.BESS_C_RATE, rtePct: CONSTANTS.BESS_RTE_PCT,
       socMinPct: CONSTANTS.BESS_SOC_MIN_PCT, socMaxPct: CONSTANTS.BESS_SOC_MAX_PCT, reserveSocPct: CONSTANTS.BESS_RESERVE_SOC_PCT,
       startSocPct: 60, gridForming: true, gridFormingStepPct: CONSTANTS.BESS_GRID_FORMING_STEP_PCT, arbitrage: true },
-    engine: { enabled: true, units: 6, unitKW: 2500, fuelType: "gas", minStableLoadPct: CONSTANTS.ENGINE_MIN_STABLE_LOAD_PCT,
+    engine: { enabled: false, units: "", unitKW: "", fuelType: "gas", minStableLoadPct: CONSTANTS.ENGINE_MIN_STABLE_LOAD_PCT,
       stepAcceptancePct: CONSTANTS.ENGINE_STEP_ACCEPTANCE_PCT, startTimeMin: CONSTANTS.ENGINE_START_TIME_MIN_GAS,
       minUpTimeH: CONSTANTS.ENGINE_MIN_UP_TIME_H, minDownTimeH: CONSTANTS.ENGINE_MIN_DOWN_TIME_H, annualHourLimit: 500 },
-    turbine: { enabled: false, ratedKW: 10000, minLoadPct: CONSTANTS.TURBINE_MIN_LOAD_PCT,
+    turbine: { enabled: false, ratedKW: "", minLoadPct: CONSTANTS.TURBINE_MIN_LOAD_PCT,
       minUpTimeH: CONSTANTS.TURBINE_MIN_UP_TIME_H, minDownTimeH: CONSTANTS.TURBINE_MIN_DOWN_TIME_H },
     tariff: { structure: "market", peakStartHour: CONSTANTS.TOU_PEAK_START_HOUR, peakEndHour: CONSTANTS.TOU_PEAK_END_HOUR,
       peakMultiplier: CONSTANTS.TOU_PEAK_MULTIPLIER, offPeakMultiplier: CONSTANTS.TOU_OFFPEAK_MULTIPLIER },
@@ -3129,6 +2986,22 @@ export default function MicrogridDesignTool() {
     lookahead: { enabled: true, horizonH: CONSTANTS.LOOKAHEAD_HOURS },
     meritOrder: "storage-first",
   });
+
+  /* --- Sanitised copies: blank yellow fields read as zero in the engine ---- */
+  const resN = useMemo(() => numz(res), [res]);
+  const ctxN = useMemo(() => numz(ctx), [ctx]);
+  const charN = useMemo(() => numz(char), [char]);
+  const aidcN = useMemo(() => numz(aidc), [aidc]);
+
+  const simYear = mode === "aidc" ? aidc.analysisYear : 1;
+
+  const effectiveImportCapKW = useMemo(() => {
+    if (ctx.gridStatus !== "phased" || !ctx.phases.length) return ctx.importCapKW;
+    const sorted = [...ctx.phases].sort((a, b) => a.year - b.year);
+    let cap = sorted[0].capKW;
+    for (const p of sorted) if (simYear >= p.year) cap = p.capKW;
+    return cap;
+  }, [ctx.gridStatus, ctx.phases, ctx.importCapKW, simYear]);
 
   /* --- Derived ------------------------------------------------------------ */
   const loc = useMemo(() => ({ ...LOCATION_LIBRARY[ctx.locationId], ...locOverride }), [ctx.locationId, locOverride]);
@@ -3141,8 +3014,8 @@ export default function MicrogridDesignTool() {
     return r ? r.mwIT : aidc.targetMWIT;
   }, [aidc]);
 
-  const aidcDerived = useMemo(() => (mode === "aidc" ? deriveAIDCLoad(aidc, temp, aidcYearMW) : null), [mode, aidc, temp, aidcYearMW]);
-  const synth = useMemo(() => (mode === "standard" && loadCfg.path === "parametric" ? synthesiseLoad({ ...loadCfg, cal }) : null), [mode, loadCfg, cal]);
+  const aidcDerived = useMemo(() => (mode === "aidc" ? deriveAIDCLoad(aidcN, temp, numz(aidcYearMW)) : null), [mode, aidcN, temp, aidcYearMW]);
+  const synth = useMemo(() => (mode === "standard" && loadCfg.path === "parametric" ? synthesiseLoad({ ...numz(loadCfg), cal }) : null), [mode, loadCfg, cal]);
 
   const load = useMemo(() => {
     if (mode === "aidc") return aidcDerived.load;
@@ -3177,6 +3050,19 @@ export default function MicrogridDesignTool() {
 
   const notices = useMemo(() => {
     const n = [];
+    const blanks = [];
+    if (mode === "standard" && loadCfg.path === "parametric") {
+      if (!loadCfg.annualEnergyMWh) blanks.push("annual energy");
+      if (!loadCfg.peakKW) blanks.push("peak demand");
+    }
+    if (mode === "aidc" && !aidc.targetMWIT) blanks.push("target IT capacity");
+    if (ctx.gridStatus !== "none" && !effectiveImportCapKW) blanks.push("grid import cap");
+    if (!res.pv.enabled && !res.bess.enabled && !res.engine.enabled && !res.wind.enabled && !res.turbine.enabled) {
+      blanks.push("at least one piece of equipment");
+    }
+    if (blanks.length) {
+      n.push({ level: "warn", text: `Still to fill in before the results mean anything: ${blanks.join(", ")}. Empty yellow fields are read as zero, so the run will complete but the numbers will be meaningless.` });
+    }
     if (ctx.locationId === "CUSTOM_SITE") {
       n.push({ level: "warn", text: `Custom site: the solar yield (${fmt(loc.specificYield_kWh_per_kWp, 0)} kWh/kWp), monthly shape, temperatures and wind speed are generic placeholders, not data for your location. Get the yield and the monthly profile from PVGIS for the real coordinates, or upload an hourly file, before quoting any LCOE.` });
     }
@@ -3238,7 +3124,6 @@ export default function MicrogridDesignTool() {
   }, [view, load, temp, pvUnit, cal]);
 
   /* --- Phase 2: generation profiles ------------------------------------- */
-  const simYear = mode === "aidc" ? aidc.analysisYear : 1;
   const pvOut = useMemo(() => (res.pv.enabled ? buildPVGen(pvUnit, res.pv, simYear)
     : { gen: new Float32Array(H), clippedHours: 0, acLimitKW: 0 }), [pvUnit, res.pv, simYear]);
   // Built regardless of whether a wind farm is installed: the national price model
@@ -3281,13 +3166,6 @@ export default function MicrogridDesignTool() {
   // A phased connection steps up over time. The cap in force is the last step
   // whose year has been reached — using the base cap in every year would
   // misreport exactly the ramp the AIDC case is about.
-  const effectiveImportCapKW = useMemo(() => {
-    if (ctx.gridStatus !== "phased" || !ctx.phases.length) return ctx.importCapKW;
-    const sorted = [...ctx.phases].sort((a, b) => a.year - b.year);
-    let cap = sorted[0].capKW;
-    for (const p of sorted) if (simYear >= p.year) cap = p.capKW;
-    return cap;
-  }, [ctx.gridStatus, ctx.phases, ctx.importCapKW, simYear]);
 
   const gridForBom = {
     enabled: ctx.gridStatus !== "none" && !(mode === "aidc" && aidc.gridStrategy === "offgrid"),
@@ -3303,17 +3181,17 @@ export default function MicrogridDesignTool() {
      downstream of the dispatch — costs, financials, sensitivity — updates live. */
   const dispatchInputs = useMemo(() => ({
     load, pvGen: pvOut.gen, windGen, price, temp, cal,
-    shed1Pct: char.shed1Pct, shed2Pct: char.shed2Pct,
+    shed1Pct: charN.shed1Pct, shed2Pct: charN.shed2Pct,
     grid: {
       enabled: ctx.gridStatus !== "none" && !(mode === "aidc" && aidc.gridStrategy === "offgrid"),
       importCapKW: effectiveImportCapKW, exportCapKW: ctx.exportCapKW,
       nonFirm: ctx.gridStatus === "flexible", reducedCapKW: ctx.flexReducedCapKW, curtailFlags,
-      shaveEnabled: res.shave.enabled, shaveTargetKW: res.shave.targetKW,
+      shaveEnabled: resN.shave.enabled, shaveTargetKW: resN.shave.targetKW,
     },
-    bess: { ...res.bess, rteFraction: res.bess.rtePct / 100, reserveApplies },
-    engine: { ...res.engine, sfcDiesel: CONSTANTS.DIESEL_SFC_L_PER_KWH, effGas: CONSTANTS.GAS_ENGINE_EFF_PCT },
-    turbine: { ...res.turbine, effCurve: CONSTANTS.TURBINE_EFF_PCT },
-    lookahead: res.lookahead,
+    bess: { ...resN.bess, rteFraction: resN.bess.rtePct / 100, reserveApplies },
+    engine: { ...resN.engine, sfcDiesel: CONSTANTS.DIESEL_SFC_L_PER_KWH, effGas: CONSTANTS.GAS_ENGINE_EFF_PCT },
+    turbine: { ...resN.turbine, effCurve: CONSTANTS.TURBINE_EFF_PCT },
+    lookahead: resN.lookahead,
     meritOrder: res.meritOrder,
   }), [load, pvOut, windGen, price, temp, cal, char.shed1Pct, char.shed2Pct, ctx, mode, aidc.gridStrategy,
        curtailFlags, res, reserveApplies, effectiveImportCapKW]);
@@ -3327,8 +3205,9 @@ export default function MicrogridDesignTool() {
 
   const evaluateDesign = (inputs, overrides) => {
     const inp = overrides ? { ...inputs, ...overrides } : inputs;
+    const stepFallback = numz(char.stepKW);
     const d = dispatch(inp);
-    const islandLoadKW = stats.peakKW * char.critPct / 100 + parasiticKWval;
+    const islandLoadKW = stats.peakKW * numz(char.critPct) / 100 + parasiticKWval;
     const engineFirmKW = (inp.engine.enabled ? inp.engine.units * inp.engine.unitKW : 0)
       + (inp.turbine.enabled ? inp.turbine.ratedKW : 0);
     const gridFormingSource = inp.bess.enabled && inp.bess.gridForming ? "bess" : inp.grid.enabled ? "grid" : "engine";
@@ -3341,8 +3220,8 @@ export default function MicrogridDesignTool() {
         grid: { enabled: inp.grid.enabled, firmCapKW: ctx.gridStatus === "flexible" ? ctx.flexReducedCapKW : inp.grid.importCapKW },
         bess: inp.bess, engine: inp.engine, turbine: inp.turbine, gridFormingSource }),
       dynamic: assessDynamicAdequacy({
-        stepKW: mode === "aidc" && !char.touched && aidcOut ? aidcOut.stepKW : char.stepKW,
-        motorKW: char.motorKW, motorMethod: char.motorMethod,
+        stepKW: mode === "aidc" && !char.touched && aidcOut ? aidcOut.stepKW : stepFallback,
+        motorKW: numz(char.motorKW), motorMethod: char.motorMethod,
         bess: inp.bess, engine: inp.engine, turbine: inp.turbine, islanded, disp: d, islandLoadKW }),
     };
     return { disp: d, adeq: ad, inputs: inp };
@@ -3352,7 +3231,7 @@ export default function MicrogridDesignTool() {
     const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
     const { disp: d, adeq: ad } = evaluateDesign(dispatchInputs);
     const b = buildBOM({
-      res, ctx, grid: gridForBom, disp: d,
+      res: resN, ctx: ctxN, grid: gridForBom, disp: d,
       aidcLimits: mode === "aidc" ? { pvAreaPerKWp: aidc.pvAreaPerKWp, bessFootprint: aidc.bessFootprint, engineFootprint: aidc.engineFootprint } : null,
     });
     const ms = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
@@ -3418,17 +3297,17 @@ export default function MicrogridDesignTool() {
   /* --- Phase 4: costs and LCOE -------------------------------------------- */
   const itEnergyMWh = mode === "aidc" && aidcDerived ? aidcDerived.itKW * H / 1000 : 0;
   const cost = useMemo(() => (disp ? computeCosts({
-    res, ctx, loc, disp, price, costs, itEnergyMWh,
+    res: resN, ctx: ctxN, loc, disp, price, costs, itEnergyMWh,
     gridEnabled: gridForBom.enabled, firmCapKW: gridForBom.firmCapKW,
   }) : null), [res, ctx, loc, disp, price, costs, itEnergyMWh, gridForBom.enabled, gridForBom.firmCapKW]);
   const sens = useMemo(() => (disp && cost ? lcoeSensitivity({ res, ctx, disp, costs }, cost) : []), [res, ctx, disp, costs, cost]);
 
   /* --- Phase 6: baseline, financials, emissions ---------------------------- */
   const baseline = useMemo(() => computeBaseline({
-    load, price, loc, gridEnabled: gridForBom.enabled, res, costs, cal,
+    load, price, loc, gridEnabled: gridForBom.enabled, res: resN, costs, cal,
   }), [load, price, loc, gridForBom.enabled, res, costs, cal]);
   const financials = useMemo(() => (cost && fin.enabled
-    ? computeFinancials({ cost, baseline, ctx, fin }) : null), [cost, baseline, ctx, fin]);
+    ? computeFinancials({ cost, baseline, ctx: ctxN, fin }) : null), [cost, baseline, ctxN, fin]);
   const emissions = useMemo(() => {
     if (!disp) return { totalTCO2: 0, gridTCO2: 0, fuelTCO2: 0 };
     const gridT = disp.summary.importMWh * loc.gridCO2_g_per_kWh / 1000;
@@ -3746,7 +3625,7 @@ export default function MicrogridDesignTool() {
         label: res.shave.enabled && res.shave.targetKW > 0
           ? `Import from the grid, but only up to ${fmt(res.shave.targetKW / 1000, 1)} MW so the demand charge stays down`
           : `Import from the grid up to the ${fmt(effectiveImportCapKW / 1000, 1)} MW connection limit`,
-        fixed: false, action: "shave",
+        fixed: true,
       });
     }
     const bat = {
@@ -3769,7 +3648,7 @@ export default function MicrogridDesignTool() {
       label: res.bess.arbitrage && ctx.gridStatus !== "none"
         ? "Charge the battery from surplus renewables, then from the cheapest hours ahead"
         : "Charge the battery from surplus renewables only",
-      fixed: false, action: "arbitrage",
+      fixed: true,
     });
     steps.push({ label: ctx.exportCapKW > 0 ? "Export what is left, then curtail the rest" : "Curtail any renewable surplus that cannot be stored", fixed: true });
     steps.push({ label: "Only as a last resort, shed load by tier, then record it as unserved", fixed: true });
@@ -4067,6 +3946,10 @@ export default function MicrogridDesignTool() {
               <Field tier="critical" label="Solar yield" source="site" unit="kWh/kWp/yr" explain="Yearly output per kWp installed. Moves LCOE more than equipment price." flag={resourceSource.pv === "library" ? "library default" : null}>
                 <Num value={loc.specificYield_kWh_per_kWp} step={10} onChange={(v) => setLocOverride((s) => ({ ...s, specificYield_kWh_per_kWp: v }))} />
               </Field>
+              <Field tier="critical" label="Land available for PV" source="site" unit="ha"
+                explain="Caps how much PV can be built here. About 12 m² per kWp for a ground-mounted array.">
+                <Num value={aidc.landPV_ha} step={0.5} onChange={(v) => setAidc((s2) => ({ ...s2, landPV_ha: v }))} />
+              </Field>
               <Field tier="critical" label="Grid import tariff" source="site" unit="€/MWh"><Num value={loc.importTariff_EUR_per_MWh} onChange={(v) => setLocOverride((s) => ({ ...s, importTariff_EUR_per_MWh: v }))} /></Field>
               <Field tier="critical" label="Diesel price" source="site" unit="€/litre"><Num value={loc.diesel_EUR_per_litre} step={0.05} onChange={(v) => setLocOverride((s) => ({ ...s, diesel_EUR_per_litre: v }))} /></Field>
               <Field tier="critical" label="Gas price" source="site" unit="€/MWh th"><Num value={loc.gas_EUR_per_MWh_th} onChange={(v) => setLocOverride((s) => ({ ...s, gas_EUR_per_MWh_th: v }))} /></Field>
@@ -4217,7 +4100,6 @@ export default function MicrogridDesignTool() {
                       { value: "offgrid", label: "Fully off-grid" },
                     ]} />
                 </Field>
-                <Field tier="critical" label="Land available for PV" source="site" unit="ha"><Num value={aidc.landPV_ha} step={0.5} onChange={(v) => setAidc((s) => ({ ...s, landPV_ha: v }))} /></Field>
                 <Field tier="critical" label="Permitted engine running hours" source="site" unit="h/yr"><Num value={aidc.engineHoursLimit} step={50} onChange={(v) => setAidc((s) => ({ ...s, engineHoursLimit: v }))} /></Field>
                 <Field tier="critical" label="Collective compute swing" unit="% of IT" hint="largest load step for the dynamic check">
                   <Num value={aidc.loadSwingPct} onChange={(v) => setAidc((s) => ({ ...s, loadSwingPct: v }))} />
@@ -4525,7 +4407,7 @@ export default function MicrogridDesignTool() {
                     <Num value={res.pv.dcacRatio} step={0.05} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, dcacRatio: v } }))} />
                   </Field>
                   <Field label="Annual degradation" source="library" unit="%/yr"><Num value={res.pv.degradationPctPerYr} step={0.1} onChange={(v) => setRes((s) => ({ ...s, pv: { ...s.pv, degradationPctPerYr: v } }))} /></Field>
-                  <Field computed label="Clipped hours" unit="h/yr"><Txt value={fmt(pvOut.clippedHours, 0)} readOnly /></Field>
+
                 </div>
                 <Advanced key={`pv-${density}`} title="Advanced — soiling, bifacial gain, availability, other losses" count={4} defaultOpen={showAll}>
                   <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -4575,7 +4457,7 @@ export default function MicrogridDesignTool() {
               {res.bess.enabled && (<>
                 <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
                   <Field tier="critical" label="Rated power" source="site" unit="kW"><Num value={res.bess.powerKW} step={100} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, powerKW: v } }))} /></Field>
-                  <Field tier="critical" label="Energy capacity" source="site" unit="kWh" hint={`${fmt(res.bess.energyKWh / Math.max(1, res.bess.powerKW), 2)} h at rated power`}>
+                  <Field tier="critical" label="Energy capacity" source="site" unit="kWh">
                     <Num value={res.bess.energyKWh} step={100} onChange={(v) => setRes((s) => ({ ...s, bess: { ...s.bess, energyKWh: v } }))} />
                   </Field>
                   <Field computed tier="critical" label="Duration at rated power" unit="hours"
@@ -4739,29 +4621,17 @@ export default function MicrogridDesignTool() {
                               className={`rounded border px-2 py-0.5 font-mono text-xs ${T.btn}`}
                               title="Swap the battery and the generators in the order">↕ swap</button>
                           )}
-                          {st2.action === "arbitrage" && (
-                            <button onClick={() => setRes((s3) => ({ ...s3, bess: { ...s3.bess, arbitrage: !s3.bess.arbitrage } }))}
-                              className={`rounded border px-2 py-0.5 font-mono text-xs ${T.btn}`}
-                              title="Allow or forbid charging from the grid in cheap hours">
-                              {res.bess.arbitrage ? "buying cheap power — turn off" : "self-consumption only — turn on"}</button>
-                          )}
-                          {st2.action === "shave" && (
-                            <span className="flex items-center gap-1">
-                              <span className={`font-mono text-xs ${T.ghost}`}>cap kW</span>
-                              <input type="number" step={50} value={res.shave.enabled ? res.shave.targetKW : 0}
-                                onChange={(e) => setRes((s3) => ({ ...s3, shave: { enabled: Number(e.target.value) > 0, targetKW: Number(e.target.value) } }))}
-                                className={`w-24 rounded border px-1 py-0.5 text-right font-mono text-xs ${T.inputSite}`} />
-                            </span>
-                          )}
+
+
                           <span className={`font-mono text-xs ${T.ghost}`}>{st2.fixed ? "fixed" : "editable"}</span>
                         </span>
                       </li>
                     ))}
                   </ol>
                   <div className={`mt-2 text-xs ${T.faint}`}>
-                    Edit the steps marked “editable” right here — swap the battery and the generators, change the import cap,
-                    or turn cheap-hour buying on and off. Steps marked “fixed” are not preferences: renewables are free at the
-                    margin so they always go first, and shedding load is always the last resort.
+                    Everything here follows from the settings above. The one thing you can change in the list itself is the
+                    order of the battery and the generators — press swap. Renewables always go first because they are free at
+                    the margin, and shedding load is always the last resort.
                   </div>
                 </div>
               </div>
@@ -4869,6 +4739,7 @@ export default function MicrogridDesignTool() {
               <Stat label="Battery cycles" value={fmt(disp.summary.equivalentFullCycles, 0)} unit="EFC/yr" tone="violet" />
               <Stat label="Minimum SOC reached" value={fmt(disp.summary.minSoc, 0)} unit="%" tone="violet" />
               <Stat label="Peak import (annual)" value={fmt(disp.summary.peakImportKW / 1000, 2)} unit="MW" tone="cyan" />
+              <Stat label="Hours PV output was clipped" value={fmt(pvOut.clippedHours, 0)} unit="h/yr" tone={pvOut.clippedHours > 500 ? "amber" : "slate"} />
               <Stat label="Billed peak (mean of 12 monthly)" value={fmt(disp.summary.meanMonthlyPeakKW / 1000, 2)} unit="MW" tone="cyan" />
             </div>
 
