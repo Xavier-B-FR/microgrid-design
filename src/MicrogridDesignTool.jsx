@@ -813,6 +813,7 @@ export const REASON_CODES = [
   "PEAK_SHAVE",      //  5c battery discharging to hold import below the demand-charge target
   "HOLD_FOR_PEAK",   //  5d battery holding energy back for a larger peak later in the horizon
   "CHEAP_HOURS",     //  5e charging because this is among the cheapest hours in the horizon
+  "BESS_CHEAPER",    //  5f discharging ahead of the grid because stored energy costs less right now
   "BESS_POWER",      //  6  battery limited by rated power or C-rate
   "ENGINE_ON",       //  7  engines running, loaded normally
   "ENGINE_MIN_LOAD", //  8  engine held at minimum stable load, surplus dumped
@@ -841,6 +842,7 @@ export const REASON_INFO = {
   TURBINE_ON:      { group: "Normal",      label: "Turbine carried the balance",            hint: "gas turbine loaded normally" },
   PEAK_SHAVE:      { group: "Normal",      label: "Battery shaved the peak",                hint: "import held below the demand-charge target" },
   HOLD_FOR_PEAK:   { group: "Normal",      label: "Battery held back for a bigger peak",    hint: "a larger peak is coming within the horizon, so energy was kept for it" },
+  BESS_CHEAPER:    { group: "Normal",      label: "Battery used instead of the grid",       hint: "the stored energy cost less than importing at this hour's price" },
   CHEAP_HOURS:     { group: "Normal",      label: "Charged in a cheap hour",                hint: "among the cheapest hours in the horizon, and the surplus ahead will not fill the battery" },
   CURTAIL:         { group: "Waste",       label: "Renewables curtailed",                   hint: "generation that could not be used, stored or exported" },
   IMPORT_CAP:      { group: "Constrained", label: "Import cap reached",                     hint: "the connection was full — this is why other assets ran" },
@@ -864,7 +866,7 @@ export const REASON_GROUPS = ["Normal", "Constrained", "Waste", "Failure"];
 const SEVERITY = {
   // Normal operation
   RENEWABLE: 0, GRID: 1, EXPORT: 2, CHARGE: 2, BESS_DISCHARGE: 2,
-  ENGINE_ON: 3, TURBINE_ON: 3, PEAK_SHAVE: 3, HOLD_FOR_PEAK: 3, CHEAP_HOURS: 2, CURTAIL: 4,
+  ENGINE_ON: 3, TURBINE_ON: 3, PEAK_SHAVE: 3, HOLD_FOR_PEAK: 3, CHEAP_HOURS: 2, BESS_CHEAPER: 2, CURTAIL: 4,
   // Asset state — an asset ran out of room or energy
   BESS_POWER: 5, BESS_EMPTY: 5, SOC_RESERVE: 5, MIN_UP_DOWN: 6, ENGINE_START: 6,
   // Structural limits — these are WHY the other assets had to run, so they outrank
@@ -978,6 +980,10 @@ function dispatch(cfg) {
     return (lo + hi) / 2;
   };
   let curtailRenewTotal = 0, renewServedTotal = 0;
+  // Weighted average cost of the energy currently in the battery, €/MWh.
+  // Surplus renewables enter at zero; grid energy enters at the hour's price.
+  let storedCostEURperMWh = 0;
+  const wearEURperMWh = b.wearCostEURperMWh !== undefined ? b.wearCostEURperMWh : CONSTANTS.BESS_WEAR_COST_EUR_PER_MWH;
 
   for (let i = 0; i < hoursOfYear; i++) {
     let reason = RC.RENEWABLE;
@@ -1009,11 +1015,14 @@ function dispatch(cfg) {
     // Peak shaving holds import below a demand-charge target. The full cap stays
     // available as a backstop in step 3b, after the battery has done what it can.
     const shaveCap = (g.enabled && g.shaveEnabled && g.shaveTargetKW > 0) ? Math.min(capKW, g.shaveTargetKW) : capKW;
-    const imp = Math.min(residual, shaveCap);
-    if (imp > 0) { out.imp[i] = imp; residual -= imp; mark(RC.GRID); }
-    if (g.enabled && residual > 0.001 && shaveCap < capKW) mark(RC.PEAK_SHAVE);
-    else if (g.enabled && residual > 0.001 && capKW > 0) mark(curtailedHour ? RC.CURTAIL_SCHED : RC.IMPORT_CAP);
-    else if (g.enabled && residual > 0.001 && capKW === 0 && curtailedHour) mark(RC.CURTAIL_SCHED);
+
+    const runGridImport = () => {
+      const imp = Math.min(residual, shaveCap);
+      if (imp > 0) { out.imp[i] = imp; residual -= imp; mark(RC.GRID); }
+      if (g.enabled && residual > 0.001 && shaveCap < capKW) mark(RC.PEAK_SHAVE);
+      else if (g.enabled && residual > 0.001 && capKW > 0) mark(curtailedHour ? RC.CURTAIL_SCHED : RC.IMPORT_CAP);
+      else if (g.enabled && residual > 0.001 && capKW === 0 && curtailedHour) mark(RC.CURTAIL_SCHED);
+    };
 
     /* --- 3 & 4. The discretionary middle of the merit order -----------------
        Renewables always come first and load shedding always comes last — those
@@ -1128,7 +1137,18 @@ function dispatch(cfg) {
       }
     };
 
-    if (thermalFirst) { runThermal(); runBattery(); } else { runBattery(); runThermal(); }
+    /* Order for this hour. Grid import normally comes before the battery, but
+       not when the stored energy is cheaper than the grid is right now: a fixed
+       order would import at the evening peak while the battery sat full of
+       midday solar. The test is explicit and its outcome is recorded, so the
+       hour is still readable. */
+    const dischargeValueEURperMWh = storedCostEURperMWh / effOneWay + wearEURperMWh;
+    const batteryBeatsGrid = b.enabled && g.enabled && !thermalFirst
+      && soc > reserveFloorPct + 0.01
+      && price[i] > dischargeValueEURperMWh;
+    if (thermalFirst) { runGridImport(); runThermal(); runBattery(); }
+    else if (batteryBeatsGrid) { runBattery(); if (disKW > 0.001) mark(RC.BESS_CHEAPER); runGridImport(); runThermal(); }
+    else { runGridImport(); runBattery(); runThermal(); }
 
     /* --- Backstop import: the full connection cap, before anything is shed --- */
     if (g.enabled && residual > 0.001 && capKW > out.imp[i]) {
@@ -1181,6 +1201,7 @@ function dispatch(cfg) {
       // (b) cheap grid hours, if arbitrage is enabled and the cap allows it
       // RULE 2 — charge from the grid only in the cheapest hours of the horizon,
       // and only for the room the forecast renewable surplus will not fill.
+      let gridChargeKW = 0;
       const priceOK = LA ? cheapHour[i] === 1 : price[i] < meanPrice * CONSTANTS.ARBITRAGE_CHARGE_THRESHOLD;
       const roomForGrid = LA
         ? Math.max(0, roomKWh - surplusAhead[i] * effOneWay) / effOneWay
@@ -1193,13 +1214,17 @@ function dispatch(cfg) {
         const headroom = Math.max(0, arbCeiling - out.imp[i]);
         const extra = Math.min(powerLimitKW - chargeKW, headroom, Math.max(0, roomForGrid - chargeKW));
         if (extra > 0.001) {
-          chargeKW += extra; out.imp[i] += extra;
+          chargeKW += extra; gridChargeKW = extra; out.imp[i] += extra;
           if (reason === RC.RENEWABLE || reason === RC.GRID) mark(LA ? RC.CHEAP_HOURS : RC.CHARGE);
         }
       }
       if (chargeKW > 0.001) {
-        soc += (chargeKW * effOneWay) / b.energyKWh * 100;
-        throughputKWh += chargeKW * effOneWay;
+        const addedKWh = chargeKW * effOneWay;
+        const heldKWh = Math.max(0, (soc - reserveFloorPct) / 100 * b.energyKWh);
+        const addedCost = (gridChargeKW > 0.001 ? gridChargeKW / chargeKW : 0) * price[i];
+        storedCostEURperMWh = (heldKWh * storedCostEURperMWh + addedKWh * addedCost) / Math.max(0.001, heldKWh + addedKWh);
+        soc += addedKWh / b.energyKWh * 100;
+        throughputKWh += addedKWh;
         if (reason === RC.RENEWABLE) mark(RC.CHARGE);
       }
       out.bess[i] = disKW - chargeKW;   // net: positive discharging, negative charging
@@ -3806,6 +3831,9 @@ export default function MicrogridDesignTool() {
 
   const runAutoSize = () => {
     setSweeping(true);
+    // The search uses the same method as the headline run, so the ranking it
+    // produces is the ranking you would get by applying each design and running it.
+    const useOptimiser = res.dispatchMode === "optimised";
     const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
     // The search decides whether an asset belongs in the design, so it must be
     // free to test sizes for assets that are currently switched off. Inclusion
@@ -3830,7 +3858,10 @@ export default function MicrogridDesignTool() {
             annualHourLimit: numz(res.engine.annualHourLimit) || CONSTANTS.HOURS_PER_YEAR,
             fuelType: res.engine.fuelType || "diesel" },
         };
-        const { disp: d, adeq: ad } = evaluateDesign(dispatchInputs, overrides);
+        const inpC = { ...dispatchInputs, ...overrides };
+        const dC = useOptimiser ? dispatchOptimised(inpC) : dispatch(inpC);
+        const { adeq: ad } = evaluateDesign(inpC, { forcedBatteryResult: dC });
+        const d = dC;
         const resVariant = {
           ...res, pv: { ...res.pv, enabled: c.kWp > 0, kWp: c.kWp },
           wind: { ...res.wind, enabled: c.windKW > 0, ratedKW: c.windKW },
@@ -3850,8 +3881,15 @@ export default function MicrogridDesignTool() {
         };
       },
     });
+    out.failCounts = { energy: 0, power: 0, dynamic: 0 };
+    out.all.forEach((r) => {
+      if (r.energy === "FAIL") out.failCounts.energy++;
+      if (r.power === "FAIL") out.failCounts.power++;
+      if (r.dynamic === "FAIL") out.failCounts.dynamic++;
+    });
+    out.ranked = [...out.all].sort((x, y) => (x.feasible === y.feasible ? x.lcoe - y.lcoe : (x.feasible ? -1 : 1)));
     const ms = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
-    setSweepOut({ ...out, ms });
+    setSweepOut({ ...out, ms, method: useOptimiser ? "optimisation" : "merit order" });
     setSweeping(false);
   };
 
@@ -4135,6 +4173,9 @@ export default function MicrogridDesignTool() {
               <p className={`text-xs ${T.faint}`}>Microgrid pre-feasibility study: sizing &amp; LCOE</p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <Seg value={res.dispatchMode === "optimised" ? "optimised" : "merit"}
+                onChange={(v) => setRes((s2) => ({ ...s2, dispatchMode: v }))}
+                options={[{ value: "merit", label: "Merit order" }, { value: "optimised", label: "Optimisation" }]} />
               <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
                 {!runOut ? "Run model" : stale ? "Inputs changed — run model again" : "Run model again"}
               </button>
@@ -5193,9 +5234,6 @@ export default function MicrogridDesignTool() {
           <Panel title="Dispatch" step="8" sub="hourly operation of every asset"
             right={
               <div className="flex flex-wrap items-center gap-2">
-                <Seg value={res.dispatchMode === "optimised" ? "optimised" : "merit"}
-                  onChange={(v) => setRes((s2) => ({ ...s2, dispatchMode: v }))}
-                  options={[{ value: "merit", label: "Merit order" }, { value: "optimised", label: "Optimisation" }]} />
                 <DetailToggle value={detail.dispatch} onChange={(v) => setDetail((s2) => ({ ...s2, dispatch: v }))} />
                 <Seg value={view.span} onChange={(v) => setView((s) => ({ ...s, span: v }))}
                   options={[{ value: "day", label: "Day" }, { value: "week", label: "Week" }, { value: "month", label: "Month" }]} />
@@ -5871,10 +5909,11 @@ export default function MicrogridDesignTool() {
                 )}
               </div>
 
-              <div className={`mt-2 rounded border px-2 py-1 text-xs ${sweepCount > 400 ? T.notice.warn : T.tile} ${T.muted}`}>
+              <div className={`mt-2 rounded border px-2 py-1 text-xs ${sweepCount > (res.dispatchMode === "optimised" ? 80 : 400) ? T.notice.warn : T.tile} ${T.muted}`}>
                 <span className={`font-mono ${T.title}`}>{fmt(sweepCount, 0)}</span> combinations will be tested,
-                each a full 8760-hour dispatch — roughly {fmt(sweepCount * 0.06, 0)} seconds.
-                {sweepCount > 400 && " That is a long run. Reduce the number of steps, or exclude an asset, unless you intend to wait."}
+                each a full 8760-hour dispatch using {res.dispatchMode === "optimised" ? "the optimiser" : "the merit order"} —
+                roughly {fmt(sweepCount * (res.dispatchMode === "optimised" ? 0.3 : 0.06), 0)} seconds.
+                {sweepCount > (res.dispatchMode === "optimised" ? 80 : 400) && " That is a long run. Reduce the number of steps, or exclude an asset, unless you intend to wait."}
                 {sweepCount <= 1 && " With nothing included there is nothing to search — switch on at least one asset above."}
               </div>
 
@@ -5897,7 +5936,7 @@ export default function MicrogridDesignTool() {
                   {sweeping ? "Sweeping…" : sweepOut ? "Run the sweep again" : "Run the sweep"}
                 </button>
                 <span className={`text-xs ${T.faint}`}>
-                  {sweepOut ? `${sweepOut.tried} combinations tested, ${sweepOut.feasible.length} passed every check`
+                  {sweepOut ? `${sweepOut.tried} combinations tested with the ${sweepOut.method || "merit order"}, ${sweepOut.feasible.length} passed every check`
                     : "Every combination is run through the same dispatch and the same three checks."}
                 </span>
               </div>
@@ -5924,25 +5963,54 @@ export default function MicrogridDesignTool() {
                 </div>
 
                 {sweepOut.feasible.length === 0 && (
-                  <div className={`mt-3 rounded border px-2 py-2 text-xs ${T.notice.fail}`}>
-                    No combination in this range passed all three adequacy checks. Widen the range, relax the reserve SOC,
-                    add engine units, or check which verdict is failing on the Adequacy tab for the current design.
+                  <div className={`mt-3 rounded border px-2 py-2 text-xs ${T.notice.warn}`}>
+                    <div className="font-semibold">No candidate passed every check — and the reason is the same for all of them.</div>
+                    <div className="mt-1">
+                      Of {fmt(sweepOut.tried, 0)} designs tested, the energy check failed on {fmt(sweepOut.failCounts.energy, 0)},
+                      the power check on {fmt(sweepOut.failCounts.power, 0)} and the dynamic check on {fmt(sweepOut.failCounts.dynamic, 0)}.
+                      A check that fails on every single candidate is not a sizing problem: no amount of PV or storage in this
+                      range can fix it, so the requirement itself is what has to change.
+                    </div>
+                    <ul className="mt-1 space-y-0.5">
+                      {sweepOut.failCounts.power === sweepOut.tried && (
+                        <li>· <strong>Power</strong> fails everywhere. N-1 is being applied because islanding is required, so the
+                          grid connection is removed as the largest unit and the site must cover its whole peak without it.
+                          Either include generators in the search, or set islanding to “none” if the site is not in fact
+                          required to run detached from the grid.</li>
+                      )}
+                      {sweepOut.failCounts.energy === sweepOut.tried && (
+                        <li>· <strong>Energy</strong> fails everywhere. The autonomy requirement needs more stored energy than any
+                          battery in this range holds. Raise the top of the battery range, shorten the required autonomy, or
+                          reduce the share of load classified as critical.</li>
+                      )}
+                      {sweepOut.failCounts.dynamic === sweepOut.tried && (
+                        <li>· <strong>Dynamic</strong> fails everywhere. The largest load step exceeds the fast response available.
+                          Confirm the battery is set to grid-forming, or reduce the load step on the Load tab.</li>
+                      )}
+                    </ul>
+                    <div className="mt-1">
+                      The ranking below still shows every design with its cheapest first, so a candidate can be applied and the
+                      failing check inspected in detail on the Reliability tab.
+                    </div>
                   </div>
                 )}
 
                 <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
                   <div>
-                    <div className={`mb-1 text-xs ${T.faint}`}>Top candidates by LCOE — click a row to load it into the parameters</div>
+                    <div className={`mb-1 text-xs ${T.faint}`}>
+                      Candidates ranked by LCOE. Designs that pass every check are listed first; the rest are still shown, with
+                      the check that fails, and any of them can be applied so the failure can be examined on the Reliability tab.
+                    </div>
                     <div className={`max-h-72 overflow-auto rounded border ${T.tile}`}>
                       <table className="w-full text-right font-mono text-xs">
                         <thead className={`sticky top-0 ${T.panel}`}>
                           <tr className={`border-b ${T.rule}`}>
-                            {["#", "PV MWp", "Wind MW", "BESS MW", "MWh", "Gen", "LCOE €/MWh", "Renew %", "Use this one"].map((h) => (
+                            {["#", "PV MWp", "Wind MW", "BESS MW", "MWh", "Gen", "LCOE €/MWh", "Renew %", "Checks", "Apply"].map((h) => (
                               <th key={h} className={`px-1.5 py-1 ${T.faint}`}>{h}</th>))}
                           </tr>
                         </thead>
                         <tbody>
-                          {sweepOut.feasible.slice(0, 10).map((r, i) => (
+                          {(sweepOut.ranked || sweepOut.feasible).slice(0, 15).map((r, i) => (
                             <tr key={i} className={`border-b ${T.divide}`}>
                               <td className={`px-1.5 py-0.5 ${T.ghost}`}>{i + 1}</td>
                               <td className="px-1.5 py-0.5">{fmt(r.kWp / 1000, 1)}</td>
@@ -5952,6 +6020,10 @@ export default function MicrogridDesignTool() {
                               <td className="px-1.5 py-0.5">{r.units}</td>
                               <td className={`px-1.5 py-0.5 ${i === 0 ? T.tone.cyan : ""}`}>{fmt(r.lcoe, 1)}</td>
                               <td className={`px-1.5 py-0.5 ${T.tone.emerald}`}>{fmt(r.renewablePct, 1)}</td>
+                              <td className={`px-1.5 py-0.5 ${r.feasible ? T.tone.emerald : T.tone.rose}`}>
+                                {r.feasible ? "pass" : [r.energy === "FAIL" && "energy", r.power === "FAIL" && "power",
+                                  r.dynamic === "FAIL" && "dynamic"].filter(Boolean).join(" + ")}
+                              </td>
                               <td className="px-1.5 py-0.5">
                                 <button onClick={() => applyCandidate(r)} className={`rounded border px-2 py-0.5 font-medium ${i === 0 ? T.chipAlert : T.chip}`}>apply →</button>
                               </td>
