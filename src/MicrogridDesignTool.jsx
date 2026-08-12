@@ -3776,19 +3776,41 @@ export default function MicrogridDesignTool() {
   };
   const parseList = (t2) => String(t2).split(",").map((v) => parseFloat(v.trim())).filter((v) => !isNaN(v));
 
+  const sweepUnitKW = numz(sweep.engineUnitKW) || numz(res.engine.unitKW) || 1600;
+
+  const sweepBounds = () => {
+    const pvCap = maxPVfromLandKWp > 0 ? maxPVfromLandKWp / 1000 : Infinity;
+    const bessCap = mode === "aidc" && aidcOut && aidcOut.maxBessMW > 0 ? aidcOut.maxBessMW : Infinity;
+    const engCap = mode === "aidc" && aidcOut && aidcOut.maxEngineMW > 0 ? aidcOut.maxEngineMW : Infinity;
+    return {
+      pvKWp: sweep.includePV
+        ? linSpace(numz(sweep.pvMin), Math.min(numz(sweep.pvMax), pvCap), Math.max(1, numz(sweep.pvSteps))).map((v) => Math.round(v * 1000))
+        : [0],
+      windKW: sweep.includeWind
+        ? linSpace(numz(sweep.windMin), numz(sweep.windMax), Math.max(1, numz(sweep.windSteps))).map((v) => Math.round(v * 1000))
+        : [0],
+      bessMW: sweep.includeBess
+        ? linSpace(numz(sweep.bessMin), Math.min(numz(sweep.bessMax), bessCap), Math.max(1, numz(sweep.bessSteps)))
+        : [0],
+      bessHours: sweep.includeBess ? (parseList(sweep.durations).length ? parseList(sweep.durations) : [2]) : [0],
+      engineUnits: sweep.includeEngine
+        ? (parseList(sweep.engineUnits).length ? parseList(sweep.engineUnits) : [0]).filter((u) => u * sweepUnitKW / 1000 <= engCap)
+        : [0],
+    };
+  };
+
+  const sweepCount = useMemo(() => {
+    const b2 = sweepBounds();
+    return b2.pvKWp.length * b2.windKW.length * b2.bessMW.length * b2.bessHours.length * Math.max(1, b2.engineUnits.length);
+  }, [sweep, maxPVfromLandKWp, mode, aidcOut, res.engine.unitKW]);
+
   const runAutoSize = () => {
     setSweeping(true);
     const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
-    const pvCap = maxPVfromLandKWp > 0 ? maxPVfromLandKWp / 1000 : Infinity;
-    const bessCap = mode === "aidc" && aidcOut ? aidcOut.maxBessMW : Infinity;
-    const engCap = mode === "aidc" && aidcOut ? aidcOut.maxEngineMW : Infinity;
-    const bounds = {
-      pvKWp: res.pv.enabled ? linSpace(sweep.pvMin, Math.min(sweep.pvMax, pvCap), sweep.pvSteps).map((v) => Math.round(v * 1000)) : [0],
-      windKW: res.wind.enabled ? linSpace(sweep.windMin, sweep.windMax, sweep.windSteps).map((v) => Math.round(v * 1000)) : [0],
-      bessMW: res.bess.enabled ? linSpace(sweep.bessMin, Math.min(sweep.bessMax, bessCap), sweep.bessSteps) : [0],
-      bessHours: res.bess.enabled ? parseList(sweep.durations) : [0],
-      engineUnits: res.engine.enabled ? parseList(sweep.engineUnits).filter((u) => u * numz(res.engine.unitKW) / 1000 <= engCap) : [0],
-    };
+    // The search decides whether an asset belongs in the design, so it must be
+    // free to test sizes for assets that are currently switched off. Inclusion
+    // is controlled here, not by the Equipment toggles.
+    const bounds = sweepBounds();
     // Generation profile depends only on kWp, so build it once per PV size
     // rather than once per combination.
     const pvCache = new Map();
@@ -3803,14 +3825,18 @@ export default function MicrogridDesignTool() {
         const overrides = {
           pvGen, windGen: windGenC,
           bess: { ...dispatchInputs.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
-          engine: { ...dispatchInputs.engine, enabled: c.units > 0, units: c.units },
+          engine: { ...dispatchInputs.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
+            minStableLoadPct: numz(res.engine.minStableLoadPct) || CONSTANTS.ENGINE_MIN_STABLE_LOAD_PCT,
+            annualHourLimit: numz(res.engine.annualHourLimit) || CONSTANTS.HOURS_PER_YEAR,
+            fuelType: res.engine.fuelType || "diesel" },
         };
         const { disp: d, adeq: ad } = evaluateDesign(dispatchInputs, overrides);
         const resVariant = {
           ...res, pv: { ...res.pv, enabled: c.kWp > 0, kWp: c.kWp },
           wind: { ...res.wind, enabled: c.windKW > 0, ratedKW: c.windKW },
           bess: { ...res.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
-          engine: { ...res.engine, enabled: c.units > 0, units: c.units },
+          engine: { ...res.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
+            fuelType: res.engine.fuelType || "diesel" },
         };
         const cst = computeCosts({ res: resVariant, ctx, loc, disp: d, price, costs, itEnergyMWh,
           gridEnabled: gridForBom.enabled, firmCapKW: gridForBom.firmCapKW });
@@ -3835,7 +3861,8 @@ export default function MicrogridDesignTool() {
       pv: { ...s2.pv, enabled: c.kWp > 0, kWp: c.kWp },
       wind: { ...s2.wind, enabled: (c.windKW || 0) > 0, ratedKW: c.windKW || 0 },
       bess: { ...s2.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
-      engine: { ...s2.engine, enabled: c.units > 0, units: c.units },
+      engine: { ...s2.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
+        fuelType: s2.engine.fuelType || "diesel" },
     }));
     setTab(4);
   };
@@ -5772,44 +5799,83 @@ export default function MicrogridDesignTool() {
                 <span className={`rounded-full px-2 font-mono text-xs ${T.chip}`}>1</span>
                 <span className={`text-sm font-semibold ${T.head}`}>Define the search ranges</span>
               </div>
-              <div className={`mb-2 text-xs ${T.faint}`}>
-                Only the equipment switched on in the Equipment tab is swept. Everything else is held at zero.
-                {res.pv.enabled && maxPVfromLandKWp > 0 && ` PV is capped at ${fmt(maxPVfromLandKWp / 1000, 2)} MWp by the land available.`}
+              <div className={`mb-2 rounded border px-2 py-2 text-xs ${T.soft.cyan} ${T.muted}`}>
+                The search decides whether an asset belongs in the design, so it tests sizes for anything included here —
+                including assets currently switched off on the Equipment tab. Every range starts at zero, so “none of this
+                asset” is always among the candidates.
               </div>
               <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                {!res.pv.enabled && !res.wind.enabled && !res.bess.enabled && !res.engine.enabled && (
-                  <div className={`md:col-span-4 rounded border px-2 py-2 text-xs ${T.notice.warn}`}>
-                    No equipment is switched on, so there is nothing to sweep. Turn on PV, wind, battery or generators first.
-                  </div>
+                <Field tier="critical" label="Solar PV" source="site" unit="include in search">
+                  <Sel value={sweep.includePV ? "yes" : "no"} prompt={null}
+                    onChange={(v) => setSweep((s2) => ({ ...s2, includePV: v === "yes" }))}
+                    options={[{ value: "yes", label: "Yes — search PV sizes" }, { value: "no", label: "No — exclude PV" }]} />
+                </Field>
+                {sweep.includePV && (
+                  <Field tier="critical" label="PV capacity range" source="site" unit="MWp — min, max, steps"
+                    explain="The search tests this many evenly spaced sizes between the smallest and the largest."
+                    flag={maxPVfromLandKWp > 0 ? `capped at ${fmt(maxPVfromLandKWp / 1000, 2)} MWp by the land available` : null}>
+                    <div className="flex gap-1">
+                      <Num value={sweep.pvMin} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, pvMin: v }))} />
+                      <Num value={sweep.pvMax} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, pvMax: v }))} />
+                      <Num value={sweep.pvSteps} onChange={(v) => setSweep((s2) => ({ ...s2, pvSteps: v }))} />
+                    </div>
+                  </Field>
                 )}
-                {res.pv.enabled && <Field tier="critical" label="PV capacity range" unit="MWp — min, max, steps"
-                  explain="The tool tests this many evenly spaced sizes between the smallest and the largest.">
-                  <div className="flex gap-1">
-                    <Num value={sweep.pvMin} step={0.5} onChange={(v) => setSweep((s) => ({ ...s, pvMin: v }))} />
-                    <Num value={sweep.pvMax} step={0.5} onChange={(v) => setSweep((s) => ({ ...s, pvMax: v }))} />
-                    <Num value={sweep.pvSteps} onChange={(v) => setSweep((s) => ({ ...s, pvSteps: v }))} />
-                  </div>
-                </Field>}
-                {res.wind.enabled && <Field tier="critical" label="Wind capacity range" unit="MW — min, max, steps">
-                  <div className="flex gap-1">
-                    <Num value={sweep.windMin} step={0.5} onChange={(v) => setSweep((s) => ({ ...s, windMin: v }))} />
-                    <Num value={sweep.windMax} step={0.5} onChange={(v) => setSweep((s) => ({ ...s, windMax: v }))} />
-                    <Num value={sweep.windSteps} onChange={(v) => setSweep((s) => ({ ...s, windSteps: v }))} />
-                  </div>
-                </Field>}
-                {res.bess.enabled && <Field tier="critical" label="Battery power range" unit="MW — min, max, steps">
-                  <div className="flex gap-1">
-                    <Num value={sweep.bessMin} step={0.5} onChange={(v) => setSweep((s) => ({ ...s, bessMin: v }))} />
-                    <Num value={sweep.bessMax} step={0.5} onChange={(v) => setSweep((s) => ({ ...s, bessMax: v }))} />
-                    <Num value={sweep.bessSteps} onChange={(v) => setSweep((s) => ({ ...s, bessSteps: v }))} />
-                  </div>
-                </Field>}
-                {res.bess.enabled && <Field tier="critical" label="Battery duration options" unit="hours, comma separated">
-                  <Txt value={sweep.durations} onChange={(v) => setSweep((s) => ({ ...s, durations: v }))} />
-                </Field>}
-                {res.engine.enabled && <Field tier="critical" label={`${res.engine.fuelType === "gas" ? "Gas" : "Diesel"} generator count options`} unit={`counts to try, units of ${fmt(numz(res.engine.unitKW) / 1000, 2)} MW`}>
-                  <Txt value={sweep.engineUnits} onChange={(v) => setSweep((s) => ({ ...s, engineUnits: v }))} />
-                </Field>}
+                <Field tier="critical" label="Battery storage" source="site" unit="include in search">
+                  <Sel value={sweep.includeBess ? "yes" : "no"} prompt={null}
+                    onChange={(v) => setSweep((s2) => ({ ...s2, includeBess: v === "yes" }))}
+                    options={[{ value: "yes", label: "Yes — search battery sizes" }, { value: "no", label: "No — exclude storage" }]} />
+                </Field>
+                {sweep.includeBess && (
+                  <Field tier="critical" label="Battery power range" source="site" unit="MW — min, max, steps">
+                    <div className="flex gap-1">
+                      <Num value={sweep.bessMin} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, bessMin: v }))} />
+                      <Num value={sweep.bessMax} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, bessMax: v }))} />
+                      <Num value={sweep.bessSteps} onChange={(v) => setSweep((s2) => ({ ...s2, bessSteps: v }))} />
+                    </div>
+                  </Field>
+                )}
+                {sweep.includeBess && (
+                  <Field tier="critical" label="Battery duration options" source="site" unit="hours, comma separated">
+                    <Txt value={sweep.durations} onChange={(v) => setSweep((s2) => ({ ...s2, durations: v }))} />
+                  </Field>
+                )}
+                <Field tier="critical" label="Wind" source="site" unit="include in search">
+                  <Sel value={sweep.includeWind ? "yes" : "no"} prompt={null}
+                    onChange={(v) => setSweep((s2) => ({ ...s2, includeWind: v === "yes" }))}
+                    options={[{ value: "no", label: "No — exclude wind" }, { value: "yes", label: "Yes — search wind sizes" }]} />
+                </Field>
+                {sweep.includeWind && (
+                  <Field tier="critical" label="Wind capacity range" source="site" unit="MW — min, max, steps">
+                    <div className="flex gap-1">
+                      <Num value={sweep.windMin} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, windMin: v }))} />
+                      <Num value={sweep.windMax} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, windMax: v }))} />
+                      <Num value={sweep.windSteps} onChange={(v) => setSweep((s2) => ({ ...s2, windSteps: v }))} />
+                    </div>
+                  </Field>
+                )}
+                <Field tier="critical" label="Generators" source="site" unit="include in search">
+                  <Sel value={sweep.includeEngine ? "yes" : "no"} prompt={null}
+                    onChange={(v) => setSweep((s2) => ({ ...s2, includeEngine: v === "yes" }))}
+                    options={[{ value: "no", label: "No — exclude generators" }, { value: "yes", label: "Yes — search unit counts" }]} />
+                </Field>
+                {sweep.includeEngine && (
+                  <Field tier="critical" label="Generator unit size" source="site" unit="kW each">
+                    <Num value={sweep.engineUnitKW} step={100} onChange={(v) => setSweep((s2) => ({ ...s2, engineUnitKW: v }))} />
+                  </Field>
+                )}
+                {sweep.includeEngine && (
+                  <Field tier="critical" label="Unit counts to test" source="site" unit="comma separated">
+                    <Txt value={sweep.engineUnits} onChange={(v) => setSweep((s2) => ({ ...s2, engineUnits: v }))} />
+                  </Field>
+                )}
+              </div>
+
+              <div className={`mt-2 rounded border px-2 py-1 text-xs ${sweepCount > 400 ? T.notice.warn : T.tile} ${T.muted}`}>
+                <span className={`font-mono ${T.title}`}>{fmt(sweepCount, 0)}</span> combinations will be tested,
+                each a full 8760-hour dispatch — roughly {fmt(sweepCount * 0.06, 0)} seconds.
+                {sweepCount > 400 && " That is a long run. Reduce the number of steps, or exclude an asset, unless you intend to wait."}
+                {sweepCount <= 1 && " With nothing included there is nothing to search — switch on at least one asset above."}
               </div>
 
               {mode === "aidc" && aidcOut && (
