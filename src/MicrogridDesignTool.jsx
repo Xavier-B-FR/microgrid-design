@@ -3464,10 +3464,16 @@ export default function MicrogridDesignTool() {
   }), [load, pvOut, windGen, price, temp, cal, char.shed1Pct, char.shed2Pct, ctx, mode, aidc.gridStrategy,
        curtailFlags, res, reserveApplies, effectiveImportCapKW]);
 
+  // Anything that can change a result belongs here, or the screen can show
+  // numbers that no longer match the inputs without saying so.
   const runSig = useMemo(() => JSON.stringify({
-    l: stats.annualMWh.toFixed(2), p: stats.peakKW.toFixed(1), res, ctx, mode,
-    cap: effectiveImportCapKW, y: loc.specificYield_kWh_per_kWp, sy: simYear, sh: [char.shed1Pct, char.shed2Pct],
-  }), [stats, res, ctx, mode, effectiveImportCapKW, loc.specificYield_kWh_per_kWp, simYear, char.shed1Pct, char.shed2Pct]);
+    l: stats.annualMWh.toFixed(2), p: stats.peakKW.toFixed(1),
+    res, ctx, mode, char, aidc, loc, loadCfg,
+    cap: effectiveImportCapKW, sy: simYear,
+    price: [costs.EXPORT_PRICE_EUR_PER_MWH],
+    up: !!uploadedPrice, ul: !!(csvResult && csvResult.load), ur: !!uploadedResource,
+  }), [stats, res, ctx, mode, char, aidc, loc, loadCfg, effectiveImportCapKW, simYear,
+       costs.EXPORT_PRICE_EUR_PER_MWH, uploadedPrice, csvResult, uploadedResource]);
 
   const [runOut, setRunOut] = useState(null);
 
@@ -4038,7 +4044,7 @@ export default function MicrogridDesignTool() {
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
-                {!runOut ? "Run the year" : stale ? "Inputs changed — run again" : "Run again"}
+                {!runOut ? "Run model" : stale ? "Inputs changed — run model again" : "Run model again"}
               </button>
               <span className={`rounded px-2 py-1 text-xs ${justRan ? `${T.chipOk} font-medium` : stale ? T.tone.amber : T.faint}`}>
                 {justRan ? `✓ Run complete — 8760 h in ${fmt(dispatchMs, 0)} ms${runOut && runOut.optimised ? ", optimised" : ""}, all checks passed`
@@ -4094,9 +4100,10 @@ export default function MicrogridDesignTool() {
                 </div>
               </div>
               <div className={`mt-2 text-xs ${T.faint}`}>
-                Complete the tabs from left to right, then select <strong>Run the year</strong> at the top of the page.
-                Results appear on the Dispatch, Reliability, LCOE and Report tabs. When any input changes, the results
-                become out of date and the button turns amber.
+                Complete the tabs from left to right, then select <strong>Run model</strong> at the top of the page. This runs the
+                dispatch across all 8760 hours of the year.
+                Results appear on the Dispatch, Reliability, LCOE and Report tabs. When any input changes the results become
+                out of date, and the button turns amber until the model is run again.
               </div>
             </Panel>
           )}
@@ -4934,7 +4941,7 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= MICROGRID — WHAT IT IS FOR, AND THE LOGIC THAT FOLLOWS ========= */}
-          {tab === 7 && (
+          {tab === 6 && (
             <Panel title="Microgrid" step="7" sub="what the microgrid is for, and the operating logic that follows"
               right={
                 <button onClick={() => { applyUseCaseLogic(); setLogicApplied(true); }}
@@ -5089,11 +5096,14 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= DISPATCH ================= */}
-          {tab === 8 && !runOut && <NeedsRun />}
-          {tab === 8 && runOut && (
+          {tab === 7 && !runOut && <NeedsRun />}
+          {tab === 7 && runOut && (
           <Panel title="Dispatch" step="8" sub="what each piece of equipment does in every hour of the year"
             right={
               <div className="flex flex-wrap items-center gap-2">
+                <Seg value={res.dispatchMode === "optimised" ? "optimised" : "merit"}
+                  onChange={(v) => setRes((s2) => ({ ...s2, dispatchMode: v }))}
+                  options={[{ value: "merit", label: "Merit order" }, { value: "optimised", label: "Optimisation" }]} />
                 <DetailToggle value={detail.dispatch} onChange={(v) => setDetail((s2) => ({ ...s2, dispatch: v }))} />
                 <Seg value={view.span} onChange={(v) => setView((s) => ({ ...s, span: v }))}
                   options={[{ value: "day", label: "Day" }, { value: "week", label: "Week" }, { value: "month", label: "Month" }]} />
@@ -5102,6 +5112,14 @@ export default function MicrogridDesignTool() {
                 <span className={`font-mono text-xs ${T.faint}`}>from {dayLabel(view.startDay)}</span>
               </div>
             }>
+            <div className={`mb-2 rounded border px-2 py-1 text-xs ${runOut && runOut.optimised ? T.soft.emerald : T.tile} ${T.muted}`}>
+              {runOut && runOut.optimised
+                ? `Optimised dispatch. The battery schedule was found by dynamic programming over the whole year — for the given number of charge steps it is the cheapest schedule that exists, not a rule. Generators are still committed by the ordinary rules afterwards. Import ceiling chosen by the search: ${fmt((runOut.disp.optimiserCeilingKW || 0) / 1000, 2)} MW.`
+                : "Merit order. Each hour is served in the fixed sequence set on the Microgrid tab, with no view of the hours ahead beyond the look-ahead rules."}
+              {res.dispatchMode === "optimised" && runOut && !runOut.optimised
+                && " Optimisation is selected but there is no battery to optimise, so the merit order was used."}
+            </div>
+
             {detail.dispatch === "detail" && (
             <div className={`mb-2 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
               Order every hour: renewables → grid import to the cap → battery above the reserve → engines at or above minimum
@@ -5328,8 +5346,8 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= PHASE 3 — ADEQUACY ================= */}
-          {tab === 9 && !runOut && <NeedsRun />}
-          {tab === 9 && runOut && (<>
+          {tab === 8 && !runOut && <NeedsRun />}
+          {tab === 8 && runOut && (<>
             <Panel title="Reliability" step="9" sub="can the design actually keep the lights on"
               right={<DetailToggle value={detail.reliability} onChange={(v) => setDetail((s2) => ({ ...s2, reliability: v }))} />}>
               <div className={`mb-3 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
@@ -5445,8 +5463,8 @@ export default function MicrogridDesignTool() {
 
           {/* ================= PHASE 3 — BOM ================= */}
           {/* ================= PHASE 4 — COSTS AND LCOE ================= */}
-          {tab === 10 && !runOut && <NeedsRun />}
-          {tab === 10 && runOut && cost && (
+          {tab === 9 && !runOut && <NeedsRun />}
+          {tab === 9 && runOut && cost && (
             <Panel title="LCOE" step="10" sub="every assumption that produced the number is on this screen"
               right={<span className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chipWarn}`}>estimate class: AACE Class 5 (−30 % / +50 %)</span>}>
 
@@ -5590,7 +5608,7 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= AUTO-SIZE ================= */}
-          {tab === 11 && (
+          {tab === 10 && (
             <Panel title="Auto-size" step="11" sub="search for a cheaper design that still passes every check">
               <div className={`mb-3 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
                 Every combination below is run through the same hourly dispatch and the same three adequacy checks.
@@ -5792,7 +5810,7 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= REPORT ================= */}
-          {tab === 12 && (
+          {tab === 11 && (
             <Panel title="Report" step="12" sub="the need, the solution, and what it delivers"
               right={
                 <div className="flex items-center gap-2">
@@ -6051,7 +6069,7 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= SCENARIOS ================= */}
-          {tab === 13 && (
+          {tab === 12 && (
             <Panel title="Compare" step="13" sub="up to six saved in this session"
               right={
                 <div className="flex items-center gap-2">
@@ -6114,7 +6132,7 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= CHECKS AND NOTES ================= */}
-          {tab === 14 && (
+          {tab === 13 && (
             <Panel title="Checks" step="14" sub="warnings, never blockers"
               right={
                 <div className="flex items-center gap-2">
