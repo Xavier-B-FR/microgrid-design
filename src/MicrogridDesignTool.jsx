@@ -2748,6 +2748,7 @@ export const THEMES = {
     head: "text-cyan-300",
     headBg: "bg-slate-900",
     soft: { cyan: "bg-cyan-950", amber: "bg-amber-950", emerald: "bg-emerald-950", violet: "bg-violet-950", rose: "bg-rose-950", slate: "bg-slate-900" },
+    lcoeSeg: { capex: ["#22d3ee", "#38bdf8", "#a78bfa", "#818cf8", "#c084fc", "#2dd4bf", "#60a5fa"], opex: ["#fb923c", "#f59e0b", "#f472b6", "#fbbf24", "#fda4af", "#facc15"], credit: "#34d399" },
     chart: { grid: "#1e293b", axis: "#475569", tipBg: "#020617", tipBorder: "#1e293b", load: "#22d3ee", loadFill: "#0e7490", temp: "#f59e0b", pv: "#a78bfa", bar1: "#0e7490", bar2: "#f59e0b", ref: "#64748b", refWarn: "#f43f5e", wind: "#38bdf8", imp: "#06b6d4", bessC: "#a78bfa", engineC: "#fb923c", turbineC: "#f472b6", socC: "#94a3b8", unservedC: "#f43f5e" },
   },
   light: {
@@ -2785,6 +2786,7 @@ export const THEMES = {
     head: "text-cyan-800",
     headBg: "bg-cyan-50",
     soft: { cyan: "bg-cyan-50", amber: "bg-amber-50", emerald: "bg-emerald-50", violet: "bg-violet-50", rose: "bg-rose-50", slate: "bg-slate-50" },
+    lcoeSeg: { capex: ["#0891b2", "#0284c7", "#7c3aed", "#4f46e5", "#9333ea", "#0d9488", "#2563eb"], opex: ["#ea580c", "#d97706", "#db2777", "#ca8a04", "#e11d48", "#a16207"], credit: "#059669" },
     chart: { grid: "#e2e8f0", axis: "#64748b", tipBg: "#ffffff", tipBorder: "#cbd5e1", load: "#0891b2", loadFill: "#a5f3fc", temp: "#d97706", pv: "#7c3aed", bar1: "#0891b2", bar2: "#f59e0b", ref: "#94a3b8", refWarn: "#e11d48", wind: "#0284c7", imp: "#0e7490", bessC: "#7c3aed", engineC: "#ea580c", turbineC: "#db2777", socC: "#64748b", unservedC: "#e11d48" },
   },
 };
@@ -3912,6 +3914,27 @@ export default function MicrogridDesignTool() {
     }
     return rows;
   }, [cost, baseline, scenarios, sweepOut]);
+
+  /* The LCOE as one bar, split by what each component contributes.
+     The segments sum to the number shown above them, to the cent. */
+  const lcoeStack = useMemo(() => {
+    if (!cost || cost.lcoeFacility <= 0) return null;
+    // Scale to the displayed boundary so the bar always totals the number on screen
+    const k = lcoeBoundary === "it" && cost.lcoeFacility > 0 ? cost.lcoeIT / cost.lcoeFacility : 1;
+    const segs = [];
+    cost.breakdown.forEach((b, i) => segs.push({
+      key: `capex_${i}`, label: `${b.name} (build)`, value: +(b.lcoe * k).toFixed(2),
+      colour: T.lcoeSeg.capex[i % T.lcoeSeg.capex.length], kind: "CAPEX",
+    }));
+    cost.opexBreakdown.forEach((b, i) => segs.push({
+      key: `opex_${i}`, label: `${b.name} (run)`, value: +(b.lcoe * k).toFixed(2),
+      colour: b.lcoe < 0 ? T.lcoeSeg.credit : T.lcoeSeg.opex[i % T.lcoeSeg.opex.length], kind: b.lcoe < 0 ? "CREDIT" : "OPEX",
+    }));
+    const row = { name: "LCOE" };
+    segs.forEach((sg) => { row[sg.key] = sg.value; });
+    const total = segs.reduce((a, sg) => a + sg.value, 0);
+    return { segs, rows: [row], total };
+  }, [cost, lcoeBoundary, T]);
 
   const doExport = () => {
     if (!runOut || !cost) return;
@@ -5489,6 +5512,65 @@ export default function MicrogridDesignTool() {
                   These are different numbers; comparing one against the other makes a scenario comparison meaningless.
                 </div>
               </div>
+
+              {/* The same number, opened up */}
+              {lcoeStack && (
+                <div className={`mt-3 rounded border p-3 ${T.tile}`}>
+                  <div className={`mb-1 text-xs uppercase tracking-wide ${T.faint}`}>What makes up that number</div>
+                  <div className="h-28">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={lcoeStack.rows} layout="vertical" margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
+                        <XAxis type="number" tick={axis} unit=" €" domain={[0, "dataMax"]} />
+                        <YAxis type="category" dataKey="name" hide />
+                        <Tooltip contentStyle={tip} formatter={(v, n) => {
+                          const sg = lcoeStack.segs.find((x) => x.key === n);
+                          return [`${fmt(v, 2)} €/MWh`, sg ? sg.label : n];
+                        }} />
+                        {lcoeStack.segs.map((sg) => (
+                          <Bar key={sg.key} dataKey={sg.key} stackId="lcoe" fill={sg.colour} name={sg.key} />
+                        ))}
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* Legend, ordered as the bar reads, with each share */}
+                  <div className="mt-1 grid grid-cols-2 gap-x-4 gap-y-1 md:grid-cols-3">
+                    {lcoeStack.segs.map((sg) => (
+                      <div key={sg.key} className="flex items-center gap-2">
+                        <span className="inline-block h-3 w-3 shrink-0 rounded-sm" style={{ backgroundColor: sg.colour }} />
+                        <span className={`truncate text-xs ${T.muted}`}>{sg.label}</span>
+                        <span className={`ml-auto shrink-0 font-mono text-xs ${sg.value < 0 ? T.tone.emerald : T.title}`}>
+                          {fmt(sg.value, 1)}
+                        </span>
+                        <span className={`w-10 shrink-0 text-right font-mono text-xs ${T.ghost}`}>
+                          {fmt(100 * sg.value / (lcoeStack.total || 1), 0)}%
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className={`mt-2 flex flex-wrap items-center gap-4 border-t pt-2 ${T.rule}`}>
+                    <span className={`text-xs ${T.faint}`}>
+                      Building it: <span className={`font-mono ${T.title}`}>
+                        {fmt(lcoeStack.segs.filter((x) => x.kind === "CAPEX").reduce((a, x) => a + x.value, 0), 1)} €/MWh
+                      </span>
+                    </span>
+                    <span className={`text-xs ${T.faint}`}>
+                      Running it: <span className={`font-mono ${T.title}`}>
+                        {fmt(lcoeStack.segs.filter((x) => x.kind === "OPEX").reduce((a, x) => a + x.value, 0), 1)} €/MWh
+                      </span>
+                    </span>
+                    <span className={`ml-auto font-mono text-xs ${T.tone.cyan}`}>
+                      total {fmt(lcoeStack.total, 1)} €/MWh
+                    </span>
+                  </div>
+                  <div className={`mt-1 text-xs ${T.faint}`}>
+                    Every segment is a share of the same €/MWh, so they add up to the figure above. Cool colours are money spent
+                    once to build; warm colours are money spent every year to run. A green segment is a credit — revenue that
+                    reduces the cost.
+                  </div>
+                </div>
+              )}
 
               {/* The money assumptions live here, with the number they produce */}
               <div className={`mt-3 mb-1 text-xs uppercase tracking-wide ${T.faint}`}>Financing assumptions</div>
