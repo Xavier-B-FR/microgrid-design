@@ -3572,20 +3572,25 @@ export default function MicrogridDesignTool() {
     return out;
   };
 
+  /* The single path from a set of inputs to an hourly result. The headline run
+     and every auto-size candidate go through this, so a design applied from the
+     sweep reproduces exactly the number the sweep reported. */
+  const dispatchFor = (inputs) => {
+    const optimised = res.dispatchMode === "optimised" && inputs.bess.enabled && inputs.bess.energyKWh > 0;
+    const d = optimised
+      ? optimiseWithDemandCharge(inputs, loc.capacityCharge_EUR_per_kW_yr)
+      : dispatch(inputs);
+    return { disp: d, optimised };
+  };
+
+  const withWear = (inputs) => ({ ...inputs,
+    bess: { ...inputs.bess, wearCostEURperMWh: numz(res.optWearCost) } });
+
   const runDispatch = () => {
     const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
-    const optimised = res.dispatchMode === "optimised" && resN.bess.enabled && resN.bess.energyKWh > 0;
-    const inputs = { ...dispatchInputs,
-      bess: { ...dispatchInputs.bess, wearCostEURperMWh: numz(res.optWearCost) } };
-    let d, ad;
-    if (optimised) {
-      const r = optimiseWithDemandCharge(inputs, loc.capacityCharge_EUR_per_kW_yr);
-      d = r;
-      ad = evaluateDesign(inputs, { forcedBatteryResult: r }).adeq;
-    } else {
-      const out2 = evaluateDesign(inputs);
-      d = out2.disp; ad = out2.adeq;
-    }
+    const inputs = withWear(dispatchInputs);
+    const { disp: d, optimised } = dispatchFor(inputs);
+    const ad = evaluateDesign(inputs, { forcedBatteryResult: d }).adeq;
     const b = buildBOM({
       res: resN, ctx: ctxN, grid: gridForBom, disp: d,
       aidcLimits: mode === "aidc" ? { pvAreaPerKWp: aidc.pvAreaPerKWp, bessFootprint: aidc.bessFootprint, engineFootprint: aidc.engineFootprint } : null,
@@ -3858,18 +3863,19 @@ export default function MicrogridDesignTool() {
             annualHourLimit: numz(res.engine.annualHourLimit) || CONSTANTS.HOURS_PER_YEAR,
             fuelType: res.engine.fuelType || "diesel" },
         };
-        const inpC = { ...dispatchInputs, ...overrides };
-        const dC = useOptimiser ? dispatchOptimised(inpC) : dispatch(inpC);
-        const { adeq: ad } = evaluateDesign(inpC, { forcedBatteryResult: dC });
-        const d = dC;
+        const inpC = withWear({ ...dispatchInputs, ...overrides });
+        const { disp: d } = dispatchFor(inpC);
+        const { adeq: ad } = evaluateDesign(inpC, { forcedBatteryResult: d });
+        // Costed from the sanitised copy, exactly as the headline run is, so a
+        // blank field cannot price differently in the two places.
         const resVariant = {
-          ...res, pv: { ...res.pv, enabled: c.kWp > 0, kWp: c.kWp },
-          wind: { ...res.wind, enabled: c.windKW > 0, ratedKW: c.windKW },
-          bess: { ...res.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
-          engine: { ...res.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
-            fuelType: res.engine.fuelType || "diesel" },
+          ...resN, pv: { ...resN.pv, enabled: c.kWp > 0, kWp: c.kWp },
+          wind: { ...resN.wind, enabled: c.windKW > 0, ratedKW: c.windKW },
+          bess: { ...resN.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
+          engine: { ...resN.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
+            fuelType: resN.engine.fuelType || "diesel" },
         };
-        const cst = computeCosts({ res: resVariant, ctx, loc, disp: d, price, costs, itEnergyMWh,
+        const cst = computeCosts({ res: resVariant, ctx: ctxN, loc, disp: d, price, costs, itEnergyMWh,
           gridEnabled: gridForBom.enabled, firmCapKW: gridForBom.firmCapKW });
         const feasible = ad.energy.verdict !== "FAIL" && ad.power.verdict !== "FAIL" && ad.dynamic.verdict !== "FAIL";
         return {
@@ -3878,6 +3884,7 @@ export default function MicrogridDesignTool() {
           unservedMWh: +d.summary.unservedMWh.toFixed(2),
           fuelDisplay: res.engine.fuelType === "diesel" ? d.summary.fuelLitres / 1000 : d.summary.fuelMWhTh,
           energy: ad.energy.verdict, power: ad.power.verdict, dynamic: ad.dynamic.verdict, feasible,
+          method: useOptimiser ? "optimised" : "merit",
         };
       },
     });
@@ -3894,6 +3901,9 @@ export default function MicrogridDesignTool() {
   };
 
   const applyCandidate = (c) => {
+    // The sweep priced this design with the method selected at the time; keep it
+    // selected so the run that follows reproduces the same number.
+    if (c.method) setRes((s2) => ({ ...s2, dispatchMode: c.method === "optimised" ? "optimised" : "merit" }));
     setRes((s2) => ({
       ...s2,
       pv: { ...s2.pv, enabled: c.kWp > 0, kWp: c.kWp },
@@ -5909,11 +5919,12 @@ export default function MicrogridDesignTool() {
                 )}
               </div>
 
-              <div className={`mt-2 rounded border px-2 py-1 text-xs ${sweepCount > (res.dispatchMode === "optimised" ? 80 : 400) ? T.notice.warn : T.tile} ${T.muted}`}>
+              <div className={`mt-2 rounded border px-2 py-1 text-xs ${sweepCount > (res.dispatchMode === "optimised" ? 20 : 400) ? T.notice.warn : T.tile} ${T.muted}`}>
                 <span className={`font-mono ${T.title}`}>{fmt(sweepCount, 0)}</span> combinations will be tested,
                 each a full 8760-hour dispatch using {res.dispatchMode === "optimised" ? "the optimiser" : "the merit order"} —
-                roughly {fmt(sweepCount * (res.dispatchMode === "optimised" ? 0.3 : 0.06), 0)} seconds.
-                {sweepCount > (res.dispatchMode === "optimised" ? 80 : 400) && " That is a long run. Reduce the number of steps, or exclude an asset, unless you intend to wait."}
+                roughly {fmt(sweepCount * (res.dispatchMode === "optimised" ? 2.0 : 0.06), 0)} seconds.
+                {res.dispatchMode === "optimised" && " Optimised runs search the import ceiling as well, so each candidate costs several dispatches. Switch to merit order to search a wide range quickly, then re-run the chosen design under optimisation."}
+                {sweepCount > (res.dispatchMode === "optimised" ? 20 : 400) && " That is a long run. Reduce the number of steps, or exclude an asset, unless you intend to wait."}
                 {sweepCount <= 1 && " With nothing included there is nothing to search — switch on at least one asset above."}
               </div>
 
