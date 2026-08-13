@@ -10,6 +10,7 @@ import {
   LOCATION_LIBRARY, MARKET_PRICES_2025, VRE_PENETRATION_2025,
   DEMAND_MONTHLY_INDEX, DEMAND_HOURLY_INDEX,
 } from "./data/library-2025.js";
+import { EXAMPLE_PROJECTS } from "./data/examples.js";
 export { LOCATION_LIBRARY, MARKET_PRICES_2025, VRE_PENETRATION_2025 };
 
 /* ============================================================================
@@ -3231,6 +3232,7 @@ export default function MicrogridDesignTool() {
   const [justRan, setJustRan] = useState(false);
   const [detail, setDetail] = useState({ dispatch: "summary", reliability: "summary", report: "summary" });
   const [lastImported, setLastImported] = useState(null);
+  const [autoRun, setAutoRun] = useState(false);
   const [lcoeBoundary, setLcoeBoundary] = useState("facility");
   const [costs, setCosts] = useState({ ...CONSTANTS.COST_DEFAULTS });
   const [fin, setFin] = useState({ enabled: false, gearingPct: 70, tenorYears: 12, interestPct: 5.5, creditBaselineCapex: false });
@@ -3607,6 +3609,10 @@ export default function MicrogridDesignTool() {
   };
 
   useEffect(() => { if (!runOut) runDispatch(); });
+  // Applying a design, or loading a project, runs the model straight away: the
+  // state has settled by the time this effect fires, so the run uses the new
+  // values rather than the ones on screen a moment ago.
+  useEffect(() => { if (autoRun) { setAutoRun(false); runDispatch(); } });
 
   const stale = !runOut || runOut.sig !== runSig;
   const disp = runOut ? runOut.disp : null;
@@ -3714,6 +3720,60 @@ export default function MicrogridDesignTool() {
     const r = new FileReader();
     r.onload = () => { const res = parseLoadCSV(String(r.result)); setCsvResult(res); if (res.load) setLoadCfg((s) => ({ ...s, path: "csv" })); };
     r.readAsText(f);
+  };
+
+  /* Apply a configuration to the whole tool. Used by the file loader and by the
+     built-in examples, so both behave identically. */
+  const applyConfig = (c, sourceLabel, extraMessages = []) => {
+    if (c.mode) setMode(c.mode);
+    if (c.ctx) setCtx(c.ctx);
+    setLocOverride(c.locOverride || {});
+    if (c.aidc) setAidc(c.aidc);
+    if (c.loadCfg) setLoadCfg(c.loadCfg);
+    if (c.char) setChar(c.char);
+    if (c.res) setRes(c.res);
+    if (c.costs) setCosts({ ...CONSTANTS.COST_DEFAULTS, ...c.costs });
+    if (c.fin) setFin(c.fin);
+    if (c.sweep) setSweep(c.sweep);
+    if (c.lcoeBoundary) setLcoeBoundary(c.lcoeBoundary);
+    setScenarios(Array.isArray(c.scenarios) ? c.scenarios.slice(0, 6) : []);
+    setProjectName(c.projectName || "");
+    setProjectNotes(c.notes || "");
+    setLastImported(sourceLabel);
+    setCsvResult(c.uploadedLoad && c.uploadedLoad.length === H
+      ? { load: Float32Array.from(c.uploadedLoad), notes: c.uploadedLoadNotes || ["Restored from a project file."], rowsIn: H, detected: "hourly" }
+      : null);
+    if (c.uploadedResource && (c.uploadedResource.pvUnit || c.uploadedResource.temp)) {
+      const nx = {};
+      if (c.uploadedResource.pvUnit) nx.pvUnit = Float32Array.from(c.uploadedResource.pvUnit);
+      if (c.uploadedResource.temp) nx.temp = Float32Array.from(c.uploadedResource.temp);
+      setUploadedResource(nx);
+    } else setUploadedResource(null);
+    setUploadedPrice(c.uploadedPrice && c.uploadedPrice.length === H ? Float32Array.from(c.uploadedPrice) : null);
+    if (c.resourceSource) setResourceSource(c.resourceSource);
+    setRunOut(null);
+    setSweepOut(null);
+    setConfigMsgs([`Loaded "${c.projectName || sourceLabel}".`, ...extraMessages, "The model is running with these inputs."]);
+    setAutoRun(true);
+  };
+
+  const loadProject = (ev) => {
+    const f = ev.target.files?.[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      const { ok, config: c, messages } = parseConfig(String(rd.result));
+      if (!ok) { setConfigMsgs(messages); return; }
+      applyConfig(c, `${f.name}${c.savedAt ? ` (saved ${c.savedAt.slice(0, 10)})` : ""}`, messages);
+    };
+    rd.readAsText(f);
+    ev.target.value = "";
+  };
+
+  const loadExample = (key) => {
+    const ex = EXAMPLE_PROJECTS[key];
+    if (!ex) return;
+    applyConfig(JSON.parse(JSON.stringify(ex.config)), `built-in example: ${ex.label}`,
+      ["Every input can be edited and the result saved as your own project file."]);
   };
 
   const onPriceFile = (e) => {
@@ -3912,6 +3972,7 @@ export default function MicrogridDesignTool() {
       engine: { ...s2.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
         fuelType: s2.engine.fuelType || "diesel" },
     }));
+    setAutoRun(true);
     setTab(4);
   };
 
@@ -4124,49 +4185,6 @@ export default function MicrogridDesignTool() {
     downloadJSON(`${slug}.json`, cfg);
   };
 
-  const loadProject = (ev) => {
-    const f = ev.target.files?.[0]; if (!f) return;
-    const rd = new FileReader();
-    rd.onload = () => {
-      const { ok, config: c, messages } = parseConfig(String(rd.result));
-      if (!ok) { setConfigMsgs(messages); return; }
-      if (c.mode) setMode(c.mode);
-      if (c.ctx) setCtx(c.ctx);
-      if (c.locOverride) setLocOverride(c.locOverride);
-      if (c.aidc) setAidc(c.aidc);
-      if (c.loadCfg) setLoadCfg(c.loadCfg);
-      if (c.char) setChar(c.char);
-      if (c.res) setRes(c.res);
-      if (c.costs) setCosts({ ...CONSTANTS.COST_DEFAULTS, ...c.costs });
-      if (c.fin) setFin(c.fin);
-      if (c.sweep) setSweep(c.sweep);
-      if (c.lcoeBoundary) setLcoeBoundary(c.lcoeBoundary);
-      if (Array.isArray(c.scenarios)) setScenarios(c.scenarios.slice(0, 6));
-      setProjectName(c.projectName || "");
-      setLastImported(`${f.name}${c.savedAt ? ` (saved ${c.savedAt.slice(0, 10)})` : ""}`);
-      setProjectNotes(c.notes || "");
-      if (c.uploadedLoad && c.uploadedLoad.length === H) {
-        setCsvResult({ load: Float32Array.from(c.uploadedLoad), notes: c.uploadedLoadNotes || ["Restored from a project file."], rowsIn: H, detected: "hourly" });
-      }
-      if (c.uploadedResource && (c.uploadedResource.pvUnit || c.uploadedResource.temp)) {
-        const nx = {};
-        if (c.uploadedResource.pvUnit) nx.pvUnit = Float32Array.from(c.uploadedResource.pvUnit);
-        if (c.uploadedResource.temp) nx.temp = Float32Array.from(c.uploadedResource.temp);
-        setUploadedResource(nx);
-      }
-      if (c.uploadedPrice && c.uploadedPrice.length === H) {
-        setUploadedPrice(Float32Array.from(c.uploadedPrice));
-        setPriceNote("Price curve restored from the project file.");
-      }
-      if (c.resourceSource) setResourceSource(c.resourceSource);
-      setRunOut(null);
-      setSweepOut(null);
-      setConfigMsgs([`Loaded "${c.projectName || f.name}"${c.savedAt ? `, saved ${c.savedAt.slice(0, 16).replace("T", " ")}` : ""}.`, ...messages,
-        "Run the dispatch to regenerate the results."]);
-    };
-    rd.readAsText(f);
-    ev.target.value = "";
-  };
   const axis = { stroke: T.chart.axis, fontSize: 10 };
   const tip = { backgroundColor: T.chart.tipBg, border: `1px solid ${T.chart.tipBorder}`, borderRadius: 4, fontSize: 11 };
 
@@ -4258,6 +4276,10 @@ export default function MicrogridDesignTool() {
                 <div className="flex items-center gap-2">
                   <button onClick={saveProject} className={`rounded border px-3 py-1 text-xs ${T.chip}`}>Save project file</button>
                   <button onClick={() => cfgFileRef.current?.click()} className={`rounded border px-3 py-1 text-xs ${T.btn}`}>Load project file</button>
+                  <div style={{ width: 250 }}>
+                    <Sel value="" prompt="Load an example…" onChange={loadExample}
+                      options={Object.entries(EXAMPLE_PROJECTS).map(([k, v]) => ({ value: k, label: v.label }))} />
+                  </div>
                   <input ref={cfgFileRef} type="file" accept=".json" className="hidden" onChange={loadProject} />
                 </div>
               }>
