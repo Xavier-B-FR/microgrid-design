@@ -4944,9 +4944,9 @@ export default function MicrogridDesignTool() {
                 {!runOut ? "Run model" : stale ? "Inputs changed — run model again" : "Run model again"}
               </button>
               <span className={`rounded px-2 py-1 text-xs ${justRan ? `${T.chipOk} font-medium` : stale ? T.tone.amber : T.faint}`}>
-                {justRan ? `✓ Run complete — 8760 h in ${fmt(dispatchMs, 0)} ms${runOut && runOut.optimised ? ", optimised" : ""}, all checks passed`
+                {justRan ? `✓ Run complete — in ${fmt(dispatchMs, 0)}`
                   : !runOut ? "not run yet"
-                    : stale ? `last run ${runOut.at}, now out of date`
+                    : stale ? `last run ${runOut.at}`
                       : `last run ${runOut.at}`}
               </span>
               <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} />
