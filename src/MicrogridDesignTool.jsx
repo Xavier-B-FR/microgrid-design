@@ -252,6 +252,43 @@ export const CONSTANTS = {
     CO2_KG_PER_LITRE_DIESEL: 2.68,      // kgCO2/l
     CO2_KG_PER_MWH_GAS: 202,            // kgCO2/MWh_th  natural gas combustion
   },
+
+  /* Guided auto-size — every coefficient of the search-space proposal and the
+     refinement, so a proposed range is always traceable to a number here. */
+  AUTOSIZE: {
+    PV_OVERBUILD_MAX: 1.5,              // × load-match kWp   upper bound of the PV axis unless land binds first
+    PV_COARSE_LEVELS: [0, 0.5, 1.0, 1.5], // × search scale    PV sizes tested in the coarse pass, clipped to the bound
+    WIND_COARSE_LEVELS: [0, 0.5, 1.0],  // × load-match MW    wind sizes tested in the coarse pass
+    WIND_SCREEN_MARGIN: 1.0,            // -    wind enters the search when its standalone LCOE is below margin × delivered grid price
+    SURPLUS_POWER_QUANTILE: 0.95,       // -    quantile of hourly PV surplus used as the storage power anchor
+    SHAVE_QUANTILE: 0.90,               // -    load-duration quantile; peak minus this is the peak-shaving anchor
+    BESS_FALLBACK_PEAK_FRACTION: 0.25,  // × peak kW          arbitrage starting size when no other anchor exists
+    BESS_DURATIONS_H: [2, 4],           // h    storage durations tested in the coarse pass
+    BESS_DURATION_LADDER_H: [1, 2, 4, 6], // h  neighbouring durations tested in refinement
+    REFINE_STEP_PCT: 25,                // %    one-axis step around the leading design in refinement
+    REFINE_STEP_MIN_PCT: 10,            // %    refinement stops once step-halving would go below this
+    REFINE_ROUNDS: 6,                   // -    maximum coordinate-refinement rounds; stops early once the leader survives its neighbours
+    OPT_SHORTLIST: 6,                   // -    designs re-priced under optimisation after merit-order screening
+    MAX_CANDIDATES: 500,                // -    hard cap on designs evaluated in one search
+  },
+
+  /* Dispatch calibration — forecast-error stress and battery duty audit.
+     The stress is a stated, reproducible perturbation of the simulated year,
+     not a weather model: day-level errors are correlated within the day, the
+     seed is fixed so two runs give the same answer, and every magnitude is
+     visible here. */
+  CALIBRATION: {
+    PV_DAY_ERROR_PCT: 15,           // %    day-ahead PV energy error, one sigma, applied per day
+    WIND_DAY_ERROR_PCT: 20,         // %    day-ahead wind energy error, one sigma, applied per day
+    LOAD_DAY_ERROR_PCT: 3,          // %    day-ahead load error, one sigma, applied per day
+    PRICE_DAY_ERROR_PCT: 15,        // % of mean |price|   day-level price level error, one sigma
+    PRICE_HOUR_ERROR_PCT: 8,        // % of mean |price|   within-day price shape error, one sigma
+    ERROR_CLAMP_SIGMA: 3,           // -    all draws clamped at this many sigma
+    SEED: 20260817,                 // -    fixed PRNG seed — the stress is reproducible run to run
+    WARRANTY_CYCLES: 6000,          // -    cycle life to end of warranty, counted as nameplate equivalent full cycles
+    WARRANTY_YEARS: 15,             // yr   calendar term of the warranty
+    WEAR_UNDERPRICE_FACTOR: 0.5,    // -    warn when the steering wear cost is below this share of full amortisation AND the cycle budget is exceeded
+  },
 };
 
 export const LOAD_SHAPES = {
@@ -1869,6 +1906,210 @@ function dispatchDiagnostics(disp, inp, loc) {
 }
 
 /* ============================================================================
+   DISPATCH CALIBRATION
+   Three questions, answered with runs rather than opinions:
+   1. What does the merit order leave on the table against the optimiser,
+      on this design and this year?
+   2. How much of the optimiser's edge survives a realistic forecast, given
+      that its schedule is built before the day and the merit order reacts
+      to what actually happens?
+   3. Is the battery duty consistent with the warranty and the wear-cost
+      assumption the optimiser steers by?
+   ========================================================================== */
+
+/** Deterministic 32-bit PRNG so the stress is reproducible. */
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Standard normal draw, clamped at ±CALIBRATION.ERROR_CLAMP_SIGMA. */
+function gaussClamped(rng, clampSigma) {
+  const u1 = Math.max(rng(), 1e-12), u2 = rng();
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  return Math.max(-clampSigma, Math.min(clampSigma, z));
+}
+
+/**
+ * A perturbed copy of the simulated year: the "outturn" against which a
+ * schedule built on the expected year is executed. Day-level multiplicative
+ * errors for PV, wind and load; day-level plus hour-level additive errors for
+ * price, scaled to the mean absolute price so negative prices stay legitimate.
+ */
+function perturbYear(inp, C, seed) {
+  const rng = mulberry32(seed);
+  const days = Math.ceil(H / 24);
+  const fPV = new Float32Array(days), fW = new Float32Array(days), fL = new Float32Array(days), dP = new Float32Array(days);
+  for (let d = 0; d < days; d++) {
+    fPV[d] = Math.max(0.05, 1 + C.PV_DAY_ERROR_PCT / 100 * gaussClamped(rng, C.ERROR_CLAMP_SIGMA));
+    fW[d] = Math.max(0.05, 1 + C.WIND_DAY_ERROR_PCT / 100 * gaussClamped(rng, C.ERROR_CLAMP_SIGMA));
+    fL[d] = Math.max(0.05, 1 + C.LOAD_DAY_ERROR_PCT / 100 * gaussClamped(rng, C.ERROR_CLAMP_SIGMA));
+    dP[d] = gaussClamped(rng, C.ERROR_CLAMP_SIGMA);
+  }
+  let meanAbsP = 0;
+  for (let i = 0; i < H; i++) meanAbsP += Math.abs(inp.price[i]);
+  meanAbsP /= H;
+  const pvGen = inp.pvGen ? new Float32Array(H) : null;
+  const windGen = inp.windGen ? new Float32Array(H) : null;
+  const load = new Float32Array(H), price = new Float32Array(H);
+  for (let i = 0; i < H; i++) {
+    const d = (i / 24) | 0;
+    if (pvGen) pvGen[i] = inp.pvGen[i] * fPV[d];
+    if (windGen) windGen[i] = inp.windGen[i] * fW[d];
+    load[i] = Math.max(0, inp.load[i] * fL[d]);
+    price[i] = inp.price[i] + meanAbsP * (C.PRICE_DAY_ERROR_PCT / 100 * dP[d]
+      + C.PRICE_HOUR_ERROR_PCT / 100 * gaussClamped(rng, C.ERROR_CLAMP_SIGMA));
+  }
+  return { ...inp, pvGen, windGen, load, price };
+}
+
+/** Variable operating cost of a dispatch on a given price series — one basis for every comparison. */
+function variableOperatingCost(d, price, inp, loc, costs) {
+  let energy = 0;
+  for (let i = 0; i < H; i++) energy += d.imp[i] * price[i] / 1000;
+  const fuel = inp.engine.fuelType === "diesel"
+    ? d.summary.fuelLitres * loc.diesel_EUR_per_litre
+    : d.summary.fuelMWhTh * loc.gas_EUR_per_MWh_th;
+  const demand = d.summary.meanMonthlyPeakKW * loc.capacityCharge_EUR_per_kW_yr;
+  const exportRev = d.summary.exportMWh * (costs.EXPORT_PRICE_EUR_PER_MWH || 0);
+  return { energy, fuel, demand, exportRev, total: energy + fuel + demand - exportRev,
+    unservedMWh: d.summary.unservedMWh, cycles: d.summary.equivalentFullCycles,
+    peakKW: d.summary.meanMonthlyPeakKW };
+}
+
+/** Discharge-depth statistics from the SOC trace: each contiguous discharge run counts once. */
+function socCycleStats(soc) {
+  const depths = [];
+  let runStart = null;
+  for (let i = 1; i < H; i++) {
+    const falling = soc[i] < soc[i - 1] - 1e-6;
+    if (falling && runStart === null) runStart = soc[i - 1];
+    if (!falling && runStart !== null) {
+      const depth = runStart - soc[i - 1];
+      if (depth >= 1) depths.push(depth);
+      runStart = null;
+    }
+  }
+  if (runStart !== null) {
+    const depth = runStart - soc[H - 1];
+    if (depth >= 1) depths.push(depth);
+  }
+  if (!depths.length) return { meanDoDPct: 0, p95DoDPct: 0, segments: 0 };
+  depths.sort((a, b) => a - b);
+  const mean = depths.reduce((a, v) => a + v, 0) / depths.length;
+  return { meanDoDPct: mean, p95DoDPct: depths[Math.min(depths.length - 1, Math.floor(0.95 * depths.length))], segments: depths.length };
+}
+
+/**
+ * The calibration itself. `inp` must already carry the optimiser wear cost and
+ * the fuel and export prices, exactly as the headline run does — the whole
+ * point is that every number here is priced on the same basis as the tool's
+ * own results. `headline` is the current headline dispatch (either mode).
+ */
+async function dispatchCalibration(a) {
+  const { inp, loc, costs, headline, headlineOptimised, onPhase } = a;
+  const CAL = CONSTANTS.CALIBRATION;
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const canOptimise = inp.bess.enabled && inp.bess.energyKWh > 0;
+  const out = { gap: { available: false }, forecast: { available: false }, battery: { available: false } };
+
+  /* --- 1. Merit order against the optimum, expected year ------------------- */
+  if (onPhase) onPhase("merit order against the optimum");
+  await tick();
+  const meritD = headlineOptimised ? dispatch(inp) : headline;
+  if (!canOptimise) {
+    out.gap = { available: false, reason: "No battery in the design — the merit order and the optimum coincide, there is nothing to calibrate." };
+  } else {
+    const optD = headlineOptimised ? headline : optimiseWithDemandCharge(inp, loc.capacityCharge_EUR_per_kW_yr);
+    await tick();
+    const cm = variableOperatingCost(meritD, inp.price, inp, loc, costs);
+    const co = variableOperatingCost(optD, inp.price, inp, loc, costs);
+    const diag = dispatchDiagnostics(meritD, inp, loc);
+    const bound = operatingCostBound({ load: inp.load, pvGen: inp.pvGen, windGen: inp.windGen,
+      price: inp.price, grid: inp.grid, engine: inp.engine, loc, costs });
+    out.gap = {
+      available: true, merit: cm, opt: co,
+      gapEUR: cm.total - co.total,
+      gapPct: cm.total > 0 ? (cm.total - co.total) / cm.total * 100 : 0,
+      arbitrageCeilingEUR: diag.arbitrageCeilingEUR,
+      peakGapEUR: diag.peakGapEUR,
+      boundEUR: bound.boundEUR,
+      optCeilingKW: optD.optimiserCeilingKW,
+    };
+
+    /* --- 2. Value of the forecast ---------------------------------------- */
+    if (onPhase) onPhase("building the outturn year");
+    await tick();
+    const pert = perturbYear(inp, CAL, CAL.SEED);
+    if (onPhase) onPhase("optimising with perfect knowledge of the outturn");
+    await tick();
+    const perfectD = optimiseWithDemandCharge(pert, loc.capacityCharge_EUR_per_kW_yr);
+    if (onPhase) onPhase("executing the day-ahead schedule on the outturn");
+    await tick();
+    // The schedule built on the expected year, executed against the outturn:
+    // the plant clips it to what is physically feasible hour by hour.
+    const scheduledD = dispatch({ ...pert, forcedBattery: optD.bess });
+    const meritOutD = dispatch(pert);
+    const cp = variableOperatingCost(perfectD, pert.price, inp, loc, costs);
+    const cs = variableOperatingCost(scheduledD, pert.price, inp, loc, costs);
+    const cmo = variableOperatingCost(meritOutD, pert.price, inp, loc, costs);
+    out.forecast = {
+      available: true,
+      sigma: { pv: CAL.PV_DAY_ERROR_PCT, wind: CAL.WIND_DAY_ERROR_PCT, load: CAL.LOAD_DAY_ERROR_PCT,
+        priceDay: CAL.PRICE_DAY_ERROR_PCT, priceHour: CAL.PRICE_HOUR_ERROR_PCT, seed: CAL.SEED },
+      perfect: cp, scheduled: cs, meritOut: cmo,
+      forecastCostEUR: cs.total - cp.total,
+      meritRegretEUR: cmo.total - cp.total,
+      optimiserEdgeEUR: cmo.total - cs.total,
+    };
+  }
+
+  /* --- 3. Battery duty against warranty and wear --------------------------- */
+  if (inp.bess.enabled && inp.bess.energyKWh > 0 && headline.soc) {
+    if (onPhase) onPhase("auditing the battery duty");
+    await tick();
+    const efc = headline.summary.equivalentFullCycles;
+    const dischargeMWh = efc * inp.bess.energyKWh / 1000;
+    const dod = socCycleStats(headline.soc);
+    const budgetCyclesPerYr = CAL.WARRANTY_CYCLES / CAL.WARRANTY_YEARS;
+    const yearsToExhaust = efc > 0.01 ? CAL.WARRANTY_CYCLES / efc : Infinity;
+    const impliedWear = (costs.BESS_EUR_PER_KWH || 0) * 1000 / CAL.WARRANTY_CYCLES; // €/MWh of nameplate-cycle throughput
+    const assumedWear = inp.bess.wearCostEURperMWh !== undefined ? inp.bess.wearCostEURperMWh : CONSTANTS.BESS_WEAR_COST_EUR_PER_MWH;
+    const overBudget = efc > budgetCyclesPerYr;
+    const underPriced = overBudget && assumedWear < impliedWear * CAL.WEAR_UNDERPRICE_FACTOR;
+    const findings = [
+      { name: "Cycle duty against the warranty budget",
+        value: `${efc.toFixed(0)} EFC/yr against ${budgetCyclesPerYr.toFixed(0)} EFC/yr budgeted`,
+        good: !overBudget,
+        note: overBudget
+          ? `at this duty the cycle allowance is exhausted in ${yearsToExhaust.toFixed(1)} yr, before the ${CAL.WARRANTY_YEARS}-yr term — plan an augmentation or slow the cycling`
+          : `calendar life binds first (${CAL.WARRANTY_CYCLES} cycles over ${CAL.WARRANTY_YEARS} yr)` },
+      { name: "Wear-cost assumption against full amortisation",
+        value: `${assumedWear.toFixed(0)} €/MWh steering cost against ${impliedWear.toFixed(0)} €/MWh full replacement amortisation`,
+        good: !underPriced,
+        note: underPriced
+          ? "the optimiser is cycling beyond the warranty budget while pricing wear far below replacement — raise the wear cost on the Microgrid tab"
+          : "the steering cost is intentionally below full amortisation: capex already pays for the battery once, wear only has to deter worthless cycling" },
+      { name: "Depth of discharge",
+        value: `mean ${dod.meanDoDPct.toFixed(0)} %, P95 ${dod.p95DoDPct.toFixed(0)} % over ${dod.segments} discharge runs`,
+        good: true,
+        note: `operating window ${inp.bess.socMinPct}–${inp.bess.socMaxPct} % SOC` },
+    ];
+    out.battery = { available: true, efc, dischargeMWh, dod, budgetCyclesPerYr, yearsToExhaust,
+      impliedWear, assumedWear, findings, clean: findings.every((f) => f.good) };
+  } else {
+    out.battery = { available: false, reason: "No battery in the design." };
+  }
+
+  return out;
+}
+
+/* ============================================================================
    WHAT TO CHANGE WHEN A CHECK FAILS
    Each failed check returns concrete, quantified moves rather than a verdict.
    ========================================================================== */
@@ -2281,6 +2522,369 @@ function autoSize(a) {
   });
   const feasible = results.filter((r) => r.feasible).sort((x, y) => x.lcoe - y.lcoe);
   return { all: results, feasible, tried: combos.length, best: feasible[0] || null };
+}
+
+/* --- Guided auto-size ------------------------------------------------------ */
+
+/** Quantile of an array without mutating it. q in 0…1; q of the value exceeded (1-q) of the time. */
+function quantile(arr, q) {
+  const s = Array.from(arr).sort((a, b) => a - b);
+  const idx = Math.min(s.length - 1, Math.max(0, Math.round(q * (s.length - 1))));
+  return s[idx];
+}
+
+/**
+ * SEARCH-SPACE PROPOSAL — derives the ranges the guided search will test from
+ * what the tool already knows: the load, the connection, the resource, the land
+ * and the tariff structure. Every bound is an explicit, named anchor so the
+ * question "why was this size tested" always has an answer. Pure function:
+ * everything it needs arrives as an argument, nothing is read from state.
+ */
+function proposeSearchSpace(a) {
+  const { load, stats, pvUnit, windAnnualMWhPerMW, windMean, gridEnabled, importCapKW,
+    parasiticKW, islanded, islandLoadKW, landCapKWp, bessCapMW, engineCapMW,
+    engineUnitKW, mode, windCapexEURperKW, windOMEURperKWyr, deliveredGridEURperMWh,
+    discountPct, lifeYears, exportCapKW, dcacRatio } = a;
+  const AZ = CONSTANTS.AUTOSIZE;
+  const round100 = (v) => Math.round(v / 100) * 100;
+
+  /* PV — two constraints govern the axis. Annual energy sets the load-match
+     size; what the busbar can absorb (peak load + export capacity, in DC terms)
+     sets the scale the coarse pass actually tests, because behind a tight
+     export cap the surplus has nowhere to go and load-match over-states the
+     useful size by a wide margin. Land and the over-build limit stay as the
+     hard bound, so refinement can still climb where the economics justify it. */
+  let pvUnitAnnual = 0;
+  for (let i = 0; i < H; i++) pvUnitAnnual += pvUnit[i]; // kWh per kWp per year, pre plant losses
+  const dcac = dcacRatio > 0 ? dcacRatio : 1.2;
+  const loadMatchKWp = stats.annualMWh * 1000 / Math.max(1, pvUnitAnnual);
+  let pvMaxKWp = loadMatchKWp * AZ.PV_OVERBUILD_MAX;
+  let pvBoundBy = `${AZ.PV_OVERBUILD_MAX} × load-match (over-build limit)`;
+  if (landCapKWp > 0 && landCapKWp < pvMaxKWp) { pvMaxKWp = landCapKWp; pvBoundBy = "land available"; }
+
+  /* Axis scale — what the busbar can absorb. The storage allowance in the
+     absorption term is the fixed fallback fraction of peak, NOT the surplus
+     anchor computed below: the surplus anchor depends on the PV size and the
+     PV scale would depend on it in turn, and that circularity mis-scales
+     every axis in whichever direction it is resolved. */
+  const bessScaleKW = round100(stats.peakKW * AZ.BESS_FALLBACK_PEAK_FRACTION);
+  const absorbKWp = round100((stats.peakKW + parasiticKW + (exportCapKW || 0) + bessScaleKW) * dcac);
+  const pvScaleKWp = Math.min(loadMatchKWp, absorbKWp, pvMaxKWp);
+
+  /* PV surplus profile at the largest PV size the coarse pass tests — the
+     storage power anchor. "A battery sized to absorb the surplus of the
+     largest PV on the table" is a statement an analyst can defend. */
+  const refKWp = Math.min(round100(pvScaleKWp * Math.max(...AZ.PV_COARSE_LEVELS)), pvMaxKWp);
+  const surplus = new Float32Array(H);
+  const dailySurplus = new Float64Array(365);
+  for (let i = 0; i < H; i++) {
+    surplus[i] = Math.max(0, pvUnit[i] * refKWp - load[i]);
+    dailySurplus[Math.min(364, Math.floor(i / 24))] += surplus[i] / 1000;
+  }
+  const surplusKW = round100(quantile(surplus, AZ.SURPLUS_POWER_QUANTILE));
+  const medianDailySurplusMWh = quantile(dailySurplus, 0.5);
+
+  /* Storage — three anchors: cover the connection shortfall, shave the peak, absorb the surplus */
+  const deficitKW = round100(Math.max(0, stats.peakKW + parasiticKW - (gridEnabled ? importCapKW : 0)));
+  const shaveKW = round100(Math.max(0, stats.peakKW - quantile(load, AZ.SHAVE_QUANTILE)));
+  const fallbackKW = round100(stats.peakKW * AZ.BESS_FALLBACK_PEAK_FRACTION);
+  let anchors = [deficitKW, shaveKW, surplusKW].filter((v) => v > 0);
+  if (!anchors.length) anchors = [fallbackKW];
+  const bessHardCapKW = bessCapMW > 0 ? bessCapMW * 1000 : Infinity;
+  const bessMaxKW = Math.min(Math.max(...anchors), bessHardCapKW);
+  let bessLevelsKW = [...new Set(anchors.map((v) => Math.min(v, bessHardCapKW)))].sort((x, y) => x - y);
+  if (bessLevelsKW.length > 3) bessLevelsKW = [bessLevelsKW[0], bessLevelsKW[Math.floor(bessLevelsKW.length / 2)], bessLevelsKW[bessLevelsKW.length - 1]];
+  bessLevelsKW = [0, ...bessLevelsKW.filter((v) => v > 0)];
+
+  const pvLevelsKWp = [...new Set(AZ.PV_COARSE_LEVELS.map((f) => round100(Math.min(f * pvScaleKWp, pvMaxKWp))))];
+
+  /* Wind — screened on its standalone LCOE against the delivered grid price,
+     using this site's simulated capacity factor and the project's own cost and
+     discount assumptions. A m/s threshold would hide the economics. */
+  const windLoadMatchKW = windAnnualMWhPerMW > 0 ? round100(stats.annualMWh / windAnnualMWhPerMW * 1000) : 0;
+  // Same absorption logic as PV: rated capacity beyond what the busbar can take at full output only curtails
+  const windScaleKW = Math.min(windLoadMatchKW, round100(stats.peakKW + parasiticKW + (exportCapKW || 0) + bessScaleKW));
+  const r = Math.max(0.0001, (discountPct || 6) / 100);
+  const n = Math.max(1, lifeYears || 25);
+  const crf = r * Math.pow(1 + r, n) / (Math.pow(1 + r, n) - 1);
+  const windLCOE = windAnnualMWhPerMW > 0
+    ? ((windCapexEURperKW || 0) * crf + (windOMEURperKWyr || 0)) / (windAnnualMWhPerMW / 1000)
+    : Infinity; // €/MWh, standalone, before integration effects
+  const windScreenPass = windLCOE < (deliveredGridEURperMWh || 0) * AZ.WIND_SCREEN_MARGIN;
+  const windDefaultInclude = windScreenPass && mode !== "aidc" && windLoadMatchKW > 0;
+  const windReason = mode === "aidc"
+    ? "excluded by default in AIDC mode — no land model for turbines on a data-centre site"
+    : `standalone wind LCOE ${isFinite(windLCOE) ? windLCOE.toFixed(0) : "—"} €/MWh (${(windAnnualMWhPerMW / 87.6).toFixed(0)} % capacity factor at ${windMean.toFixed(1)} m/s) against a delivered grid price of ${(deliveredGridEURperMWh || 0).toFixed(0)} €/MWh — ${windScreenPass ? "worth testing" : "excluded by default"}`;
+  const windLevelsKW = [...new Set(AZ.WIND_COARSE_LEVELS.map((f) => round100(f * windScaleKW)))];
+
+  /* Engines — only where a firm shortfall exists: connection gap or an islanding duty */
+  const engineGapKW = deficitKW > 0 ? deficitKW : (islanded ? round100(islandLoadKW) : 0);
+  const engineDefaultInclude = engineGapKW > 0;
+  const engineHardCapUnits = engineCapMW > 0 ? Math.floor(engineCapMW * 1000 / Math.max(1, engineUnitKW)) : Infinity;
+  const needUnits = engineGapKW > 0 ? Math.ceil(engineGapKW / Math.max(1, engineUnitKW)) : 0;
+  // Where an islanding duty exists, the power adequacy check (including N-1) is
+  // what sets the count, not the energy gap — so that duty is anchored as well.
+  const islandUnits = islanded && islandLoadKW > 0 ? Math.ceil(islandLoadKW / Math.max(1, engineUnitKW)) : 0;
+  let engineLevels = engineGapKW > 0
+    ? [...new Set([0, needUnits, needUnits + 1, islandUnits, islandUnits + 1].filter((u) => u >= 0))]
+    : [0];
+  engineLevels = engineLevels.filter((u) => u <= engineHardCapUnits).sort((x, y) => x - y);
+  const engineReason = deficitKW > 0
+    ? `the connection is ${(deficitKW / 1000).toFixed(1)} MW short of the peak — firm generation must bridge it`
+    : islanded ? `an islanding duty of ${(islandLoadKW / 1000).toFixed(1)} MW needs firm generation behind it`
+    : "the connection covers the peak and there is no islanding duty — no firm shortfall to bridge";
+
+  return {
+    pv: { include: true, loadMatchKWp: round100(loadMatchKWp), scaleKWp: pvScaleKWp, absorptionKWp: absorbKWp,
+      maxKWp: round100(pvMaxKWp), boundBy: pvBoundBy, levelsKWp: pvLevelsKWp },
+    wind: { include: windDefaultInclude, loadMatchKW: windLoadMatchKW, scaleKW: windScaleKW, maxKW: windLoadMatchKW,
+      levelsKW: windLevelsKW, reason: windReason, standaloneLCOE: windLCOE },
+    bess: { include: true, anchors: { deficitKW, shaveKW, surplusKW, fallbackKW }, maxKW: round100(bessMaxKW),
+      hardCapKW: bessHardCapKW, levelsKW: bessLevelsKW, durationsH: AZ.BESS_DURATIONS_H.slice(), medianDailySurplusMWh },
+    engine: { include: engineDefaultInclude, unitKW: engineUnitKW, gapKW: engineGapKW, needUnits, levels: engineLevels,
+      maxUnits: engineHardCapUnits, reason: engineReason },
+  };
+}
+
+/**
+ * GUIDED AUTO-SIZE — a coarse pass over anchor-derived sizes, then coordinate
+ * refinement around the leading design, then (when the headline method is the
+ * optimiser) re-pricing of a short list under optimisation. Screening always
+ * runs in the merit order so a wide search stays interactive; the shortlist
+ * carries both numbers so the screening error is visible, never hidden.
+ * Every candidate records why it was tested.
+ */
+async function autoSizeGuided(a) {
+  const { space, evaluate, evaluateOpt, tick, onProgress } = a;
+  const AZ = CONSTANTS.AUTOSIZE;
+  const results = [];
+  const seen = new Set();
+  const key = (c) => `${c.kWp}|${c.windKW}|${c.bessKW}|${c.hours}|${c.units}`;
+  const round100 = (v) => Math.round(v / 100) * 100;
+  const clip = (v, max) => Math.max(0, Math.min(v, max));
+
+  const mk = (kWp, windKW, bessKW, hours, units, why) => {
+    const p = space.pv.include ? round100(clip(kWp, space.pv.maxKWp)) : 0;
+    const w = space.wind.include ? round100(clip(windKW, space.wind.maxKW)) : 0;
+    const b = space.bess.include ? round100(clip(bessKW, space.bess.hardCapKW !== undefined ? space.bess.hardCapKW : space.bess.maxKW)) : 0;
+    const h = b > 0 ? hours : 0;
+    const u = space.engine.include ? Math.max(0, Math.min(Math.round(units), space.engine.maxUnits)) : 0;
+    return { kWp: p, windKW: w, bessKW: b, hours: h, bessKWh: b * h, units: u, why };
+  };
+
+  const pending = [];
+  const push = (c) => { const k = key(c); if (!seen.has(k) && results.length + pending.length < AZ.MAX_CANDIDATES) { seen.add(k); pending.push(c); } };
+
+  let done = 0, planned = 0;
+  const evalPending = async () => {
+    planned += pending.length;
+    while (pending.length) {
+      const batch = pending.splice(0, 8);
+      for (const c of batch) { results.push({ ...c, ...evaluate(c) }); done++; }
+      if (onProgress) onProgress(done / Math.max(1, planned));
+      if (tick) await tick();
+    }
+  };
+  const rank = (list) => [...list].sort((x, y) => (x.feasible === y.feasible ? x.lcoe - y.lcoe : (x.feasible ? -1 : 1)));
+
+  /* Stage 1 — coarse pass over the anchor-derived levels */
+  const pvL = space.pv.include ? space.pv.levelsKWp : [0];
+  const wiL = space.wind.include ? space.wind.levelsKW : [0];
+  const beL = space.bess.include ? space.bess.levelsKW : [0];
+  const duL = space.bess.include ? space.bess.durationsH : [0];
+  const enL = space.engine.include ? space.engine.levels : [0];
+  for (const p of pvL) for (const w of wiL) for (const b of beL)
+    for (const h of (b > 0 ? duL : [0])) for (const u of enL)
+      push(mk(p, w, b, h, u, "coarse pass over anchor-derived sizes"));
+  await evalPending();
+  const coarseTried = results.length;
+
+  /* Stage 2 — coordinate refinement around the leader. When the leader survives
+     a round unchanged the step is halved rather than the search stopped: a
+     ±25 % step straddles shallow optima, and one or two halvings recover the
+     point in between for a handful of extra screening evaluations. */
+  let step = AZ.REFINE_STEP_PCT / 100;
+  const ladder = AZ.BESS_DURATION_LADDER_H;
+  for (let round = 0; round < AZ.REFINE_ROUNDS; round++) {
+    const leader = rank(results)[0];
+    if (!leader) break;
+    const why = `refinement around the leading design (round ${round + 1}, ±${Math.round(step * 100)} %)`;
+    if (space.pv.include && leader.kWp > 0) {
+      push(mk(leader.kWp * (1 - step), leader.windKW, leader.bessKW, leader.hours || duL[0], leader.units, why));
+      push(mk(leader.kWp * (1 + step), leader.windKW, leader.bessKW, leader.hours || duL[0], leader.units, why));
+    }
+    if (space.wind.include && leader.windKW > 0) {
+      push(mk(leader.kWp, leader.windKW * (1 - step), leader.bessKW, leader.hours || duL[0], leader.units, why));
+      push(mk(leader.kWp, leader.windKW * (1 + step), leader.bessKW, leader.hours || duL[0], leader.units, why));
+    }
+    if (space.bess.include && leader.bessKW > 0) {
+      push(mk(leader.kWp, leader.windKW, leader.bessKW * (1 - step), leader.hours, leader.units, why));
+      push(mk(leader.kWp, leader.windKW, leader.bessKW * (1 + step), leader.hours, leader.units, why));
+      const di = ladder.indexOf(leader.hours);
+      const neigh = di === -1 ? ladder : [ladder[di - 1], ladder[di + 1]].filter(Boolean);
+      for (const h of neigh) push(mk(leader.kWp, leader.windKW, leader.bessKW, h, leader.units, why));
+    }
+    if (space.engine.include && leader.units > 0) {
+      push(mk(leader.kWp, leader.windKW, leader.bessKW, leader.hours, leader.units - 1, why));
+      push(mk(leader.kWp, leader.windKW, leader.bessKW, leader.hours, leader.units + 1, why));
+    }
+    if (!pending.length) break;
+    const before = rank(results)[0];
+    await evalPending();
+    const after = rank(results)[0];
+    if (before && after && key(before) === key(after)) {
+      step /= 2; // the leader survived its neighbours — tighten the bracket
+      if (step * 100 < AZ.REFINE_STEP_MIN_PCT) break;
+    }
+  }
+  const refineTried = results.length - coarseTried;
+
+  /* Stage 2b — ablation of the selected design: for every asset the leader
+     carries, evaluate the identical design without it (and, for every asset it
+     excludes, the identical design with the smallest tested size of it). This
+     pins the marginal-contribution comparison to the selected design itself
+     rather than to whatever the coarse grid happened to test. */
+  const ablationTwins = (leader, why) => {
+    const twins = [];
+    if (space.pv.include) twins.push(mk(leader.kWp > 0 ? 0 : (space.pv.levelsKWp.find((v) => v > 0) || 0),
+      leader.windKW, leader.bessKW, leader.hours, leader.units, why));
+    if (space.wind.include) twins.push(mk(leader.kWp, leader.windKW > 0 ? 0 : (space.wind.levelsKW.find((v) => v > 0) || 0),
+      leader.bessKW, leader.hours, leader.units, why));
+    if (space.bess.include) twins.push(leader.bessKW > 0
+      ? mk(leader.kWp, leader.windKW, 0, 0, leader.units, why)
+      : mk(leader.kWp, leader.windKW, space.bess.levelsKW.find((v) => v > 0) || 0, space.bess.durationsH[0], leader.units, why));
+    if (space.engine.include) twins.push(mk(leader.kWp, leader.windKW, leader.bessKW, leader.hours,
+      leader.units > 0 ? 0 : (space.engine.levels.find((v) => v > 0) || 0), why));
+    return twins;
+  };
+  {
+    const leader = rank(results)[0];
+    if (leader) {
+      for (const t of ablationTwins(leader, "ablation of the selected design")) push(t);
+      await evalPending();
+    }
+  }
+
+  /* Stage 3 — re-price the shortlist under optimisation, if that is the headline
+     method. Merit-order screening under-values a battery that earns its keep on
+     price arbitrage, so the shortlist is deliberately diversified across the
+     storage axis: the best screened design at every distinct storage power is
+     re-priced, then the remaining slots go to the overall screening order. */
+  let shortlisted = 0;
+  const reprice = async (r) => {
+    if (r.lcoeOpt !== undefined) return;
+    const o = evaluateOpt(r);
+    r.lcoeOpt = o.lcoe;
+    r.renewablePctOpt = o.renewablePct;
+    r.method = "optimised";
+    shortlisted++;
+    if (onProgress) onProgress(1);
+    if (tick) await tick();
+  };
+  if (evaluateOpt) {
+    const feas = rank(results).filter((r) => r.feasible);
+    const perBess = new Map();
+    for (const r of feas) if (!perBess.has(r.bessKW)) perBess.set(r.bessKW, r);
+    const shortlist = [...perBess.values()];
+    for (const r of feas) {
+      if (shortlist.length >= AZ.OPT_SHORTLIST) break;
+      if (!shortlist.includes(r)) shortlist.push(r);
+    }
+    for (const r of shortlist.slice(0, Math.max(AZ.OPT_SHORTLIST, perBess.size))) await reprice(r);
+
+    /* One refinement round on the optimisation side: the storage neighbours of
+       the optimised leader, priced under optimisation directly, since the
+       screening order that guided refinement so far cannot see arbitrage value. */
+    const optLeader = results.filter((r) => r.lcoeOpt !== undefined).sort((x, y) => x.lcoeOpt - y.lcoeOpt)[0];
+    if (optLeader) {
+      const stepB = Math.max(100, round100(Math.max(optLeader.bessKW, bessSmallest(space)) * AZ.REFINE_STEP_PCT / 100));
+      const cands = [];
+      const ladder = AZ.BESS_DURATION_LADDER_H;
+      const li = ladder.indexOf(optLeader.hours);
+      if (optLeader.bessKW > 0) {
+        cands.push(mk(optLeader.kWp, optLeader.windKW, optLeader.bessKW + stepB, optLeader.hours, optLeader.units, "storage neighbour of the optimised leader"));
+        cands.push(mk(optLeader.kWp, optLeader.windKW, Math.max(0, optLeader.bessKW - stepB), optLeader.hours, optLeader.units, "storage neighbour of the optimised leader"));
+        if (li >= 0 && li + 1 < ladder.length) cands.push(mk(optLeader.kWp, optLeader.windKW, optLeader.bessKW, ladder[li + 1], optLeader.units, "duration neighbour of the optimised leader"));
+        if (li > 0) cands.push(mk(optLeader.kWp, optLeader.windKW, optLeader.bessKW, ladder[li - 1], optLeader.units, "duration neighbour of the optimised leader"));
+      } else {
+        cands.push(mk(optLeader.kWp, optLeader.windKW, bessSmallest(space), AZ.BESS_DURATIONS_H[0], optLeader.units, "storage neighbour of the optimised leader"));
+      }
+      for (const c of cands) push(c);
+      await evalPending();
+      for (const r of results.filter((x) => x.feasible && x.lcoeOpt === undefined &&
+        (x.why === "storage neighbour of the optimised leader" || x.why === "duration neighbour of the optimised leader"))) await reprice(r);
+    }
+
+    /* Ablation of the final optimised selection, re-priced on the same basis,
+       so the marginal-contribution table speaks about the design actually
+       recommended and in the prices actually quoted. */
+    const finalOpt = results.filter((r) => r.lcoeOpt !== undefined).sort((x, y) => x.lcoeOpt - y.lcoeOpt)[0];
+    if (finalOpt) {
+      const twins = ablationTwins(finalOpt, "ablation of the selected design (optimised basis)");
+      const twinKeys = new Set(twins.map((t) => key(t)));
+      for (const t of twins) push(t);
+      await evalPending();
+      for (const r of results.filter((x) => x.feasible && x.lcoeOpt === undefined && twinKeys.has(key(x)))) await reprice(r);
+    }
+  }
+
+  const feasible = results.filter((r) => r.feasible).sort((x, y) => x.lcoe - y.lcoe);
+  const repriced = results.filter((r) => r.lcoeOpt !== undefined).sort((x, y) => x.lcoeOpt - y.lcoeOpt);
+  const best = evaluateOpt ? (repriced[0] || feasible[0] || null) : (feasible[0] || null);
+  return { all: results, feasible, ranked: rank(results), best, tried: results.length,
+    coarseTried, refineTried, shortlisted };
+}
+
+function bessSmallest(space) {
+  const v = (space.bess.levelsKW || []).find((x) => x > 0);
+  return v || round100(space.bess.anchors ? space.bess.anchors.fallbackKW : 0) || 100;
+}
+
+/**
+ * MARGINAL CONTRIBUTION OF EACH ASSET CLASS — for the winning design, what does
+ * each asset actually buy? Compares the winner against the best feasible design
+ * that excludes the asset class entirely (both priced on the screening basis,
+ * so the comparison is like for like). This is what makes "storage does not
+ * pay" a stated result rather than something read between the lines.
+ */
+function assetContribution(results, best, space) {
+  if (!best) return [];
+  const axes = [
+    { id: "pv", label: "Solar PV", val: (r) => r.kWp, inSearch: space.pv.include, size: (r) => `${(r.kWp / 1000).toFixed(1)} MWp` },
+    { id: "wind", label: "Wind", val: (r) => r.windKW, inSearch: space.wind.include, size: (r) => `${(r.windKW / 1000).toFixed(1)} MW` },
+    { id: "bess", label: "Battery storage", val: (r) => r.bessKW, inSearch: space.bess.include, size: (r) => `${(r.bessKW / 1000).toFixed(1)} MW / ${(r.bessKWh / 1000).toFixed(1)} MWh` },
+    { id: "engine", label: "Engine generation", val: (r) => r.units, inSearch: space.engine.include, size: (r) => `${r.units} units` },
+  ];
+  /* Basis discipline: the comparison must be priced the same way the selection
+     was. When the winner was selected on optimised dispatch, alternatives are
+     drawn from the re-priced pool only — mixing screening and optimised prices
+     in one table would overstate whichever side the reader is not warned about. */
+  const basisOpt = best.lcoeOpt !== undefined;
+  const price = (r) => (basisOpt ? r.lcoeOpt : r.lcoe);
+  const renew = (r) => (basisOpt && r.renewablePctOpt !== undefined ? r.renewablePctOpt : r.renewablePct);
+  const feasible = results.filter((r) => r.feasible && (!basisOpt || r.lcoeOpt !== undefined));
+  return axes.filter((ax) => ax.inSearch).map((ax) => {
+    const inWinner = ax.val(best) > 0;
+    const pool = feasible.filter((r) => (inWinner ? ax.val(r) === 0 : ax.val(r) > 0));
+    const alt = pool.length ? pool.reduce((m, r) => (price(r) < price(m) ? r : m)) : null;
+    if (!alt) {
+      return { id: ax.id, label: ax.label, inWinner, size: inWinner ? ax.size(best) : "—",
+        deltaLCOE: null, deltaRenew: null, deltaCapex: null,
+        note: inWinner ? (basisOpt ? "required — no re-priced design excludes it" : "required — no design passed the checks without it")
+          : "no feasible design includes it" };
+    }
+    // positive delta = the winner is cheaper than the alternative, i.e. the choice pays
+    const deltaLCOE = +(price(alt) - price(best)).toFixed(1);
+    const deltaRenew = +(renew(best) - renew(alt)).toFixed(1);
+    const deltaCapex = +((best.capexMEUR || 0) - (alt.capexMEUR || 0)).toFixed(2);
+    const note = inWinner
+      ? (deltaLCOE >= 0 ? `pays: best design without it is ${deltaLCOE.toFixed(1)} €/MWh dearer`
+        : `does not pay on LCOE: dropping it saves ${(-deltaLCOE).toFixed(1)} €/MWh but gives up ${deltaRenew.toFixed(1)} pp renewable share`)
+      : (deltaLCOE >= 0 ? `correctly excluded: best design with it is ${deltaLCOE.toFixed(1)} €/MWh dearer`
+        : `excluded, but the best design with it is ${(-deltaLCOE).toFixed(1)} €/MWh cheaper — inspect the ranking`);
+    return { id: ax.id, label: ax.label, inWinner, size: inWinner ? ax.size(best) : ax.size(alt) + " (best alternative)",
+      deltaLCOE, deltaRenew, deltaCapex, altKey: alt, note };
+  });
 }
 
 /* --- Excel export ---------------------------------------------------------- */
@@ -3236,9 +3840,15 @@ export default function MicrogridDesignTool() {
   const [lcoeBoundary, setLcoeBoundary] = useState("facility");
   const [costs, setCosts] = useState({ ...CONSTANTS.COST_DEFAULTS });
   const [fin, setFin] = useState({ enabled: false, gearingPct: 70, tenorYears: 12, interestPct: 5.5, creditBaselineCapex: false });
-  const [sweep, setSweep] = useState({ pvMin: 0, pvMax: 20, pvSteps: 5, bessMin: 0, bessMax: 12, bessSteps: 4, durations: "2, 4", engineUnits: "0, 4, 6, 8" });
+  const [sweep, setSweep] = useState({ mode: "guided",
+    // guided overrides — blank means "use the proposed value"
+    gPvOn: null, gWindOn: null, gBessOn: null, gEngineOn: null,
+    gPvMaxMWp: "", gWindMaxMW: "", gBessMaxMW: "", gEngineUnitKW: "",
+    // manual ranges (unchanged)
+    pvMin: 0, pvMax: 20, pvSteps: 5, bessMin: 0, bessMax: 12, bessSteps: 4, durations: "2, 4", engineUnits: "0, 4, 6, 8" });
   const [sweepOut, setSweepOut] = useState(null);
   const [sweeping, setSweeping] = useState(false);
+  const [sweepPct, setSweepPct] = useState(0);
   const [scenarios, setScenarios] = useState([]);
   const [scenarioName, setScenarioName] = useState("");
   const [projectName, setProjectName] = useState("");
@@ -3490,8 +4100,16 @@ export default function MicrogridDesignTool() {
     turbine: { ...resN.turbine, effCurve: CONSTANTS.TURBINE_EFF_PCT },
     lookahead: resN.lookahead,
     meritOrder: res.meritOrder,
+    // Prices the optimiser needs. These were read by optimiseDispatch and
+    // optimiseWithDemandCharge but never supplied, so the optimiser priced
+    // engine fuel and export revenue at zero — a real distortion on any
+    // optimised project with engines or an export route.
+    dieselPrice: numz(loc.diesel_EUR_per_litre),
+    gasPrice: numz(loc.gas_EUR_per_MWh_th),
+    exportPrice: numz(costs.EXPORT_PRICE_EUR_PER_MWH),
   }), [load, pvOut, windGen, price, temp, cal, char.shed1Pct, char.shed2Pct, ctx, mode, aidc.gridStrategy,
-       curtailFlags, res, reserveApplies, effectiveImportCapKW]);
+       curtailFlags, res, reserveApplies, effectiveImportCapKW,
+       loc.diesel_EUR_per_litre, loc.gas_EUR_per_MWh_th, costs.EXPORT_PRICE_EUR_PER_MWH]);
 
   // Anything that can change a result belongs here, or the screen can show
   // numbers that no longer match the inputs without saying so.
@@ -3505,6 +4123,8 @@ export default function MicrogridDesignTool() {
        costs.EXPORT_PRICE_EUR_PER_MWH, uploadedPrice, csvResult, uploadedResource]);
 
   const [runOut, setRunOut] = useState(null);
+  const [calib, setCalib] = useState(null);        // dispatch-calibration results, cleared when the run changes
+  const [calibBusy, setCalibBusy] = useState("");
 
   const evaluateDesign = (inputs, overrides) => {
     const forcedResult = overrides && overrides.forcedBatteryResult;
@@ -3616,6 +4236,24 @@ export default function MicrogridDesignTool() {
 
   const stale = !runOut || runOut.sig !== runSig;
   const disp = runOut ? runOut.disp : null;
+  useEffect(() => { setCalib(null); setCalibBusy(""); }, [runOut ? runOut.sig : null]);
+
+  const runCalibration = async () => {
+    if (!runOut || calibBusy) return;
+    setCalibBusy("preparing");
+    await new Promise((r) => setTimeout(r, 30));
+    try {
+      const inputs = withWear(dispatchInputs);
+      const res2 = await dispatchCalibration({
+        inp: inputs, loc, costs: numz(costs),
+        headline: runOut.disp, headlineOptimised: !!runOut.optimised,
+        onPhase: (ph) => setCalibBusy(ph),
+      });
+      setCalib({ sig: runOut.sig, ...res2 });
+    } finally {
+      setCalibBusy("");
+    }
+  };
   const adeq = runOut ? runOut.adeq : null;
   const bom = runOut ? runOut.bom : null;
   const dispatchMs = runOut ? runOut.ms : 0;
@@ -3734,7 +4372,7 @@ export default function MicrogridDesignTool() {
     if (c.res) setRes(c.res);
     if (c.costs) setCosts({ ...CONSTANTS.COST_DEFAULTS, ...c.costs });
     if (c.fin) setFin(c.fin);
-    if (c.sweep) setSweep(c.sweep);
+    if (c.sweep) setSweep((s2) => ({ ...s2, ...c.sweep })); // merged: older files carry no search-method field
     if (c.lcoeBoundary) setLcoeBoundary(c.lcoeBoundary);
     setScenarios(Array.isArray(c.scenarios) ? c.scenarios.slice(0, 6) : []);
     setProjectName(c.projectName || "");
@@ -3894,6 +4532,143 @@ export default function MicrogridDesignTool() {
     return b2.pvKWp.length * b2.windKW.length * b2.bessMW.length * b2.bessHours.length * Math.max(1, b2.engineUnits.length);
   }, [sweep, maxPVfromLandKWp, mode, aidcOut, res.engine.unitKW]);
 
+  /* One evaluator for every search path — manual sweep, guided screening and
+     shortlist re-pricing all build the candidate the same way, so the only
+     thing that can differ between them is the dispatch method, and that is
+     printed on the result. The generation profile depends only on kWp, so it
+     is cached per PV size. */
+  const makeCandidateEvaluator = (method, unitKW) => {
+    const pvCache = new Map();
+    const useOpt = method === "optimised";
+    return (c) => {
+      if (!pvCache.has(c.kWp)) {
+        pvCache.set(c.kWp, c.kWp > 0 ? buildPVGen(pvUnit, { ...res.pv, enabled: true, kWp: c.kWp }, simYear).gen : new Float32Array(H));
+      }
+      const pvGen = pvCache.get(c.kWp);
+      const windGenC = c.windKW > 0 ? buildWindGen(windSpeed, temp, { ...res.wind, ratedKW: c.windKW }) : new Float32Array(H);
+      const overrides = {
+        pvGen, windGen: windGenC,
+        bess: { ...dispatchInputs.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
+        engine: { ...dispatchInputs.engine, enabled: c.units > 0, units: c.units, unitKW,
+          minStableLoadPct: numz(res.engine.minStableLoadPct) || CONSTANTS.ENGINE_MIN_STABLE_LOAD_PCT,
+          annualHourLimit: numz(res.engine.annualHourLimit) || CONSTANTS.HOURS_PER_YEAR,
+          fuelType: res.engine.fuelType || "diesel" },
+      };
+      const inpC = withWear({ ...dispatchInputs, ...overrides });
+      // Same rule as the headline path: the optimiser needs a battery to optimise.
+      const d = useOpt && c.bessKW > 0
+        ? optimiseWithDemandCharge(inpC, loc.capacityCharge_EUR_per_kW_yr)
+        : dispatch(inpC);
+      const { adeq: ad } = evaluateDesign(inpC, { forcedBatteryResult: d });
+      // Costed from the sanitised copy, exactly as the headline run is, so a
+      // blank field cannot price differently in the two places.
+      const resVariant = {
+        ...resN, pv: { ...resN.pv, enabled: c.kWp > 0, kWp: c.kWp },
+        wind: { ...resN.wind, enabled: c.windKW > 0, ratedKW: c.windKW },
+        bess: { ...resN.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
+        engine: { ...resN.engine, enabled: c.units > 0, units: c.units, unitKW,
+          fuelType: resN.engine.fuelType || "diesel" },
+      };
+      const cst = computeCosts({ res: resVariant, ctx: ctxN, loc, disp: d, price, costs, itEnergyMWh,
+        gridEnabled: gridForBom.enabled, firmCapKW: gridForBom.firmCapKW });
+      const feasible = ad.energy.verdict !== "FAIL" && ad.power.verdict !== "FAIL" && ad.dynamic.verdict !== "FAIL";
+      return {
+        lcoe: +cst.lcoeFacility.toFixed(1),
+        capexMEUR: +(cst.capex.total / 1e6).toFixed(2),
+        renewablePct: +(d.summary.renewableFraction * 100).toFixed(1),
+        unservedMWh: +d.summary.unservedMWh.toFixed(2),
+        fuelDisplay: res.engine.fuelType === "diesel" ? d.summary.fuelLitres / 1000 : d.summary.fuelMWhTh,
+        energy: ad.energy.verdict, power: ad.power.verdict, dynamic: ad.dynamic.verdict, feasible,
+        method: useOpt ? "optimised" : "merit",
+      };
+    };
+  };
+
+  /* Guided search space — proposed from the load, the connection, the resource
+     and the land, then adjusted by any override entered on the tab. */
+  const windAnnualMWhPerMW = useMemo(() => {
+    let e = 0; const g = buildWindGen(windSpeed, temp, { ...res.wind, ratedKW: 1000 });
+    for (let i = 0; i < H; i++) e += g[i];
+    return e / 1000; // MWh per year per MW installed
+  }, [windSpeed, temp, res.wind]);
+
+  const proposedSpace = useMemo(() => proposeSearchSpace({
+    load, stats, pvUnit,
+    windAnnualMWhPerMW, windMean: numz(loc.windMean_m_s_100m) || 0,
+    gridEnabled: dispatchInputs.grid.enabled, importCapKW: effectiveImportCapKW,
+    parasiticKW: parasiticKWval,
+    islanded: (ctx.islanding !== "none" && ctx.islanding !== "") || ctx.gridStatus === "none"
+      || (mode === "aidc" && aidc.gridStrategy === "offgrid"),
+    islandLoadKW: stats.peakKW * numz(char.critPct) / 100 + parasiticKWval,
+    landCapKWp: maxPVfromLandKWp,
+    bessCapMW: mode === "aidc" && aidcOut && aidcOut.maxBessMW > 0 ? aidcOut.maxBessMW : 0,
+    engineCapMW: mode === "aidc" && aidcOut && aidcOut.maxEngineMW > 0 ? aidcOut.maxEngineMW : 0,
+    engineUnitKW: numz(sweep.gEngineUnitKW) || numz(res.engine.unitKW) || 1600,
+    mode,
+    exportCapKW: numz(ctx.exportCapKW), dcacRatio: numz(res.pv.dcacRatio) || 1.2,
+    windCapexEURperKW: numz(costs.WIND_EUR_PER_KW), windOMEURperKWyr: numz(costs.OM_WIND_EUR_PER_KW_YR),
+    deliveredGridEURperMWh: (numz(loc.importTariff_EUR_per_MWh) || 0) + (numz(loc.gridFee_EUR_per_MWh) || 0),
+    discountPct: numz(ctx.discountPct), lifeYears: numz(ctx.lifeYears),
+  }), [load, stats, pvUnit, windAnnualMWhPerMW, loc, dispatchInputs.grid.enabled, effectiveImportCapKW,
+    parasiticKWval, ctx, mode, aidc, char.critPct, maxPVfromLandKWp, aidcOut, sweep.gEngineUnitKW, res.engine.unitKW,
+    costs.WIND_EUR_PER_KW, costs.OM_WIND_EUR_PER_KW_YR]);
+
+  /* The space the search actually runs on: the proposal with overrides applied.
+     An override moves the bound; the coarse levels are re-clipped to it. */
+  const guidedSpace = useMemo(() => {
+    const p = proposedSpace;
+    const ovr = (on, def) => (on === null || on === undefined ? def : on);
+    const cap = (v, ovrMax) => (numz(ovrMax) > 0 ? Math.min(v, numz(ovrMax)) : v);
+    const pvMax = numz(sweep.gPvMaxMWp) > 0 ? numz(sweep.gPvMaxMWp) * 1000 : p.pv.maxKWp;
+    const windMax = numz(sweep.gWindMaxMW) > 0 ? numz(sweep.gWindMaxMW) * 1000 : p.wind.maxKW;
+    const bessMax = numz(sweep.gBessMaxMW) > 0 ? numz(sweep.gBessMaxMW) * 1000 : p.bess.maxKW;
+    return {
+      pv: { ...p.pv, include: ovr(sweep.gPvOn, p.pv.include), maxKWp: pvMax,
+        levelsKWp: [...new Set(p.pv.levelsKWp.map((v) => Math.min(v, pvMax)))] },
+      wind: { ...p.wind, include: ovr(sweep.gWindOn, p.wind.include), maxKW: windMax,
+        levelsKW: [...new Set(p.wind.levelsKW.map((v) => Math.min(v, windMax)))] },
+      bess: { ...p.bess, include: ovr(sweep.gBessOn, p.bess.include), maxKW: bessMax,
+        levelsKW: [...new Set(p.bess.levelsKW.map((v) => Math.min(v, bessMax)))] },
+      engine: { ...p.engine, include: ovr(sweep.gEngineOn, p.engine.include) },
+    };
+  }, [proposedSpace, sweep.gPvOn, sweep.gWindOn, sweep.gBessOn, sweep.gEngineOn,
+    sweep.gPvMaxMWp, sweep.gWindMaxMW, sweep.gBessMaxMW]);
+
+  const guidedCoarseCount = useMemo(() => {
+    const g = guidedSpace;
+    const pv = g.pv.include ? g.pv.levelsKWp.length : 1;
+    const wi = g.wind.include ? g.wind.levelsKW.length : 1;
+    const beNZ = g.bess.include ? g.bess.levelsKW.filter((v) => v > 0).length : 0;
+    const be = 1 + beNZ * (g.bess.include ? g.bess.durationsH.length : 0);
+    const en = g.engine.include ? g.engine.levels.length : 1;
+    return pv * wi * be * en;
+  }, [guidedSpace]);
+
+  const runGuided = async () => {
+    setSweeping(true); setSweepPct(0);
+    await new Promise((r) => setTimeout(r, 30)); // let the running state paint before the work starts
+    const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const unitKW = numz(sweep.gEngineUnitKW) || numz(res.engine.unitKW) || 1600;
+    const evalMerit = makeCandidateEvaluator("merit", unitKW);
+    const evalOpt = res.dispatchMode === "optimised" ? makeCandidateEvaluator("optimised", unitKW) : null;
+    const out = await autoSizeGuided({
+      space: guidedSpace, evaluate: evalMerit, evaluateOpt: evalOpt,
+      tick: () => new Promise((r) => setTimeout(r, 0)),
+      onProgress: (pct) => setSweepPct(pct),
+    });
+    out.failCounts = { energy: 0, power: 0, dynamic: 0 };
+    out.all.forEach((r) => {
+      if (r.energy === "FAIL") out.failCounts.energy++;
+      if (r.power === "FAIL") out.failCounts.power++;
+      if (r.dynamic === "FAIL") out.failCounts.dynamic++;
+    });
+    const contributions = assetContribution(out.all, out.best, guidedSpace);
+    const ms = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+    setSweepOut({ ...out, kind: "guided", contributions, space: guidedSpace, unitKW, ms,
+      method: evalOpt ? "merit-order screening, shortlist re-priced under optimisation" : "merit order" });
+    setSweeping(false);
+  };
+
   const runAutoSize = () => {
     setSweeping(true);
     // The search uses the same method as the headline run, so the ranking it
@@ -3904,49 +4679,9 @@ export default function MicrogridDesignTool() {
     // free to test sizes for assets that are currently switched off. Inclusion
     // is controlled here, not by the Equipment toggles.
     const bounds = sweepBounds();
-    // Generation profile depends only on kWp, so build it once per PV size
-    // rather than once per combination.
-    const pvCache = new Map();
     const out = autoSize({
       bounds,
-      evaluate: (c) => {
-        if (!pvCache.has(c.kWp)) {
-          pvCache.set(c.kWp, c.kWp > 0 ? buildPVGen(pvUnit, { ...res.pv, enabled: true, kWp: c.kWp }, simYear).gen : new Float32Array(H));
-        }
-        const pvGen = pvCache.get(c.kWp);
-        const windGenC = c.windKW > 0 ? buildWindGen(windSpeed, temp, { ...res.wind, ratedKW: c.windKW }) : new Float32Array(H);
-        const overrides = {
-          pvGen, windGen: windGenC,
-          bess: { ...dispatchInputs.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
-          engine: { ...dispatchInputs.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
-            minStableLoadPct: numz(res.engine.minStableLoadPct) || CONSTANTS.ENGINE_MIN_STABLE_LOAD_PCT,
-            annualHourLimit: numz(res.engine.annualHourLimit) || CONSTANTS.HOURS_PER_YEAR,
-            fuelType: res.engine.fuelType || "diesel" },
-        };
-        const inpC = withWear({ ...dispatchInputs, ...overrides });
-        const { disp: d } = dispatchFor(inpC);
-        const { adeq: ad } = evaluateDesign(inpC, { forcedBatteryResult: d });
-        // Costed from the sanitised copy, exactly as the headline run is, so a
-        // blank field cannot price differently in the two places.
-        const resVariant = {
-          ...resN, pv: { ...resN.pv, enabled: c.kWp > 0, kWp: c.kWp },
-          wind: { ...resN.wind, enabled: c.windKW > 0, ratedKW: c.windKW },
-          bess: { ...resN.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
-          engine: { ...resN.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
-            fuelType: resN.engine.fuelType || "diesel" },
-        };
-        const cst = computeCosts({ res: resVariant, ctx: ctxN, loc, disp: d, price, costs, itEnergyMWh,
-          gridEnabled: gridForBom.enabled, firmCapKW: gridForBom.firmCapKW });
-        const feasible = ad.energy.verdict !== "FAIL" && ad.power.verdict !== "FAIL" && ad.dynamic.verdict !== "FAIL";
-        return {
-          lcoe: +cst.lcoeFacility.toFixed(1),
-          renewablePct: +(d.summary.renewableFraction * 100).toFixed(1),
-          unservedMWh: +d.summary.unservedMWh.toFixed(2),
-          fuelDisplay: res.engine.fuelType === "diesel" ? d.summary.fuelLitres / 1000 : d.summary.fuelMWhTh,
-          energy: ad.energy.verdict, power: ad.power.verdict, dynamic: ad.dynamic.verdict, feasible,
-          method: useOptimiser ? "optimised" : "merit",
-        };
-      },
+      evaluate: makeCandidateEvaluator(useOptimiser ? "optimised" : "merit", sweepUnitKW),
     });
     out.failCounts = { energy: 0, power: 0, dynamic: 0 };
     out.all.forEach((r) => {
@@ -3964,12 +4699,13 @@ export default function MicrogridDesignTool() {
     // The sweep priced this design with the method selected at the time; keep it
     // selected so the run that follows reproduces the same number.
     if (c.method) setRes((s2) => ({ ...s2, dispatchMode: c.method === "optimised" ? "optimised" : "merit" }));
+    const unitKW = (sweepOut && sweepOut.kind === "guided" && sweepOut.unitKW) ? sweepOut.unitKW : sweepUnitKW;
     setRes((s2) => ({
       ...s2,
       pv: { ...s2.pv, enabled: c.kWp > 0, kWp: c.kWp },
       wind: { ...s2.wind, enabled: (c.windKW || 0) > 0, ratedKW: c.windKW || 0 },
       bess: { ...s2.bess, enabled: c.bessKW > 0, powerKW: c.bessKW, energyKWh: c.bessKWh },
-      engine: { ...s2.engine, enabled: c.units > 0, units: c.units, unitKW: sweepUnitKW,
+      engine: { ...s2.engine, enabled: c.units > 0, units: c.units, unitKW,
         fuelType: s2.engine.fuelType || "diesel" },
     }));
     setAutoRun(true);
@@ -5282,6 +6018,132 @@ export default function MicrogridDesignTool() {
                 && " Optimisation is selected but there is no battery to optimise, so the merit order was used."}
             </div>
 
+            {/* Dispatch calibration — merit vs optimum, forecast value, battery duty */}
+            <div className={`mt-3 rounded border ${T.tile}`}>
+              <div className={`flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1.5 ${T.rule}`}>
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Dispatch calibration</span>
+                <div className="flex items-center gap-2">
+                  {calib && <Badge v={(!calib.battery.available || calib.battery.clean) ? "PASS" : "MARGINAL"} />}
+                  <button onClick={runCalibration} disabled={!!calibBusy}
+                    className={`rounded border px-2 py-1 text-xs ${T.btn} ${calibBusy ? "opacity-60" : ""}`}>
+                    {calibBusy ? `Running — ${calibBusy}…` : calib ? "Run the calibration again" : "Run the calibration"}
+                  </button>
+                </div>
+              </div>
+              <div className="p-2">
+                <div className={`mb-2 text-xs ${T.muted}`}>
+                  Three measured answers: what the merit order leaves against the optimiser on this design; how much of that
+                  edge survives a realistic forecast, since the optimised schedule is built before the day while the merit
+                  order reacts to what actually happens; and whether the battery duty is consistent with the warranty and the
+                  wear-cost assumption. Runs the optimiser up to twice — expect a few seconds.
+                </div>
+
+                {!calib && !calibBusy && (
+                  <div className={`text-xs ${T.faint}`}>Not run yet for this configuration.</div>
+                )}
+
+                {calib && (<>
+                  {/* 1 — merit against the optimum */}
+                  <div className={`mb-1 text-xs font-semibold ${T.head}`}>Merit order against the optimum — variable operating cost, expected year</div>
+                  {!calib.gap.available && <div className={`mb-3 text-xs ${T.faint}`}>{calib.gap.reason}</div>}
+                  {calib.gap.available && (<>
+                    <table className="mb-1 w-full text-left font-mono text-xs">
+                      <thead>
+                        <tr className={T.faint}>
+                          <th className="px-1 py-0.5 font-normal">Cost component, k€/yr</th>
+                          <th className="px-1 py-0.5 text-right font-normal">Merit order</th>
+                          <th className="px-1 py-0.5 text-right font-normal">Optimised</th>
+                          <th className="px-1 py-0.5 text-right font-normal">Difference</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[["Import energy", "energy"], ["Engine fuel", "fuel"], ["Demand charge", "demand"], ["Export revenue", "exportRev"], ["Variable operating cost", "total"]].map(([lbl, k]) => {
+                          const sign = k === "exportRev" ? -1 : 1;
+                          const m = sign * calib.gap.merit[k], o = sign * calib.gap.opt[k];
+                          return (
+                            <tr key={k} className={`border-b ${T.divide} ${k === "total" ? "font-semibold" : ""}`}>
+                              <td className={`px-1 py-0.5 ${k === "total" ? T.title : T.muted}`}>{lbl}{k === "exportRev" ? " (credit)" : ""}</td>
+                              <td className="px-1 py-0.5 text-right">{fmt(m / 1000, 1)}</td>
+                              <td className="px-1 py-0.5 text-right">{fmt(o / 1000, 1)}</td>
+                              <td className={`px-1 py-0.5 text-right ${k === "total" ? (m - o >= 0 ? T.tone.emerald : T.tone.amber) : T.faint}`}>{fmt((m - o) / 1000, 1)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    <p className={`mb-3 text-xs ${T.faint}`}>
+                      The optimiser saves {fmt(calib.gap.gapEUR / 1000, 1)} k€/yr ({fmt(calib.gap.gapPct, 1)} % of the merit order's
+                      variable cost) on this design and year. For scale: the day-spread ceiling on arbitrage is
+                      {" "}{fmt(calib.gap.arbitrageCeilingEUR / 1000, 1)} k€/yr, the peak-shaving headroom is worth
+                      {" "}{fmt(calib.gap.peakGapEUR / 1000, 1)} k€/yr, and the floor with free lossless storage would be
+                      {" "}{fmt(calib.gap.boundEUR / 1000, 1)} k€/yr of supply cost. The optimiser held the import ceiling at
+                      {" "}{fmt((calib.gap.optCeilingKW || 0) / 1000, 2)} MW for the demand charge.
+                    </p>
+                  </>)}
+
+                  {/* 2 — value of the forecast */}
+                  <div className={`mb-1 text-xs font-semibold ${T.head}`}>Value of the forecast — the same design on a year that departs from the forecast</div>
+                  {!calib.forecast.available && <div className={`mb-3 text-xs ${T.faint}`}>Requires a battery — see above.</div>}
+                  {calib.forecast.available && (<>
+                    <table className="mb-1 w-full text-left font-mono text-xs">
+                      <tbody>
+                        <tr className={`border-b ${T.divide}`}>
+                          <td className={`px-1 py-0.5 ${T.muted}`}>Optimised with perfect knowledge of the outturn</td>
+                          <td className="px-1 py-0.5 text-right">{fmt(calib.forecast.perfect.total / 1000, 1)} k€/yr</td>
+                        </tr>
+                        <tr className={`border-b ${T.divide}`}>
+                          <td className={`px-1 py-0.5 ${T.muted}`}>Day-ahead optimised schedule, executed on the outturn</td>
+                          <td className="px-1 py-0.5 text-right">{fmt(calib.forecast.scheduled.total / 1000, 1)} k€/yr</td>
+                        </tr>
+                        <tr className={`border-b ${T.divide}`}>
+                          <td className={`px-1 py-0.5 ${T.muted}`}>Merit order reacting to the outturn</td>
+                          <td className="px-1 py-0.5 text-right">{fmt(calib.forecast.meritOut.total / 1000, 1)} k€/yr</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <p className={`mb-1 text-xs ${T.faint}`}>
+                      Forecast error costs the optimiser {fmt(calib.forecast.forecastCostEUR / 1000, 1)} k€/yr against perfect
+                      information. The merit order, which needs no forecast, gives up {fmt(calib.forecast.meritRegretEUR / 1000, 1)} k€/yr.
+                      {" "}{calib.forecast.optimiserEdgeEUR >= 0
+                        ? `The optimised schedule keeps a net edge of ${fmt(calib.forecast.optimiserEdgeEUR / 1000, 1)} k€/yr under this forecast error.`
+                        : `Under this forecast error the merit order beats the frozen optimised schedule by ${fmt(-calib.forecast.optimiserEdgeEUR / 1000, 1)} k€/yr — feedback is worth more than foresight here, and the optimised LCOE should be read as an upper bound on what operations can capture.`}
+                    </p>
+                    <p className={`mb-3 text-xs ${T.ghost}`}>
+                      Stress assumptions, one sigma, day-correlated: PV ±{calib.forecast.sigma.pv} %, wind ±{calib.forecast.sigma.wind} %,
+                      load ±{calib.forecast.sigma.load} %, price level ±{calib.forecast.sigma.priceDay} % of mean with
+                      ±{calib.forecast.sigma.priceHour} % hourly shape error. Fixed seed {calib.forecast.sigma.seed} — the stress is
+                      reproducible, not a Monte-Carlo. Constants in CONSTANTS.CALIBRATION.
+                    </p>
+                  </>)}
+
+                  {/* 3 — battery duty */}
+                  <div className={`mb-1 text-xs font-semibold ${T.head}`}>Battery duty against warranty and wear assumptions</div>
+                  {!calib.battery.available && <div className={`text-xs ${T.faint}`}>{calib.battery.reason}</div>}
+                  {calib.battery.available && (<>
+                    <div className="mb-2 grid grid-cols-2 gap-2 md:grid-cols-4">
+                      <Stat label="Equivalent full cycles" value={fmt(calib.battery.efc, 0)} unit="/yr" tone="cyan" />
+                      <Stat label="Warranty cycle budget" value={fmt(calib.battery.budgetCyclesPerYr, 0)} unit="/yr" />
+                      <Stat label="Discharge throughput" value={fmt(calib.battery.dischargeMWh, 0)} unit="MWh/yr" />
+                      <Stat label="Cycle allowance lasts" value={isFinite(calib.battery.yearsToExhaust) ? fmt(calib.battery.yearsToExhaust, 1) : "—"} unit="yr" tone={calib.battery.yearsToExhaust < CONSTANTS.CALIBRATION.WARRANTY_YEARS ? "amber" : "emerald"} />
+                    </div>
+                    <table className="w-full text-left font-mono text-xs">
+                      <tbody>
+                        {calib.battery.findings.map((f, i) => (
+                          <tr key={i} className={`border-b ${T.divide}`}>
+                            <td className="px-1 py-0.5 w-12"><Badge v={f.good ? "PASS" : "MARGINAL"} /></td>
+                            <td className={`px-1 py-0.5 ${T.title}`}>{f.name}</td>
+                            <td className={`px-1 py-0.5 text-right ${f.good ? T.tone.emerald : T.tone.amber}`}>{f.value}</td>
+                            <td className={`px-1 py-0.5 ${T.faint}`}>{f.note}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>)}
+                </>)}
+              </div>
+            </div>
+
+
             {detail.dispatch === "detail" && (
             <div className={`mb-2 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
               Order every hour: renewables → grid import to the cap → battery above the reserve → engines at or above minimum
@@ -5859,12 +6721,108 @@ export default function MicrogridDesignTool() {
           {tab === 10 && (
             <Panel title="Auto-size" step="11" sub="ranked search for a lower-cost compliant design">
               <div className={`mb-3 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
-                Every combination below is run through the same hourly dispatch and the same three adequacy checks.
-                Anything that fails a check is discarded. What survives is ranked by LCOE — but the scatter matters more than
-                the ranking, because the cheapest design is rarely the one you want once renewable fraction and fuel are on the table.
-                {mode === "aidc" && " In AIDC mode the land, import and permit limits are applied as hard bounds, and every ramp year must pass."}
+                Every candidate is run through the same hourly dispatch and the same three adequacy checks as the headline
+                design. Anything that fails a check is discarded; what survives is ranked by LCOE, with the trade-off against
+                renewable fraction and capital cost shown alongside — the scatter matters as much as the winner.
+                {mode === "aidc" && " In AIDC mode the land, import and permit limits are applied as hard bounds."}
               </div>
 
+              <div className="mb-3 flex flex-wrap items-center gap-3">
+                <span className={`text-xs font-semibold ${T.title}`}>Search method</span>
+                <Seg value={sweep.mode === "manual" ? "manual" : "guided"}
+                  onChange={(v) => setSweep((s2) => ({ ...s2, mode: v }))}
+                  options={[{ value: "guided", label: "Guided — ranges proposed from the project" },
+                    { value: "manual", label: "Manual ranges" }]} />
+              </div>
+
+              {sweep.mode !== "manual" && (<>
+                <div className={`mb-2 flex items-center gap-2 rounded px-2 py-1 ${T.soft.cyan}`}>
+                  <span className={`rounded-full px-2 font-mono text-xs ${T.chip}`}>1</span>
+                  <span className={`text-sm font-semibold ${T.head}`}>Search space — derived from the project</span>
+                </div>
+                <div className={`mb-2 rounded border px-2 py-2 text-xs ${T.soft.cyan} ${T.muted}`}>
+                  The ranges below are proposed from the load, the connection, the resource and the land — each bound is a
+                  named anchor, so every tested size has a reason. Override a bound or an inclusion where the project
+                  knows better; zero stays in every range, so "none of this asset" is always among the candidates.
+                </div>
+                <Trace lines={[
+                  { label: "PV load-match capacity", expr: `${fmt(stats.annualMWh, 0)} MWh/yr ÷ ${fmt(proposedSpace.pv.loadMatchKWp > 0 ? stats.annualMWh * 1000 / proposedSpace.pv.loadMatchKWp : 0, 0)} kWh/kWp`, result: `${fmt(proposedSpace.pv.loadMatchKWp / 1000, 1)} MWp` },
+                  { label: "PV search scale", expr: `min(load-match, busbar absorption: peak + auxiliaries + export capacity + storage power, × DC/AC ratio)`, result: `${fmt(proposedSpace.pv.scaleKWp / 1000, 1)} MWp` },
+                  { label: "PV hard bound", expr: proposedSpace.pv.boundBy, result: `${fmt(guidedSpace.pv.maxKWp / 1000, 1)} MWp` },
+                  { label: "Storage anchor — connection shortfall", expr: `peak + auxiliaries − import capacity`, result: proposedSpace.bess.anchors.deficitKW > 0 ? `${fmt(proposedSpace.bess.anchors.deficitKW / 1000, 1)} MW` : "none — the connection covers the peak" },
+                  { label: "Storage anchor — peak shaving depth", expr: `peak − P${fmt(CONSTANTS.AUTOSIZE.SHAVE_QUANTILE * 100, 0)} of the load duration curve`, result: `${fmt(proposedSpace.bess.anchors.shaveKW / 1000, 1)} MW` },
+                  { label: "Storage anchor — PV surplus absorption", expr: `P${fmt(CONSTANTS.AUTOSIZE.SURPLUS_POWER_QUANTILE * 100, 0)} of hourly PV surplus at load-match capacity`, result: `${fmt(proposedSpace.bess.anchors.surplusKW / 1000, 1)} MW · median surplus ${fmt(proposedSpace.bess.medianDailySurplusMWh, 1)} MWh/day` },
+                  { label: "Engine requirement", expr: proposedSpace.engine.reason, result: proposedSpace.engine.needUnits > 0 ? `${proposedSpace.engine.needUnits} × ${fmt(proposedSpace.engine.unitKW, 0)} kW` : "not proposed" },
+                  { label: "Wind resource screening", expr: proposedSpace.wind.reason, result: proposedSpace.wind.include || sweep.gWindOn ? `load-match ${fmt(proposedSpace.wind.loadMatchKW / 1000, 1)} MW` : "excluded by default" },
+                ]} />
+                <div className="mt-2 grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Field tier="critical" label="Solar PV" source="site" unit="axis inclusion"
+                    explain="Whether PV sizes are searched. The bound comes from the land available or the over-build limit; override it below.">
+                    <Sel value={guidedSpace.pv.include ? "yes" : "no"} prompt={null}
+                      onChange={(v) => setSweep((s2) => ({ ...s2, gPvOn: v === "yes" }))}
+                      options={[{ value: "yes", label: "Searched" }, { value: "no", label: "Excluded" }]} />
+                  </Field>
+                  {guidedSpace.pv.include && (
+                    <Field tier="advanced" label="PV upper bound override" source="site" unit="MWp — blank uses the proposal">
+                      <Num value={sweep.gPvMaxMWp} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, gPvMaxMWp: v }))} />
+                    </Field>
+                  )}
+                  <Field tier="critical" label="Battery storage" source="site" unit="axis inclusion"
+                    explain="Whether storage sizes are searched. Power levels come from the three anchors above; durations tested are the standard set.">
+                    <Sel value={guidedSpace.bess.include ? "yes" : "no"} prompt={null}
+                      onChange={(v) => setSweep((s2) => ({ ...s2, gBessOn: v === "yes" }))}
+                      options={[{ value: "yes", label: "Searched" }, { value: "no", label: "Excluded" }]} />
+                  </Field>
+                  {guidedSpace.bess.include && (
+                    <Field tier="advanced" label="Storage power bound override" source="site" unit="MW — blank uses the proposal">
+                      <Num value={sweep.gBessMaxMW} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, gBessMaxMW: v }))} />
+                    </Field>
+                  )}
+                  <Field tier="critical" label="Wind" source="site" unit="axis inclusion"
+                    explain="Wind is proposed only where the resource clears the screening threshold; override to force it in or out.">
+                    <Sel value={guidedSpace.wind.include ? "yes" : "no"} prompt={null}
+                      onChange={(v) => setSweep((s2) => ({ ...s2, gWindOn: v === "yes" }))}
+                      options={[{ value: "no", label: "Excluded" }, { value: "yes", label: "Searched" }]} />
+                  </Field>
+                  {guidedSpace.wind.include && (
+                    <Field tier="advanced" label="Wind upper bound override" source="site" unit="MW — blank uses the proposal">
+                      <Num value={sweep.gWindMaxMW} step={0.5} onChange={(v) => setSweep((s2) => ({ ...s2, gWindMaxMW: v }))} />
+                    </Field>
+                  )}
+                  <Field tier="critical" label="Engine generation" source="site" unit="axis inclusion"
+                    explain="Engines are proposed only where a firm shortfall exists — a connection gap or an islanding duty.">
+                    <Sel value={guidedSpace.engine.include ? "yes" : "no"} prompt={null}
+                      onChange={(v) => setSweep((s2) => ({ ...s2, gEngineOn: v === "yes" }))}
+                      options={[{ value: "no", label: "Excluded" }, { value: "yes", label: "Searched" }]} />
+                  </Field>
+                  {guidedSpace.engine.include && (
+                    <Field tier="advanced" label="Engine unit rating" source="site" unit="kW each — blank uses the Equipment tab value">
+                      <Num value={sweep.gEngineUnitKW} step={100} onChange={(v) => setSweep((s2) => ({ ...s2, gEngineUnitKW: v }))} />
+                    </Field>
+                  )}
+                </div>
+
+                <div className={`mt-4 mb-2 flex flex-wrap items-center gap-3 rounded px-2 py-2 ${T.soft.cyan}`}>
+                  <span className={`rounded-full px-2 font-mono text-xs ${T.chip}`}>2</span>
+                  <span className={`text-sm font-semibold ${T.head}`}>Run the search</span>
+                  <button onClick={runGuided} disabled={sweeping}
+                    className={`rounded border px-4 py-1.5 text-sm font-medium ${sweeping ? T.chipIdle : T.chipAlert}`}>
+                    {sweeping ? "Searching…" : sweepOut ? "Search again" : "Search"}
+                  </button>
+                  <span className={`text-xs ${T.faint}`}>
+                    {sweepOut && sweepOut.kind === "guided"
+                      ? `${sweepOut.coarseTried} coarse + ${sweepOut.refineTried} refinement candidates in the merit order${sweepOut.shortlisted ? `, ${sweepOut.shortlisted} re-priced under optimisation` : ""} — ${fmt(sweepOut.ms / 1000, 1)} s`
+                      : `≈ ${fmt(guidedCoarseCount, 0)} coarse candidates, then refinement around the leader, in the merit order${res.dispatchMode === "optimised" ? `; the ${CONSTANTS.AUTOSIZE.OPT_SHORTLIST} best designs are then re-priced under optimisation (adds roughly ${fmt(CONSTANTS.AUTOSIZE.OPT_SHORTLIST * 2, 0)} s)` : ""}.`}
+                  </span>
+                  {sweeping && (
+                    <div className={`h-1.5 w-40 overflow-hidden rounded ${T.tile}`}>
+                      <div className="h-full rounded bg-cyan-500 transition-all" style={{ width: `${Math.round(sweepPct * 100)}%` }} />
+                    </div>
+                  )}
+                </div>
+              </>)}
+
+              {sweep.mode === "manual" && (<>
               <div className={`mb-2 flex items-center gap-2 rounded px-2 py-1 ${T.soft.cyan}`}>
                 <span className={`rounded-full px-2 font-mono text-xs ${T.chip}`}>1</span>
                 <span className={`text-sm font-semibold ${T.head}`}>Define the search ranges</span>
@@ -5973,6 +6931,7 @@ export default function MicrogridDesignTool() {
                     : "Every combination is run through the same dispatch and the same three checks."}
                 </span>
               </div>
+              </>)}
 
               {sweepOut && (<>
                 <div className={`mb-2 mt-4 flex flex-wrap items-center gap-3 rounded px-2 py-2 ${T.soft.emerald}`}>
@@ -5989,11 +6948,51 @@ export default function MicrogridDesignTool() {
                   )}
                 </div>
                 <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">
-                  <Stat label="Combinations tried" value={fmt(sweepOut.tried, 0)} unit="" />
+                  <Stat label="Candidates evaluated" value={fmt(sweepOut.tried, 0)} unit="" />
                   <Stat label="Passed every check" value={fmt(sweepOut.feasible.length, 0)} unit="" tone={sweepOut.feasible.length ? "emerald" : "rose"} />
-                  <Stat label="Best LCOE" value={sweepOut.best ? fmt(sweepOut.best.lcoe, 1) : "—"} unit="€/MWh" tone="cyan" />
-                  <Stat label="Sweep time" value={fmt(sweepOut.ms, 0)} unit="ms" />
+                  <Stat label="Best LCOE" value={sweepOut.best ? fmt(sweepOut.best.lcoeOpt !== undefined ? sweepOut.best.lcoeOpt : sweepOut.best.lcoe, 1) : "—"} unit="€/MWh" tone="cyan" />
+                  <Stat label="Search time" value={fmt(sweepOut.ms / 1000, 1)} unit="s" />
                 </div>
+
+                {sweepOut.kind === "guided" && sweepOut.best && sweepOut.contributions && sweepOut.contributions.length > 0 && (
+                  <div className={`mt-3 rounded border ${T.tile}`}>
+                    <div className={`border-b px-2 py-1.5 text-xs font-semibold uppercase tracking-wide ${T.rule} ${T.title}`}>
+                      Design rationale — marginal contribution of each asset class
+                    </div>
+                    <div className="p-2">
+                      <table className="w-full text-left font-mono text-xs">
+                        <thead>
+                          <tr className={`border-b ${T.rule}`}>
+                            {["Asset class", "In design", "Rating", "Δ LCOE €/MWh", "Δ renewable pp", "Δ capex M€", "Assessment"].map((h) => (
+                              <th key={h} className={`px-1.5 py-1 ${T.faint}`}>{h}</th>))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sweepOut.contributions.map((c, i) => (
+                            <tr key={i} className={`border-b ${T.divide}`}>
+                              <td className={`px-1.5 py-0.5 ${T.title}`}>{c.label}</td>
+                              <td className={`px-1.5 py-0.5 ${c.inWinner ? T.tone.emerald : T.ghost}`}>{c.inWinner ? "yes" : "no"}</td>
+                              <td className="px-1.5 py-0.5">{c.size}</td>
+                              <td className={`px-1.5 py-0.5 ${c.deltaLCOE === null ? T.ghost : c.deltaLCOE >= 0 ? T.tone.emerald : T.tone.rose}`}>{c.deltaLCOE === null ? "—" : (c.deltaLCOE >= 0 ? "+" : "") + fmt(c.deltaLCOE, 1)}</td>
+                              <td className="px-1.5 py-0.5">{c.deltaRenew === null ? "—" : fmt(c.deltaRenew, 1)}</td>
+                              <td className="px-1.5 py-0.5">{c.deltaCapex === null ? "—" : fmt(c.deltaCapex, 2)}</td>
+                              <td className={`px-1.5 py-0.5 ${T.muted}`}>{c.note}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      <div className={`mt-1 text-xs ${T.faint}`}>
+                        Δ LCOE compares the selected design against the best compliant design that excludes the asset class
+                        entirely (or includes it, where the selected design excludes it) — positive means the selection pays.
+                        All comparisons on the merit-order screening basis, so they are like for like.
+                        {sweepOut.best.kWp >= sweepOut.space.pv.maxKWp - 100 && sweepOut.space.pv.boundBy === "land available" &&
+                          " PV sizing is bound by the land available, not by economics — more land would lower the LCOE further."}
+                        {sweepOut.best.unservedMWh > 0.5 &&
+                          ` The selected design leaves ${fmt(sweepOut.best.unservedMWh, 0)} MWh/yr unserved — read the energy adequacy detail before presenting it.`}
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {sweepOut.feasible.length === 0 && (
                   <div className={`mt-3 rounded border px-2 py-2 text-xs ${T.notice.warn}`}>
@@ -6031,27 +7030,35 @@ export default function MicrogridDesignTool() {
                 <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
                   <div>
                     <div className={`mb-1 text-xs ${T.faint}`}>
-                      Candidates ranked by LCOE. Designs that pass every check are listed first; the rest are still shown, with
+                      Candidates ranked by {sweepOut.shortlisted ? "the merit-order screening LCOE; the shortlist carries the optimised price alongside, and the selected design (highlighted) is the cheapest under optimisation" : "LCOE"}.
+                      Designs that pass every check are listed first; the rest are still shown, with
                       the check that fails, and any of them can be applied so the failure can be examined on the Reliability tab.
                     </div>
                     <div className={`max-h-72 overflow-auto rounded border ${T.tile}`}>
                       <table className="w-full text-right font-mono text-xs">
                         <thead className={`sticky top-0 ${T.panel}`}>
                           <tr className={`border-b ${T.rule}`}>
-                            {["#", "PV MWp", "Wind MW", "BESS MW", "MWh", "Gen", "LCOE €/MWh", "Renew %", "Checks", "Apply"].map((h) => (
+                            {["#", "PV MWp", "Wind MW", "BESS MW", "MWh", "Gen",
+                              sweepOut.shortlisted ? "LCOE screen" : "LCOE €/MWh",
+                              ...(sweepOut.shortlisted ? ["LCOE optimised"] : []),
+                              "Capex M€", "Renew %", "Checks", "Apply"].map((h) => (
                               <th key={h} className={`px-1.5 py-1 ${T.faint}`}>{h}</th>))}
                           </tr>
                         </thead>
                         <tbody>
                           {(sweepOut.ranked || sweepOut.feasible).slice(0, 15).map((r, i) => (
-                            <tr key={i} className={`border-b ${T.divide}`}>
+                            <tr key={i} title={r.why || ""} className={`border-b ${T.divide}`}>
                               <td className={`px-1.5 py-0.5 ${T.ghost}`}>{i + 1}</td>
                               <td className="px-1.5 py-0.5">{fmt(r.kWp / 1000, 1)}</td>
                               <td className="px-1.5 py-0.5">{fmt((r.windKW || 0) / 1000, 1)}</td>
                               <td className="px-1.5 py-0.5">{fmt(r.bessKW / 1000, 1)}</td>
                               <td className="px-1.5 py-0.5">{fmt(r.bessKWh / 1000, 1)}</td>
                               <td className="px-1.5 py-0.5">{r.units}</td>
-                              <td className={`px-1.5 py-0.5 ${i === 0 ? T.tone.cyan : ""}`}>{fmt(r.lcoe, 1)}</td>
+                              <td className={`px-1.5 py-0.5 ${sweepOut.best === r ? T.tone.cyan : ""}`}>{fmt(r.lcoe, 1)}</td>
+                              {sweepOut.shortlisted ? (
+                                <td className={`px-1.5 py-0.5 ${sweepOut.best === r ? T.tone.cyan : ""}`}>{r.lcoeOpt !== undefined ? fmt(r.lcoeOpt, 1) : "—"}</td>
+                              ) : null}
+                              <td className="px-1.5 py-0.5">{r.capexMEUR !== undefined ? fmt(r.capexMEUR, 1) : "—"}</td>
                               <td className={`px-1.5 py-0.5 ${T.tone.emerald}`}>{fmt(r.renewablePct, 1)}</td>
                               <td className={`px-1.5 py-0.5 ${r.feasible ? T.tone.emerald : T.tone.rose}`}>
                                 {r.feasible ? "pass" : [r.energy === "FAIL" && "energy", r.power === "FAIL" && "power",
