@@ -4944,7 +4944,7 @@ export default function MicrogridDesignTool() {
                 {!runOut ? "Run model" : stale ? "Inputs changed — run model again" : "Run model again"}
               </button>
               <span className={`rounded px-2 py-1 text-xs ${justRan ? `${T.chipOk} font-medium` : stale ? T.tone.amber : T.faint}`}>
-                {justRan ? `✓ Run complete — in ${fmt(dispatchMs, 0)}`
+                {justRan ? `✓ Run complete — in ${fmt(dispatchMs, 0)} ms`
                   : !runOut ? "not run yet"
                     : stale ? `last run ${runOut.at}`
                       : `last run ${runOut.at}`}
