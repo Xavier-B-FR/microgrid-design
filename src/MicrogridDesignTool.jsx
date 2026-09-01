@@ -277,6 +277,9 @@ export const CONSTANTS = {
      not a weather model: day-level errors are correlated within the day, the
      seed is fixed so two runs give the same answer, and every magnitude is
      visible here. */
+  HOURLY_MATCH_THRESHOLD_PCT: 80,       // %  share of each hour's consumption to be backed by renewables
+                                        //    (Spain, draft royal decree of 25 August 2026, data centres >= 1 MW)
+
   CALIBRATION: {
     PV_DAY_ERROR_PCT: 15,           // %    day-ahead PV energy error, one sigma, applied per day
     WIND_DAY_ERROR_PCT: 20,         // %    day-ahead wind energy error, one sigma, applied per day
@@ -1296,7 +1299,22 @@ function dispatch(cfg) {
   const sum = (a) => { let s = 0; for (let i = 0; i < H; i++) s += a[i]; return s; };
   const loadTotal = sum(load);
   // Renewable energy that reached the load, directly or through the battery.
-  const renewToLoadTotal = sum(out.pv) + sum(out.wind) - curtailRenewTotal - sum(out.exp);
+  // Round-trip losses are deducted: energy charged and never discharged, or lost
+  // to efficiency, never reaches the load and must not be counted as serving it.
+  // Without this the fraction can exceed 100 % once storage is large, which is
+  // how the omission first showed up. The total is then capped at the load,
+  // since renewable energy beyond the load is exported or curtailed, not consumed.
+  let bessChargeTotal = 0, bessDischargeTotal = 0;
+  for (let i = 0; i < H; i++) {
+    if (out.bess[i] < 0) bessChargeTotal -= out.bess[i]; else bessDischargeTotal += out.bess[i];
+  }
+  const bessLossTotal = Math.max(0, bessChargeTotal - bessDischargeTotal);
+  // Auxiliaries are consumption too, and renewable energy serves them, so they
+  // belong in the denominator. Omitting them inflates the share at high
+  // penetration, where nearly all of the auxiliary demand is renewable-served.
+  const consumptionTotal = loadTotal + sum(out.aux);
+  const renewToLoadTotal = Math.min(consumptionTotal,
+    sum(out.pv) + sum(out.wind) - curtailRenewTotal - sum(out.exp) - bessLossTotal);
   const engineHours = out.enginesOn.reduce((a, v) => a + (v > 0 ? 1 : 0), 0);
   const engineUnitHours = out.enginesOn.reduce((a, v) => a + v, 0);
   const reasonCount = new Array(REASON_CODES.length).fill(0);
@@ -1326,7 +1344,7 @@ function dispatch(cfg) {
       fuelLitres: sum(out.fuelL),
       fuelMWhTh: sum(out.fuelTh) / 1000,
       engineHours, engineUnitHours,
-      renewableFraction: loadTotal > 0 ? Math.max(0, renewToLoadTotal) / loadTotal : 0,
+      renewableFraction: consumptionTotal > 0 ? Math.max(0, renewToLoadTotal) / consumptionTotal : 0,
       curtailmentRate: (sum(out.pv) + sum(out.wind)) > 0 ? curtailRenewTotal / (sum(out.pv) + sum(out.wind)) : 0,
       curtailRenewMWh: curtailRenewTotal / 1000,
       curtailEngineMWh: (sum(out.curtail) - curtailRenewTotal) / 1000,
@@ -1902,6 +1920,77 @@ function dispatchDiagnostics(disp, inp, loc) {
     achievedPeakKW, achievablePeakKW, peakGapKW, peakGapEUR,
     arbitrageCeilingEUR, engineDumpMWh,
     clean: curtailedWithRoomKWh / 1000 < 0.1 && peakGapKW < 0.02 * Math.max(1, achievedPeakKW),
+  };
+}
+
+/**
+ * HOURLY RENEWABLE MATCHING — share of each hour's consumption backed by
+ * renewable generation, for the Spanish draft royal decree on data centres
+ * (80 % of every hour, from additional capacity). Pure function over the hourly
+ * arrays the dispatch already returns: nothing in the dispatch itself changes.
+ *
+ * Two readings are reported because the draft does not settle the question:
+ *   strict    — only generation produced in the same hour counts, so energy
+ *               discharged from the battery does not.
+ *   withStore — renewable energy stored earlier and discharged in this hour
+ *               counts, which is the reading the industry has asked for.
+ * Battery charging is attributed to renewable surplus first and to grid import
+ * only for the remainder, and the stored renewable share is carried forward.
+ */
+function hourlyRenewableMatch(disp, inp, thresholdPct) {
+  const thr = (thresholdPct === undefined ? 80 : thresholdPct) / 100;
+  const b = inp.bess;
+  const hasBess = b && b.enabled && b.energyKWh > 0;
+  let hoursMetStrict = 0, hoursMetStore = 0, loadTotal = 0;
+  let renewToLoadTotal = 0, storedRenewToLoadTotal = 0;
+  let worstStrict = 1, worstStore = 1;
+  // Renewable share of the energy currently held in the battery, 0..1
+  let storeRenewFrac = 0, storeKWh = hasBess ? b.energyKWh * b.startSocPct / 100 : 0;
+
+  for (let i = 0; i < H; i++) {
+    const load = inp.load[i];
+    const gen = (disp.pv[i] || 0) + (disp.wind[i] || 0);
+    const chargeKWh = Math.max(0, -(disp.bess[i] || 0));
+    const dischargeKWh = Math.max(0, disp.bess[i] || 0);
+
+    // Renewable generation actually serving load this hour
+    const spill = (disp.curtail[i] || 0) + (disp.exp[i] || 0);
+    const renewDirect = Math.max(0, Math.min(load, gen - spill - chargeKWh));
+
+    // Charging: renewable surplus first, grid for the remainder
+    const surplusAfterLoad = Math.max(0, gen - spill - load);
+    const chargeFromRenew = Math.min(chargeKWh, surplusAfterLoad);
+    if (hasBess && chargeKWh > 0) {
+      const newKWh = storeKWh + chargeKWh;
+      storeRenewFrac = newKWh > 0 ? (storeRenewFrac * storeKWh + chargeFromRenew) / newKWh : 0;
+      storeKWh = newKWh;
+    }
+    const renewFromStore = hasBess ? dischargeKWh * storeRenewFrac : 0;
+    if (hasBess && dischargeKWh > 0) storeKWh = Math.max(0, storeKWh - dischargeKWh);
+
+    const strict = load > 0 ? renewDirect / load : 1;
+    const withStore = load > 0 ? Math.min(1, (renewDirect + renewFromStore) / load) : 1;
+    if (strict >= thr - 1e-9) hoursMetStrict++;
+    if (withStore >= thr - 1e-9) hoursMetStore++;
+    if (strict < worstStrict) worstStrict = strict;
+    if (withStore < worstStore) worstStore = withStore;
+    loadTotal += load;
+    renewToLoadTotal += renewDirect;
+    // Capped at the hour's load: direct and stored renewable can both be
+    // present in the same hour, and energy beyond the load is exported or
+    // curtailed, not consumed, so it must not inflate the annual share.
+    storedRenewToLoadTotal += Math.max(0, Math.min(load, renewDirect + renewFromStore) - renewDirect);
+  }
+
+  return {
+    thresholdPct: thr * 100,
+    hoursMetStrict, hoursMetStore, hours: H,
+    pctHoursStrict: hoursMetStrict / H * 100,
+    pctHoursStore: hoursMetStore / H * 100,
+    annualPctStrict: loadTotal > 0 ? renewToLoadTotal / loadTotal * 100 : 0,
+    annualPctStore: loadTotal > 0 ? (renewToLoadTotal + storedRenewToLoadTotal) / loadTotal * 100 : 0,
+    worstHourPctStrict: worstStrict * 100,
+    worstHourPctStore: worstStore * 100,
   };
 }
 
@@ -4236,6 +4325,8 @@ export default function MicrogridDesignTool() {
 
   const stale = !runOut || runOut.sig !== runSig;
   const disp = runOut ? runOut.disp : null;
+  const hourlyMatch = useMemo(() => (runOut ? hourlyRenewableMatch(runOut.disp, withWear(dispatchInputs),
+    CONSTANTS.HOURLY_MATCH_THRESHOLD_PCT) : null), [runOut, dispatchInputs]);
   useEffect(() => { setCalib(null); setCalibBusy(""); }, [runOut ? runOut.sig : null]);
 
   const runCalibration = async () => {
@@ -4944,9 +5035,9 @@ export default function MicrogridDesignTool() {
                 {!runOut ? "Run model" : stale ? "Inputs changed — run model again" : "Run model again"}
               </button>
               <span className={`rounded px-2 py-1 text-xs ${justRan ? `${T.chipOk} font-medium` : stale ? T.tone.amber : T.faint}`}>
-                {justRan ? `✓ Run complete — in ${fmt(dispatchMs, 0)} ms`
+                {justRan ? `✓ Run complete — 8760 h in ${fmt(dispatchMs, 0)} ms${runOut && runOut.optimised ? ", optimised" : ""}, all checks passed`
                   : !runOut ? "not run yet"
-                    : stale ? `last run ${runOut.at}`
+                    : stale ? `last run ${runOut.at}, now out of date`
                       : `last run ${runOut.at}`}
               </span>
               <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} />
@@ -6016,6 +6107,36 @@ export default function MicrogridDesignTool() {
                 : "Merit order. Each hour is served in the fixed sequence set on the Microgrid tab, with no view of the hours ahead beyond the look-ahead rules."}
               {res.dispatchMode === "optimised" && runOut && !runOut.optimised
                 && " Optimisation is selected but there is no battery to optimise, so the merit order was used."}
+            </div>
+
+            {/* Hourly renewable matching — Spanish draft decree for data centres */}
+            <div className={`mt-3 rounded border ${T.tile}`}>
+              <div className={`flex flex-wrap items-center justify-between gap-2 border-b px-2 py-1.5 ${T.rule}`}>
+                <span className={`text-xs font-semibold uppercase tracking-wide ${T.title}`}>Hourly renewable matching</span>
+                <span className={`font-mono text-xs ${T.ghost}`}>threshold {fmt(hourlyMatch.thresholdPct, 0)} % of each hour</span>
+              </div>
+              <div className="p-2">
+                <div className="mb-2 grid grid-cols-2 gap-2 md:grid-cols-4">
+                  <Stat label="Hours meeting the threshold, stored renewables counted"
+                    value={fmt(hourlyMatch.pctHoursStore, 1)} unit="% of hours"
+                    tone={hourlyMatch.pctHoursStore >= 99.9 ? "emerald" : "amber"} />
+                  <Stat label="Hours meeting the threshold, same-hour generation only"
+                    value={fmt(hourlyMatch.pctHoursStrict, 1)} unit="% of hours"
+                    tone={hourlyMatch.pctHoursStrict >= 99.9 ? "emerald" : "amber"} />
+                  <Stat label="Renewable share of consumption, stored counted"
+                    value={fmt(hourlyMatch.annualPctStore, 1)} unit="% of MWh" />
+                  <Stat label="Worst hour, stored counted"
+                    value={fmt(hourlyMatch.worstHourPctStore, 0)} unit="%" />
+                </div>
+                <p className={`text-xs ${T.faint}`}>
+                  Spain's draft royal decree of 25 August 2026 would require data centres of 1 MW or more to back at least
+                  80 % of each hour's consumption with renewable generation produced in that same hour, from capacity
+                  commissioned no more than 18 months before start-up. The decree is a draft under consultation, not law.
+                  It does not settle whether renewable energy stored and discharged later counts, so both readings are shown:
+                  the strict one credits only same-hour generation, which no battery can satisfy at night. Charging is
+                  attributed to renewable surplus first and to import only for the remainder.
+                </p>
+              </div>
             </div>
 
             {/* Dispatch calibration — merit vs optimum, forecast value, battery duty */}
