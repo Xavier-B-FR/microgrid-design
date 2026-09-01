@@ -1305,7 +1305,7 @@ export const EXAMPLE_PROJECTS = {
             "scenarios": [],
             "lcoeBoundary": "facility",
             "projectName": "Demo 6 — AIDC 200 MW IT, Extremadura, surcharge for non-compliance",
-            "notes": "SCENARIO 2B — the Demo 5 design kept unchanged, with the non-compliance surcharge applied. The draft provides for surcharges of 100 % to 500 % on network tariffs and system charges depending on the size of the shortfall, plus monthly surcharges for failing hourly matching. This demo applies a central +200 % (grid fee 30 to 90 EUR/MWh, capacity charge 35 to 105 EUR/kW/yr), giving LCOE 146.53 EUR/MWh. Sensitivity: +100 % gives 121.53 and +500 % gives 221.51 EUR/MWh. Compliance (Demo 4, 199.6) is therefore cheaper than the surcharge only above roughly +410 %; below that, paying the surcharge is the cheaper commercial answer, which is the central finding of the comparison. The surcharge multiplier is an assumption, entered as a location override so it is visible and editable on the Location tab. AI data centre, 200 MW IT in a single phase, Badajoz (Extremadura). Facility load about 1 638 GWh/yr. The grid connection is deliberately left non-binding (320 MW import, 150 MW export) so the comparison isolates the sourcing rule and nothing else. Connection capex is set to zero in all three Extremadura demos, as the connection is treated as existing and identical, so it cannot bias the comparison. Backup generation is excluded for the same reason. Optimised dispatch, 8 % discount, 20 yr life, 2025 Spanish market prices and library costs with no scale discount on the 650 EUR/kWp PV price, which is conservative at gigawatt scale.",
+            "notes": "SCENARIO 2B \u2014 least-cost response to the rule by accepting the non-compliance surcharge instead of complying. The draft provides for surcharges of 100 % to 500 % on network tariffs and system charges depending on the size of the shortfall; this demo applies a central +200 % (grid fee 30 to 90 EUR/MWh, capacity charge 35 to 105 EUR/kW/yr), entered as a location override so it is visible and editable on the Location tab. The design is re-optimised under that tariff rather than carried over from Demo 5, which matters: the surcharge lifts delivered grid energy from 120 to 180 EUR/MWh, roughly doubling what local PV is worth and making storage pay for the first time. The result is 700 MWp PV with a 250 MW / 1 250 MWh battery at 138.4 EUR/MWh, against 146.5 for the un-resized Demo 5 design under the same surcharge. The optimum is flat between 600 and 800 MWp. Read against Demo 4 (full compliance, 199.6) and Demo 5 (before the rule, 96.5), this is the central result of the three Extremadura demos: the rule costs about 42 EUR/MWh at best, not the doubling implied by comparing compliance with the pre-rule baseline, and full compliance is the most expensive route available at any surcharge below about +410 %. Two caveats. If the surcharge scales with the shortfall rather than being flat, the optimum moves up towards 1 200 MWp, since this design covers only 46 % of hours. And the draft also allows access and connection rights to lapse after sustained breach, which is not a cost that can be carried in an LCOE.",
             "mode": "aidc",
             "ctx": {
                   "useCase": "cost",
@@ -1441,7 +1441,7 @@ export const EXAMPLE_PROJECTS = {
             "res": {
                   "pv": {
                         "enabled": true,
-                        "kWp": 350000,
+                        "kWp": 700000,
                         "dcacRatio": 1.2,
                         "soilingPct": 2,
                         "bifacialGainPct": 0,
@@ -1459,9 +1459,9 @@ export const EXAMPLE_PROJECTS = {
                         "availabilityPct": 96
                   },
                   "bess": {
-                        "enabled": false,
-                        "powerKW": 0,
-                        "energyKWh": 0,
+                        "enabled": true,
+                        "powerKW": 250000,
+                        "energyKWh": 1250000,
                         "cRate": 0.5,
                         "rtePct": 89,
                         "socMinPct": 5,
