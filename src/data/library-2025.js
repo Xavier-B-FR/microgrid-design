@@ -188,4 +188,3 @@ export const VRE_PENETRATION_2025 = {
   UK: { solar: 0.05, wind: 0.29 },
   OTHER: { solar: 0.08, wind: 0.10 },
 };
-
