@@ -73,6 +73,16 @@ export const LOCATION_LIBRARY = {
     gridCO2_g_per_kWh: 150, importTariff_EUR_per_MWh: 90, gridFee_EUR_per_MWh: 30,
     capacityCharge_EUR_per_kW_yr: 35, diesel_EUR_per_litre: 1.30, gas_EUR_per_MWh_th: 42,
   },
+  ES_EXTREMADURA: {
+    label: "Badajoz, Extremadura, Spain", country: "ES", lat: 38.88,
+    specificYield_kWh_per_kWp: 1820,
+    monthlyYieldShare: [5.2, 6.2, 8.8, 9.6, 11.0, 12.0, 12.9, 12.1, 9.7, 7.3, 5.3, 4.4],
+    tempMeanC: [9, 11, 14, 16, 20, 25, 28, 28, 24, 18, 13, 10],
+    diurnalSwingC: 14,
+    windMean_m_s_100m: 5.2, weibullK: 1.8,
+    gridCO2_g_per_kWh: 150, importTariff_EUR_per_MWh: 90, gridFee_EUR_per_MWh: 30,
+    capacityCharge_EUR_per_kW_yr: 35, diesel_EUR_per_litre: 1.30, gas_EUR_per_MWh_th: 42,
+  },
   SA_RIYADH: {
     label: "Riyadh, Saudi Arabia (sunbelt)", country: "SA", lat: 24.71,
     specificYield_kWh_per_kWp: 1750,
@@ -178,3 +188,4 @@ export const VRE_PENETRATION_2025 = {
   UK: { solar: 0.05, wind: 0.29 },
   OTHER: { solar: 0.08, wind: 0.10 },
 };
+
