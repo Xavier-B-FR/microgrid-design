@@ -1305,7 +1305,7 @@ export const EXAMPLE_PROJECTS = {
             "scenarios": [],
             "lcoeBoundary": "facility",
             "projectName": "Demo 6 — AIDC 200 MW IT, Extremadura, surcharge for non-compliance",
-            "notes": "SCENARIO 2B \u2014 least-cost response to the rule by accepting the non-compliance surcharge instead of complying. The draft provides for surcharges of 100 % to 500 % on network tariffs and system charges depending on the size of the shortfall; this demo applies a central +200 % (grid fee 30 to 90 EUR/MWh, capacity charge 35 to 105 EUR/kW/yr), entered as a location override so it is visible and editable on the Location tab. The design is re-optimised under that tariff rather than carried over from Demo 5, which matters: the surcharge lifts delivered grid energy from 120 to 180 EUR/MWh, roughly doubling what local PV is worth and making storage pay for the first time. The result is 700 MWp PV with a 250 MW / 1 250 MWh battery at 138.4 EUR/MWh, against 146.5 for the un-resized Demo 5 design under the same surcharge. The optimum is flat between 600 and 800 MWp. Read against Demo 4 (full compliance, 199.6) and Demo 5 (before the rule, 96.5), this is the central result of the three Extremadura demos: the rule costs about 42 EUR/MWh at best, not the doubling implied by comparing compliance with the pre-rule baseline, and full compliance is the most expensive route available at any surcharge below about +410 %. Two caveats. If the surcharge scales with the shortfall rather than being flat, the optimum moves up towards 1 200 MWp, since this design covers only 46 % of hours. And the draft also allows access and connection rights to lapse after sustained breach, which is not a cost that can be carried in an LCOE.",
+            "notes": "SCENARIO 2B \u2014 the Demo 5 design kept deliberately unchanged, with the non-compliance surcharge applied. The purpose is to isolate the cost of the penalty itself: same 350 MWp PV, no storage, same dispatch, so the only difference against Demo 5 is the tariff. LCOE 146.53 EUR/MWh against 96.54, i.e. the surcharge adds 50.0 EUR/MWh. HOW THE SURCHARGE IS APPLIED, AND HOW TO CHANGE IT: it is entered as a location override on two fields, visible and editable on the Location tab \u2014 grid fee raised from 30 to 90 EUR/MWh, and capacity charge from 35 to 105 EUR/kW/yr, both a factor of three on the library values for Badajoz. Edit either field to test another level; the energy tariff of 90 EUR/MWh is deliberately left untouched, since the draft penalises network charges and tolls rather than the commodity. The two components behave differently: the grid fee scales with energy imported and can be escaped by building generation, while the capacity charge scales with billed peak import and cannot. THE MULTIPLIER IS OUR ASSUMPTION, NOT A FIGURE FROM THE DRAFT. The draft describes escalating penalties on charges and tolls without published percentages, so every conclusion drawn from this demo is a sensitivity, not a result. Note also that a project facing this tariff would not keep the Demo 5 design: re-optimised under the same surcharge the best answer is about 700 MWp with a 250 MW / 1 250 MWh battery at 138.4 EUR/MWh. That is a separate question from the one this demo isolates.",
             "mode": "aidc",
             "ctx": {
                   "useCase": "cost",
@@ -1441,7 +1441,7 @@ export const EXAMPLE_PROJECTS = {
             "res": {
                   "pv": {
                         "enabled": true,
-                        "kWp": 700000,
+                        "kWp": 350000,
                         "dcacRatio": 1.2,
                         "soilingPct": 2,
                         "bifacialGainPct": 0,
@@ -1459,9 +1459,9 @@ export const EXAMPLE_PROJECTS = {
                         "availabilityPct": 96
                   },
                   "bess": {
-                        "enabled": true,
-                        "powerKW": 250000,
-                        "energyKWh": 1250000,
+                        "enabled": false,
+                        "powerKW": 0,
+                        "energyKWh": 0,
                         "cRate": 0.5,
                         "rtePct": 89,
                         "socMinPct": 5,
