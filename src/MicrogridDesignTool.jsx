@@ -3764,8 +3764,8 @@ function Seg({ value, onChange, options }) {
   return (
     <div className={`flex overflow-hidden rounded border ${T.btn}`}>
       {options.map((o) => (
-        <button key={o.value} onClick={() => onChange(o.value)}
-          className={`px-2 py-1 text-xs ${value === o.value ? T.btnOn : ""}`}>{o.label}</button>
+        <button key={o.value} onClick={() => onChange(o.value)} title={o.title || undefined}
+          className={`whitespace-nowrap px-2 py-1 text-xs ${value === o.value ? T.btnOn : ""}`}>{o.label}</button>
       ))}
     </div>
   );
@@ -3789,19 +3789,18 @@ export const TABS = [
   { n: 6,  title: "Costs",       sub: "electricity, equipment and fuel prices" },
   { n: 7,  title: "Microgrid",   sub: "objectives and dispatch logic" },
   { n: 8,  title: "Dispatch",    sub: "hourly operation of every asset" },
-  { n: 9,  title: "Reliability", sub: "adequacy assessment" },
+  { n: 9,  title: "Reliability", sub: "adequacy assessment and checks" },
   { n: 10, title: "LCOE",        sub: "levelised cost and its components" },
   { n: 11, title: "Auto-size",   sub: "ranked search for a lower-cost compliant design" },
   { n: 12, title: "Report",      sub: "requirement, solution and performance" },
   { n: 13, title: "Compare",     sub: "side-by-side design comparison" },
-  { n: 14, title: "Checks",      sub: "warnings and notes, never blockers" },
 ];
 
 export const TAB_STAGES = [
   { name: "Define", from: 0, to: 6 },
   { name: "Analyse", from: 7, to: 9 },
   { name: "Optimise", from: 10, to: 10 },
-  { name: "Report", from: 11, to: 13 },
+  { name: "Report", from: 11, to: 12 },
 ];
 
 export const SCENARIO_ROWS = [
@@ -5022,43 +5021,55 @@ export default function MicrogridDesignTool() {
         <div className="mx-auto max-w-7xl space-y-3">
 
           {/* Header */}
-          <header className={`flex flex-wrap items-end justify-between gap-3 border-b pb-3 ${T.rule}`}>
-            <div>
-              <h1 className={`text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
-              <p className={`text-xs ${T.faint}`}>Microgrid pre-feasibility study: sizing &amp; LCOE</p>
+          <header className={`flex items-end justify-between gap-3 border-b pb-3 ${T.rule}`}>
+            <div className="min-w-0">
+              <h1 className={`truncate text-lg font-semibold tracking-tight ${T.title}`}>Microgrid design tool</h1>
+              <p className={`truncate text-xs ${T.faint}`}>Pre-feasibility: sizing &amp; LCOE</p>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-nowrap items-center gap-2 overflow-x-auto">
               <Seg value={res.dispatchMode === "optimised" ? "optimised" : "merit"}
                 onChange={(v) => setRes((s2) => ({ ...s2, dispatchMode: v }))}
-                options={[{ value: "merit", label: "Merit order" }, { value: "optimised", label: "Optimisation" }]} />
-              <button onClick={runDispatch} className={`rounded border px-4 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
-                {!runOut ? "Run model" : stale ? "Inputs changed — run model again" : "Run model again"}
+                options={[{ value: "merit", label: "Merit", title: "Merit-order dispatch" },
+                          { value: "optimised", label: "Optimised", title: "Optimised dispatch" }]} />
+              <button onClick={runDispatch}
+                title={!runOut ? "Run the model" : stale ? "Inputs have changed since the last run — run the model again" : "Run the model again"}
+                className={`whitespace-nowrap rounded border px-3 py-1.5 text-sm font-medium ${stale ? T.chipAlert : T.btn}`}>
+                {!runOut ? "Run model" : stale ? "Rerun ●" : "Rerun"}
               </button>
-              <span className={`rounded px-2 py-1 text-xs ${justRan ? `${T.chipOk} font-medium` : stale ? T.tone.amber : T.faint}`}>
-                {justRan ? `✓ Run complete — 8760 h in ${fmt(dispatchMs, 0)} ms${runOut && runOut.optimised ? ", optimised" : ""}, all checks passed`
-                  : !runOut ? "not run yet"
-                    : stale ? `last run ${runOut.at}, now out of date`
-                      : `last run ${runOut.at}`}
+              <span title={justRan ? `Run complete: 8760 h simulated in ${fmt(dispatchMs, 0)} ms${runOut && runOut.optimised ? ", optimised dispatch" : ", merit-order dispatch"}, all checks passed`
+                  : !runOut ? "The model has not been run for these inputs"
+                    : stale ? `Last run at ${runOut.at}; inputs have changed since, so the results shown are out of date`
+                      : `Last run at ${runOut.at}`}
+                className={`whitespace-nowrap rounded px-2 py-1 font-mono text-xs ${justRan ? `${T.chipOk} font-medium` : stale ? T.tone.amber : T.faint}`}>
+                {justRan ? `✓ ${fmt(dispatchMs, 0)} ms`
+                  : !runOut ? "not run"
+                    : stale ? `${runOut.at} · stale`
+                      : runOut.at}
               </span>
-              <Seg value={themeKey} onChange={setThemeKey} options={[{ value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} />
-              <Seg value={density} onChange={setDensity} options={[{ value: "essential", label: "Essentials" }, { value: "full", label: "Advanced" }]} />
-              <Seg value={mode} onChange={setMode} options={[{ value: "standard", label: "Standard project" }, { value: "aidc", label: "AIDC" }]} />
+              <Seg value={themeKey} onChange={setThemeKey}
+                options={[{ value: "light", label: "☀", title: "Light theme" }, { value: "dark", label: "☾", title: "Dark theme" }]} />
+              <Seg value={density} onChange={setDensity}
+                options={[{ value: "essential", label: "Essentials", title: "Essential fields only" },
+                          { value: "full", label: "Advanced", title: "All fields, including advanced settings" }]} />
+              <Seg value={mode} onChange={setMode}
+                options={[{ value: "standard", label: "Standard", title: "Standard project" },
+                          { value: "aidc", label: "AIDC", title: "AI data centre project" }]} />
             </div>
           </header>
 
           {/* Step tabs */}
           <nav className={`rounded border p-1 ${T.panel}`}>
-            <div className="flex flex-wrap gap-3">
+            <div className="flex flex-nowrap items-center gap-2 overflow-x-auto">
               {TAB_STAGES.map((st) => (
-                <div key={st.name} className="flex items-center gap-1">
-                  <span className={`px-1 font-mono text-xs uppercase tracking-wide ${T.ghost}`}>{st.name}</span>
+                <div key={st.name} className="flex flex-nowrap items-center gap-0.5">
+                  <span className={`px-1 font-mono text-[10px] uppercase tracking-wide ${T.ghost}`} title={`${st.name} stage`}>{st.name}</span>
                   {TABS.slice(st.from, st.to + 1).map((t2, k) => {
                     const i = st.from + k;
                     return (
-                      <button key={t2.n} onClick={() => setTab(i)}
-                        className={`flex items-baseline gap-1.5 rounded px-2 py-1 text-xs ${tab === i ? T.btnOn : T.muted}`}>
+                      <button key={t2.n} onClick={() => setTab(i)} title={`${t2.n}. ${t2.title} — ${t2.sub}`}
+                        className={`flex items-baseline gap-1 whitespace-nowrap rounded px-1.5 py-1 text-xs ${tab === i ? T.btnOn : T.muted}`}>
                         <span className="font-mono">{t2.n}</span>
-                        <span className={tab === i ? "font-semibold" : ""}>{t2.title}</span>
+                        <span className={tab === i ? "font-semibold" : "hidden lg:inline"}>{t2.title}</span>
                       </button>
                     );
                   })}
@@ -6491,7 +6502,36 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= PHASE 3 — ADEQUACY ================= */}
-          {tab === 8 && !runOut && <NeedsRun />}
+          {tab === 8 && !runOut && (<>
+            <NeedsRun />
+            <Panel title="Checks" step="9b" sub="warnings and notes, never blockers"
+              right={
+                <div className="flex items-center gap-2">
+                  <span className={`rounded px-2 py-0.5 font-mono text-xs ${notices.some((n) => n.level === "warn") ? T.chipWarn : T.chipOk}`}>
+                    {notices.filter((n) => n.level === "warn").length} checks
+                  </span>
+                  <span className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chipIdle}`}>
+                    {notices.filter((n) => n.level === "info").length} notes
+                  </span>
+                  <Seg value={noticesOpen ? "open" : "closed"} onChange={(v) => setNoticesOpen(v === "open")}
+                    options={[{ value: "closed", label: "Reduce" }, { value: "open", label: "Expand" }]} />
+                </div>
+              }>
+              {notices.length === 0 ? (
+                <div className={`rounded border px-2 py-2 text-xs ${T.notice.info}`}>Nothing flagged for the current inputs.</div>
+              ) : noticesOpen ? (
+                <Notices items={notices} />
+              ) : (
+                <ul className="space-y-0.5">
+                  {notices.map((n, i) => (
+                    <li key={i} className={`truncate font-mono text-xs ${n.level === "warn" ? T.tone.amber : T.muted}`}>
+                      <span className="uppercase mr-2">{n.level === "warn" ? "check" : "note"}</span>{n.text}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Panel>
+          </>)}
           {tab === 8 && runOut && (<>
             <Panel title="Reliability" step="9" sub="adequacy assessment"
               right={<DetailToggle value={detail.reliability} onChange={(v) => setDetail((s2) => ({ ...s2, reliability: v }))} />}>
@@ -6603,6 +6643,34 @@ export default function MicrogridDesignTool() {
                   </div>
                 </div>
               </div>
+            </Panel>
+
+            <Panel title="Checks" step="9b" sub="warnings and notes, never blockers"
+              right={
+                <div className="flex items-center gap-2">
+                  <span className={`rounded px-2 py-0.5 font-mono text-xs ${notices.some((n) => n.level === "warn") ? T.chipWarn : T.chipOk}`}>
+                    {notices.filter((n) => n.level === "warn").length} checks
+                  </span>
+                  <span className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chipIdle}`}>
+                    {notices.filter((n) => n.level === "info").length} notes
+                  </span>
+                  <Seg value={noticesOpen ? "open" : "closed"} onChange={(v) => setNoticesOpen(v === "open")}
+                    options={[{ value: "closed", label: "Reduce" }, { value: "open", label: "Expand" }]} />
+                </div>
+              }>
+              {notices.length === 0 ? (
+                <div className={`rounded border px-2 py-2 text-xs ${T.notice.info}`}>Nothing flagged for the current inputs.</div>
+              ) : noticesOpen ? (
+                <Notices items={notices} />
+              ) : (
+                <ul className="space-y-0.5">
+                  {notices.map((n, i) => (
+                    <li key={i} className={`truncate font-mono text-xs ${n.level === "warn" ? T.tone.amber : T.muted}`}>
+                      <span className="uppercase mr-2">{n.level === "warn" ? "check" : "note"}</span>{n.text}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </Panel>
           </>)}
 
@@ -7582,36 +7650,6 @@ export default function MicrogridDesignTool() {
           )}
 
           {/* ================= CHECKS AND NOTES ================= */}
-          {tab === 13 && (
-            <Panel title="Checks" step="14" sub="warnings, never blockers"
-              right={
-                <div className="flex items-center gap-2">
-                  <span className={`rounded px-2 py-0.5 font-mono text-xs ${notices.some((n) => n.level === "warn") ? T.chipWarn : T.chipOk}`}>
-                    {notices.filter((n) => n.level === "warn").length} checks
-                  </span>
-                  <span className={`rounded border px-2 py-0.5 font-mono text-xs ${T.chipIdle}`}>
-                    {notices.filter((n) => n.level === "info").length} notes
-                  </span>
-                  <Seg value={noticesOpen ? "open" : "closed"} onChange={(v) => setNoticesOpen(v === "open")}
-                    options={[{ value: "closed", label: "Reduce" }, { value: "open", label: "Expand" }]} />
-                </div>
-              }>
-              {notices.length === 0 ? (
-                <div className={`rounded border px-2 py-2 text-xs ${T.notice.info}`}>Nothing flagged for the current inputs.</div>
-              ) : noticesOpen ? (
-                <Notices items={notices} />
-              ) : (
-                <ul className="space-y-0.5">
-                  {notices.map((n, i) => (
-                    <li key={i} className={`truncate font-mono text-xs ${n.level === "warn" ? T.tone.amber : T.muted}`}>
-                      <span className="uppercase mr-2">{n.level === "warn" ? "check" : "note"}</span>{n.text}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </Panel>
-          )}
-
           {/* Step navigation */}
           <div className={`flex items-center justify-between gap-3 rounded border p-2 ${T.panel}`}>
             <button disabled={tab === 0} onClick={() => setTab(tab - 1)}
