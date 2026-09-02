@@ -2649,8 +2649,8 @@ function computeFinancials(a) {
  * a check is discarded, and the survivors are ranked by LCOE. The output is a
  * ranked set with the trade-off visible, never a single "answer".
  */
-function autoSize(a) {
-  const { base, bounds, evaluate, onProgress } = a;
+async function autoSize(a) {
+  const { base, bounds, evaluate, onProgress, tick } = a;
   const combos = [];
   const winds = bounds.windKW && bounds.windKW.length ? bounds.windKW : [0];
   for (const kWp of bounds.pvKWp)
@@ -2660,12 +2660,17 @@ function autoSize(a) {
           for (const units of bounds.engineUnits)
             combos.push({ kWp, windKW, bessKW: bMW * 1000, bessKWh: bMW * 1000 * hrs, units, hours: hrs });
 
+  /* Evaluated in small batches with a yield between them. Without the yield the
+     whole sweep ran inside one synchronous call and nothing on screen could
+     repaint, so the progress indicator never appeared however long it took. */
   const results = [];
-  combos.forEach((c, idx) => {
-    const r = evaluate(c);
-    results.push({ ...c, ...r });
-    if (onProgress && idx % 25 === 0) onProgress(idx / combos.length);
-  });
+  for (let idx = 0; idx < combos.length; idx++) {
+    results.push({ ...combos[idx], ...evaluate(combos[idx]) });
+    if (idx % 4 === 3 || idx === combos.length - 1) {
+      if (onProgress) onProgress((idx + 1) / combos.length);
+      if (tick) await tick();
+    }
+  }
   const feasible = results.filter((r) => r.feasible).sort((x, y) => x.lcoe - y.lcoe);
   return { all: results, feasible, tried: combos.length, best: feasible[0] || null };
 }
@@ -3938,11 +3943,14 @@ export const TABS = [
   { n: 13, title: "Compare",     icon: "compare",    sub: "side-by-side design comparison" },
 ];
 
+/* showName controls only the small caption in front of the group. The last two
+   groups drop it so the whole banner fits the page without a scroller; their
+   colour still identifies them. */
 export const TAB_STAGES = [
-  { name: "Define", from: 0, to: 6 },
-  { name: "Analyse", from: 7, to: 9 },
-  { name: "Optimise", from: 10, to: 10 },
-  { name: "Report", from: 11, to: 12 },
+  { name: "Define", from: 0, to: 6, showName: true },
+  { name: "Analyse", from: 7, to: 9, showName: true },
+  { name: "Optimise", from: 10, to: 10, showName: false },
+  { name: "Report", from: 11, to: 12, showName: false },
 ];
 
 export const SCENARIO_ROWS = [
@@ -4083,6 +4091,8 @@ export default function MicrogridDesignTool() {
   const [sweepOut, setSweepOut] = useState(null);
   const [sweeping, setSweeping] = useState(false);
   const [sweepPct, setSweepPct] = useState(0);
+  const [sweepStartedAt, setSweepStartedAt] = useState(0);
+  const [sweepElapsedS, setSweepElapsedS] = useState(0);
   const [scenarios, setScenarios] = useState([]);
   const [scenarioName, setScenarioName] = useState("");
   const [projectName, setProjectName] = useState("");
@@ -4968,8 +4978,16 @@ export default function MicrogridDesignTool() {
     return pv * wi * be * en;
   }, [guidedSpace]);
 
+  /* A running clock while a search is under way. A sweep can take a minute or
+     more and the only honest thing to show is how long it has been going. */
+  useEffect(() => {
+    if (!sweeping || !sweepStartedAt) return undefined;
+    const id = setInterval(() => setSweepElapsedS((Date.now() - sweepStartedAt) / 1000), 500);
+    return () => clearInterval(id);
+  }, [sweeping, sweepStartedAt]);
+
   const runGuided = async () => {
-    setSweeping(true); setSweepPct(0);
+    setSweeping(true); setSweepPct(0); setSweepStartedAt(Date.now()); setSweepElapsedS(0);
     await new Promise((r) => setTimeout(r, 30)); // let the running state paint before the work starts
     const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
     const unitKW = numz(sweep.gEngineUnitKW) || numz(res.engine.unitKW) || 1600;
@@ -4994,8 +5012,9 @@ export default function MicrogridDesignTool() {
     setSweeping(false);
   };
 
-  const runAutoSize = () => {
-    setSweeping(true);
+  const runAutoSize = async () => {
+    setSweeping(true); setSweepPct(0); setSweepStartedAt(Date.now()); setSweepElapsedS(0);
+    await new Promise((r) => setTimeout(r, 30)); // let the running state paint before the work starts
     // The search uses the same method as the headline run, so the ranking it
     // produces is the ranking you would get by applying each design and running it.
     const useOptimiser = res.dispatchMode === "optimised";
@@ -5004,9 +5023,11 @@ export default function MicrogridDesignTool() {
     // free to test sizes for assets that are currently switched off. Inclusion
     // is controlled here, not by the Equipment toggles.
     const bounds = sweepBounds();
-    const out = autoSize({
+    const out = await autoSize({
       bounds,
       evaluate: makeCandidateEvaluator(useOptimiser ? "optimised" : "merit", sweepUnitKW, { fuelType: sweepFuelType }),
+      tick: () => new Promise((r) => setTimeout(r, 0)),
+      onProgress: (pct) => setSweepPct(pct),
     });
     out.failCounts = { energy: 0, power: 0, dynamic: 0 };
     out.all.forEach((r) => {
@@ -5298,7 +5319,7 @@ export default function MicrogridDesignTool() {
               {sweeping && (
                 <span title="A sizing search is running" className={`flex items-center gap-1.5 whitespace-nowrap rounded border px-2 py-1 text-xs ${T.chipWarn}`}>
                   <Spinner className="h-3.5 w-3.5" />
-                  Search running {fmt(sweepPct * 100, 0)} %
+                  Sweep in progress · {fmt(sweepElapsedS, 0)} s · {fmt(sweepPct * 100, 0)} %
                 </span>
               )}
               <span title={justRan ? `Run complete: 8760 h simulated in ${fmt(dispatchMs, 0)} ms${runOut && runOut.optimised ? ", optimised dispatch" : ", merit-order dispatch"}, all checks passed`
@@ -5324,12 +5345,14 @@ export default function MicrogridDesignTool() {
 
           {/* Step tabs */}
           <nav className={`rounded border p-1 ${T.panel}`}>
-            <div className="flex flex-nowrap items-stretch gap-2 overflow-x-auto">
+            <div className="flex flex-nowrap items-stretch gap-1 overflow-x-auto">
               {TAB_STAGES.map((st) => {
                 const sp = T.stage[st.name];
                 return (
                   <div key={st.name} className={`flex flex-nowrap items-center gap-0.5 rounded px-1 py-0.5 ${sp.band}`}>
-                    <span className={`px-1 font-mono text-[10px] uppercase tracking-wide ${sp.label}`} title={`${st.name} stage`}>{st.name}</span>
+                    {st.showName && (
+                      <span className={`px-1 font-mono text-[10px] uppercase tracking-wide ${sp.label}`} title={`${st.name} stage`}>{st.name}</span>
+                    )}
                     {TABS.slice(st.from, st.to + 1).map((t2, k) => {
                       const i = st.from + k;
                       const on = tab === i;
@@ -7066,18 +7089,18 @@ export default function MicrogridDesignTool() {
 
                       {/* The same scenarios as numbers, because the bar only carries one of them */}
                       <div className={`mt-2 w-full overflow-auto rounded border ${T.tile}`}>
-                        <table className="w-full text-right font-mono text-xs">
+                        <table className="w-full text-right font-mono text-sm">
                           <thead className={T.panel}>
                             <tr className={`border-b ${T.rule}`}>
                               {["Scenario", "LCOE €/MWh", "Δ vs this design", "Capex M€", "Import MWh/yr",
                                 "Generator MWh/yr", "Renewable %", "Unserved MWh/yr"].map((h, i) => (
-                                <th key={h} className={`px-1.5 py-1 ${T.faint} ${i === 0 ? "text-left" : ""}`}>{h}</th>))}
+                                <th key={h} className={`px-1.5 py-1 text-xs font-normal ${T.faint} ${i === 0 ? "text-left" : ""}`}>{h}</th>))}
                             </tr>
                           </thead>
                           <tbody>
                             <tr className={`border-b ${T.divide} ${T.soft.cyan}`}>
-                              <td className={`px-1.5 py-0.5 text-left font-semibold ${T.title}`}>This design</td>
-                              <td className={`px-1.5 py-0.5 font-semibold ${T.tone.cyan}`}>{fmt(cost.lcoeFacility, 1)}</td>
+                              <td className={`px-1.5 py-0.5 text-left ${T.title}`}>This design</td>
+                              <td className={`px-1.5 py-0.5 ${T.tone.cyan}`}>{fmt(cost.lcoeFacility, 1)}</td>
                               <td className={`px-1.5 py-0.5 ${T.ghost}`}>—</td>
                               <td className="px-1.5 py-0.5">{fmt(cost.capex.total / 1e6, 1)}</td>
                               <td className="px-1.5 py-0.5">{fmt(disp.summary.importMWh, 0)}</td>
@@ -7089,7 +7112,7 @@ export default function MicrogridDesignTool() {
                               <tr key={i} title={v.note} className={`border-b ${T.divide}`}>
                                 <td className={`px-1.5 py-0.5 text-left ${T.title}`}>
                                   {v.label}
-                                  {v.note ? <span className={`ml-1 font-sans ${T.faint}`}>— {v.note}</span> : null}
+                                  {v.note ? <span className={`ml-1 font-sans text-xs ${T.faint}`}>— {v.note}</span> : null}
                                 </td>
                                 <td className="px-1.5 py-0.5">{fmt(v.lcoe, 1)}</td>
                                 <td className={`px-1.5 py-0.5 ${v.lcoe > cost.lcoeFacility ? T.tone.emerald : T.tone.rose}`}>
@@ -7239,6 +7262,20 @@ export default function MicrogridDesignTool() {
           {/* ================= AUTO-SIZE ================= */}
           {tab === 10 && (
             <Panel title="Auto-size" step="11" sub="ranked search for a lower-cost compliant design">
+              {sweeping && (
+                <div className={`mb-3 flex flex-wrap items-center gap-3 rounded border px-3 py-2 ${T.notice.warn}`}>
+                  <Spinner className="h-5 w-5" />
+                  <span className="text-sm font-medium">Sweep in progress</span>
+                  <span className="font-mono text-sm">{fmt(sweepElapsedS, 0)} s elapsed</span>
+                  <div className={`h-2 w-56 overflow-hidden rounded ${T.tile}`}>
+                    <div className="h-full rounded bg-amber-500 transition-all" style={{ width: `${Math.round(sweepPct * 100)}%` }} />
+                  </div>
+                  <span className="font-mono text-sm">{fmt(sweepPct * 100, 0)} %</span>
+                  <span className="text-xs">
+                    Every candidate is a full 8760-hour dispatch. The page stays usable; the results appear below when it finishes.
+                  </span>
+                </div>
+              )}
               <div className={`mb-3 rounded border px-2 py-1 text-xs ${T.tile} ${T.muted}`}>
                 Every candidate is run through the same hourly dispatch and the same three adequacy checks as the headline
                 design. Anything that fails a check is discarded; what survives is ranked by LCOE, with the trade-off against
@@ -7568,11 +7605,11 @@ export default function MicrogridDesignTool() {
                       Design rationale — marginal contribution of each asset class
                     </div>
                     <div className="p-2">
-                      <table className="w-full text-left font-mono text-xs">
+                      <table className="w-full text-left font-mono text-sm">
                         <thead>
                           <tr className={`border-b ${T.rule}`}>
                             {["Asset class", "In design", "Rating", "Δ LCOE €/MWh", "Δ renewable pp", "Δ capex M€", "Assessment"].map((h) => (
-                              <th key={h} className={`px-1.5 py-1 ${T.faint}`}>{h}</th>))}
+                              <th key={h} className={`px-1.5 py-1 text-xs font-normal ${T.faint}`}>{h}</th>))}
                           </tr>
                         </thead>
                         <tbody>
@@ -7643,14 +7680,14 @@ export default function MicrogridDesignTool() {
                       the check that fails, and any of them can be applied so the failure can be examined on the Reliability tab.
                     </div>
                     <div className={`max-h-96 w-full overflow-auto rounded border ${T.tile}`}>
-                      <table className="w-full text-right font-mono text-xs">
+                      <table className="w-full text-right font-mono text-sm">
                         <thead className={`sticky top-0 ${T.panel}`}>
                           <tr className={`border-b ${T.rule}`}>
                             {["#", "PV MWp", "Wind MW", "BESS MW", "MWh", "Gen", "Gen MWh",
                               sweepOut.shortlisted ? "LCOE screen" : "LCOE €/MWh",
                               ...(sweepOut.shortlisted ? ["LCOE optimised"] : []),
                               "Capex M€", "Renew %", "Checks", "Apply"].map((h) => (
-                              <th key={h} className={`px-1.5 py-1 ${T.faint}`}>{h}</th>))}
+                              <th key={h} className={`px-1.5 py-1 text-xs font-normal ${T.faint}`}>{h}</th>))}
                           </tr>
                         </thead>
                         <tbody>
@@ -7674,7 +7711,7 @@ export default function MicrogridDesignTool() {
                                   r.dynamic === "FAIL" && "dynamic"].filter(Boolean).join(" + ")}
                               </td>
                               <td className="px-1.5 py-0.5">
-                                <button onClick={() => applyCandidate(r)} className={`rounded border px-2 py-0.5 font-medium ${i === 0 ? T.chipAlert : T.chip}`}>apply →</button>
+                                <button onClick={() => applyCandidate(r)} className={`rounded border px-2 py-0.5 text-xs ${i === 0 ? T.chipAlert : T.chip}`}>apply →</button>
                               </td>
                             </tr>
                           ))}
@@ -7686,10 +7723,15 @@ export default function MicrogridDesignTool() {
                     <div className={`mb-1 text-xs ${T.faint}`}>LCOE against renewable fraction — the shape of the trade-off, not just the winner</div>
                     <div className="h-80 w-full">
                       <ResponsiveContainer width="100%" height="100%">
-                        <ScatterChart margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
+                        <ScatterChart margin={{ top: 8, right: 16, left: 8, bottom: 16 }}>
                           <CartesianGrid stroke={T.chart.grid} />
-                          <XAxis type="number" dataKey="renewablePct" name="Renewable" unit="%" tick={axis} />
-                          <YAxis type="number" dataKey="lcoe" name="LCOE" unit="€/MWh" tick={axis} domain={["auto", "auto"]} />
+                          <XAxis type="number" dataKey="renewablePct" name="Renewable" unit="%" tick={axis} height={40}
+                            label={{ value: "Renewable fraction (%)", position: "insideBottom", offset: -6, fontSize: 11, fill: T.chart.axis }} />
+                          {/* An explicit width and a plain tick format: the axis used to
+                              carry its unit on every tick and was clipped by a negative margin. */}
+                          <YAxis type="number" dataKey="lcoe" name="LCOE" unit="€/MWh" tick={axis} domain={["auto", "auto"]}
+                            width={70} tickFormatter={(v) => fmt(v, 0)}
+                            label={{ value: "LCOE (€/MWh)", angle: -90, position: "insideLeft", offset: 4, fontSize: 11, fill: T.chart.axis }} />
                           <Tooltip contentStyle={tip} cursor={{ strokeDasharray: "3 3" }} />
                           <Legend wrapperStyle={{ fontSize: 11 }} />
                           <Scatter name="Failed a check" data={sweepOut.all.filter((r) => !r.feasible)} fill={T.chart.unservedC} fillOpacity={0.35} />
@@ -8024,11 +8066,11 @@ export default function MicrogridDesignTool() {
                 </div>
               ) : (<>
                 <div className={`overflow-auto rounded border ${T.tile}`}>
-                  <table className="w-full text-right font-mono text-xs">
+                  <table className="w-full text-right font-mono text-sm">
                     <thead className={T.panel}>
                       <tr className={`border-b ${T.rule}`}>
-                        <th className={`px-2 py-1 text-left ${T.faint}`}>Metric</th>
-                        {scenarios.map((s, i) => <th key={i} className={`px-2 py-1 ${T.title}`}>{s.name}</th>)}
+                        <th className={`px-2 py-1 text-left text-xs font-normal ${T.faint}`}>Metric</th>
+                        {scenarios.map((s, i) => <th key={i} className={`px-2 py-1 text-xs font-normal ${T.title}`}>{s.name}</th>)}
                       </tr>
                     </thead>
                     <tbody>
