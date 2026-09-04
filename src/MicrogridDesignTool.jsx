@@ -24,8 +24,8 @@ export { LOCATION_LIBRARY, MARKET_PRICES_2025, VRE_PENETRATION_2025 };
 /* Release identity, shown in the footer and written into every saved project
    file so a result can always be traced back to the build that produced it. */
 export const TOOL_RELEASE = {
-  version: "1.1.0",
-  date: "2026-09-02",
+  version: "1.2.0",
+  date: "2026-09-04",
   author: "Xavier Becuwe",
 };
 
@@ -204,6 +204,8 @@ export const CONSTANTS = {
      means a finer answer and a slower run; 41 is accurate to well under a
      percent of annual cost on every case tested here.                       */
   OPT_SOC_LEVELS: 41,                   // -       state-of-charge steps in the search
+  OPT_SOC_LEVELS_MIN: 11,               // -       below this the discretisation is too coarse to mean anything
+  OPT_SOC_LEVELS_MAX: 121,              // -       policy is an Int8Array, so a level change must stay inside ±127
   OPT_CEILING_STEPS: [0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6], // - import ceilings tried
   BESS_WEAR_COST_EUR_PER_MWH: 4,        // €/MWh   throughput cost, so the optimiser will not
                                         //         cycle the battery for a gain smaller than
@@ -3353,7 +3355,11 @@ function optimiseDispatch(cfg) {
   const { load, pvGen, windGen, price, temp, cal } = cfg;
   const g = cfg.grid, b = cfg.bess, e = cfg.engine, t = cfg.turbine;
   const opt = cfg.optimiser || {};
-  const NS = Math.max(11, opt.socLevels || CONSTANTS.OPT_SOC_LEVELS);
+  // The policy is stored in an Int8Array, so a level change must stay inside
+  // ±127. NS − 1 is the largest change the recursion can propose, hence the
+  // upper clamp; below 11 levels the discretisation stops being meaningful.
+  const NS = Math.min(CONSTANTS.OPT_SOC_LEVELS_MAX,
+    Math.max(CONSTANTS.OPT_SOC_LEVELS_MIN, Math.round(opt.socLevels || CONSTANTS.OPT_SOC_LEVELS)));
 
   /* --- Residual demand after renewables, and the surplus available --------- */
   const resid = new Float32Array(H), surplus = new Float32Array(H);
@@ -3365,10 +3371,12 @@ function optimiseDispatch(cfg) {
   }
 
   /* --- Marginal cost of a kWh from each source, hour by hour --------------- */
+  // Same definition the dispatch, the search-space proposal and the screen use.
+  // It honours the fuel curves carried on the engine, evaluates at the stated
+  // load point and includes variable O&M — the local copy this replaced did
+  // none of those three, so the optimiser priced engine energy below the plant.
   const engineMarginal = e.enabled
-    ? (e.fuelType === "diesel"
-      ? 1000 * partLoadValue(CONSTANTS.DIESEL_SFC_L_PER_KWH, 75) * (cfg.dieselPrice || 0)
-      : (cfg.gasPrice || 0) / (partLoadValue(CONSTANTS.GAS_ENGINE_EFF_PCT, 75) / 100))
+    ? engineMarginalCostEURperMWh(e, cfg.dieselPrice, cfg.gasPrice)
     : Infinity;
   const engineCapKW = e.enabled ? e.units * e.unitKW : 0;
   const turbCapKW = t.enabled ? t.ratedKW : 0;
@@ -3644,6 +3652,7 @@ const ICON_PATHS = {
   battery: <><rect x="3" y="7.5" width="15.5" height="9" rx="2" /><path d="M21 10.8v2.9" /><path d="M11.6 9.6 8.9 13h3.3l-1 2.4" /></>,
   engine: <><rect x="3.2" y="8.6" width="11.6" height="7" rx="1.4" /><path d="M14.8 10.8h3.1l2.4 2.4v2.4h-5.5" /><path d="M6.2 8.6V6.4h4.2v2.2" /><circle cx="7" cy="17.6" r="1.2" /><circle cx="13.2" cy="17.6" r="1.2" /></>,
   compare: <><path d="M12 3.5v17" /><path d="M4 7.5h6M14 7.5h6" /><path d="M7 7.5 4 14h6zM17 7.5 14 14h6z" /><path d="M4 14a3 3 0 0 0 6 0M14 14a3 3 0 0 0 6 0" /></>,
+  info: <><circle cx="12" cy="12" r="9" /><path d="M12 11v5.5" /><path d="M12 7.6h.01" /></>,
 };
 
 function Icon({ name, className = "h-4 w-4" }) {
@@ -4067,7 +4076,14 @@ export default function MicrogridDesignTool() {
 
   const [view, setView] = useState({ span: "week", startDay: 172 });
   const [reasonFilter, setReasonFilter] = useState(-1);
-  const [tab, setTab] = useState(0);
+  /* The method note is a page in its own right, not a fourteenth step. It is
+     reached from the footer, and while it is open `tab` reads -1 so every
+     `tab === n` gate below closes on its own and nothing else has to change.
+     The tab band keeps its thirteen buttons and their data-mgt-tab attributes. */
+  const [tabSel, setTabSel] = useState(0);
+  const [showInfo, setShowInfo] = useState(false);
+  const tab = showInfo ? -1 : tabSel;
+  const setTab = (v) => { setShowInfo(false); setTabSel(v); };
   const [noticesOpen, setNoticesOpen] = useState(true);
   const [selfTestOpen, setSelfTestOpen] = useState(false);
   const [logicApplied, setLogicApplied] = useState(false);
@@ -4353,6 +4369,10 @@ export default function MicrogridDesignTool() {
     dieselPrice: numz(loc.diesel_EUR_per_litre),
     gasPrice: numz(loc.gas_EUR_per_MWh_th),
     exportPrice: numz(costs.EXPORT_PRICE_EUR_PER_MWH),
+    // Settings the optimiser reads. socLevels was offered on the Microgrid tab
+    // but never supplied, so the search always ran at the library default
+    // whatever the field said. It is clamped again inside optimiseDispatch.
+    optimiser: { socLevels: numz(res.optSocLevels) || CONSTANTS.OPT_SOC_LEVELS },
   }), [load, pvOut, windGen, price, temp, cal, char.shed1Pct, char.shed2Pct, ctx, mode, aidc.gridStrategy,
        curtailFlags, res, reserveApplies, effectiveImportCapKW,
        loc.diesel_EUR_per_litre, loc.gas_EUR_per_MWh_th, costs.EXPORT_PRICE_EUR_PER_MWH,
@@ -5370,6 +5390,336 @@ export default function MicrogridDesignTool() {
             </div>
           </nav>
 
+          {/* ================= METHOD NOTE =================
+              Reached from the footer. A mathematical statement of the dispatch
+              optimisation: the objective, the state, the recursion, what the
+              method is called, and exactly what the optimality claim covers.
+              No code is described here — this page has to survive a refactor. */}
+          {showInfo && (<>
+            <Panel title="Method note — dispatch optimisation" step="i"
+              sub="what is minimised, over what, and by which method"
+              right={<button onClick={() => setShowInfo(false)} className={`rounded border px-2 py-1 text-xs ${T.chip}`}>Back to the tool</button>}>
+              <p className={`text-xs ${T.title}`}>
+                The optimised dispatch minimises the annual variable operating cost of the site by choosing the battery
+                charge and discharge schedule for all 8760 hours at once. It is solved by deterministic dynamic programming
+                over a discretised state of charge. It is not a simulation, not a heuristic and not a Monte Carlo method.
+              </p>
+              <p className={`mt-2 text-xs ${T.muted}`}>
+                This page states the mathematics. It says nothing about how the tool is written, so it stays true if the
+                implementation changes. Every symbol carries its unit.
+              </p>
+            </Panel>
+
+            <Panel title="The optimisation problem" step="i.1" sub="objective, variables, state and constraints">
+              <div className={`rounded border p-2 ${T.soft.cyan}`}>
+                <div className={`text-xs font-semibold ${T.head}`}>Objective</div>
+                <div className={`mt-1 font-mono text-xs ${T.title}`}>
+                  {"minimise   J(b) = Σ over i = 0 … 8759 of [ c_i(need_i) + w · |b_i| · Δt ]        €/yr"}
+                </div>
+                <div className={`mt-1 text-xs ${T.faint}`}>
+                  Δt = 1 h throughout. The tool has no sub-hourly resolution, so energy in kWh and power in kW are
+                  numerically the same quantity in every hour and the two are used interchangeably below.
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className={`rounded border p-2 ${T.tile}`}>
+                  <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Decision variable</div>
+                  <div className={`mt-1 font-mono text-xs ${T.title}`}>{"b_i   battery power in hour i, kW"}</div>
+                  <div className={`text-xs ${T.faint}`}>
+                    Positive discharging into the site, negative charging. One value per hour, 8760 in total. This is the
+                    only quantity the optimiser chooses.
+                  </div>
+                </div>
+                <div className={`rounded border p-2 ${T.tile}`}>
+                  <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>State</div>
+                  <div className={`mt-1 font-mono text-xs ${T.title}`}>{"s_i   energy stored at the start of hour i, kWh"}</div>
+                  <div className={`text-xs ${T.faint}`}>
+                    One scalar. This is what makes the problem tractable: the whole history of the year matters to the
+                    future only through the energy currently in the battery.
+                  </div>
+                </div>
+              </div>
+
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Transition</div>
+                <div className={`mt-1 font-mono text-xs ${T.title}`}>
+                  {"s_i+1 = s_i − b_i / η        when discharging, b_i ≥ 0"}<br />
+                  {"s_i+1 = s_i + |b_i| · η      when charging, b_i < 0"}<br />
+                  {"η = √(RTE)                   one-way efficiency, −"}
+                </div>
+                <div className={`mt-1 text-xs ${T.faint}`}>
+                  The round-trip efficiency is split evenly between the two directions, so a full cycle loses RTE exactly
+                  once. Charging costs more energy than it stores; discharging delivers less than it removes.
+                </div>
+              </div>
+
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Hourly cost function</div>
+                <div className={`mt-1 font-mono text-xs ${T.title}`}>
+                  {"need_i = L_i − PV_i − W_i − b_i        kW, the site's net requirement"}
+                </div>
+                <div className={`mt-2 text-xs ${T.muted}`}>When need_i is positive, it is met in this fixed order:</div>
+                <ol className={`mt-1 space-y-0.5 text-xs ${T.title}`}>
+                  <li><span className={`font-mono ${T.tone.cyan}`}>1</span> grid import, up to the connection cap, at that hour's price π_i in €/MWh</li>
+                  <li><span className={`font-mono ${T.tone.cyan}`}>2</span> engines and turbine, up to their combined rating, at short-run marginal cost m in €/MWh</li>
+                  <li><span className={`font-mono ${T.tone.cyan}`}>3</span> whatever is left is unserved, charged at the value of lost load, {fmt(CONSTANTS.VALUE_OF_LOST_LOAD_EUR_PER_MWH, 0)} €/MWh</li>
+                </ol>
+                <div className={`mt-2 text-xs ${T.muted}`}>When need_i is negative, the surplus is exported up to the export cap at the export price, and the rest is curtailed at zero value.</div>
+                <div className={`mt-2 text-xs ${T.faint}`}>
+                  c_i is piecewise linear in need_i. It is not necessarily convex: the stack is ordered by supply priority,
+                  not sorted by price, so in an hour where the import price exceeds the engine marginal cost the segments
+                  are out of order. Dynamic programming does not require convexity, which is one reason it was chosen.
+                </div>
+              </div>
+
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Wear term</div>
+                <div className={`mt-1 font-mono text-xs ${T.title}`}>{"w   battery wear cost, €/MWh of throughput"}</div>
+                <div className={`text-xs ${T.faint}`}>
+                  Charged on every kWh moved in either direction. Without it the optimiser cycles for arbitrarily small
+                  gains, because a lossy battery with no cost of use is still worth using whenever prices differ at all.
+                  It is a steering cost, deliberately set below full replacement amortisation — capex already pays for the
+                  battery once. The Reliability page compares the two figures directly.
+                </div>
+              </div>
+
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Constraints</div>
+                <div className={`mt-1 font-mono text-xs ${T.title}`}>
+                  {"|b_i| ≤ min(P_rated, E · C-rate)                    kW, power and C-rate limit"}<br />
+                  {"SOC_min ≤ 100 · s_i / E ≤ SOC_max                    %, usable window"}<br />
+                  {"100 · s_i / E ≥ SOC_reserve                          %, when a reserve is declared"}<br />
+                  {"s_8760 ≥ s_0                                         kWh, terminal condition"}<br />
+                  {"import_i ≤ cap_i                                     kW, reduced in curtailment hours"}
+                </div>
+                <div className={`mt-1 text-xs ${T.faint}`}>
+                  The terminal condition matters more than it looks. Without it the optimiser ends the year with an empty
+                  battery, books the proceeds and reports a cost that cannot be repeated in year two.
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="The method is deterministic dynamic programming" step="i.2" sub="Bellman recursion on a discretised state">
+              <p className={`text-xs ${T.title}`}>
+                The state of charge is discretised into N levels evenly spaced across the usable window, N = {CONSTANTS.OPT_SOC_LEVELS} by
+                default and settable on the Microgrid page. Level spacing and the reachable move set follow from the
+                battery's own ratings:
+              </p>
+              <div className={`mt-2 rounded border p-2 ${T.soft.cyan}`}>
+                <div className={`font-mono text-xs ${T.title}`}>
+                  {"Δ = E · (SOC_max − SOC_min) / 100 / (N − 1)      kWh per level"}<br />
+                  {"M = floor( min(P_rated, E · C-rate) / Δ )        levels reachable in one hour"}
+                </div>
+              </div>
+              <p className={`mt-3 text-xs ${T.title}`}>
+                Let V_i(k) be the least cost of running the site from hour i to the end of the year, given that the battery
+                is at level k at the start of hour i. Bellman's principle of optimality gives a backward recursion:
+              </p>
+              <div className={`mt-2 rounded border p-2 ${T.soft.cyan}`}>
+                <div className={`font-mono text-xs ${T.title}`}>
+                  {"V_i(k) = min over m ∈ [−M, +M] of [ c_i(k, m) + w · |m| · Δ + V_i+1(k + m) ]"}<br />
+                  {"V_8760(k) = 0 if k ≥ k_0,  +∞ otherwise"}
+                </div>
+                <div className={`mt-1 text-xs ${T.faint}`}>
+                  m is the change in level chosen this hour, subject to k + m staying inside the window and above the
+                  reserve floor. k_0 is the starting level.
+                </div>
+              </div>
+              <p className={`mt-3 text-xs ${T.muted}`}>
+                Solved backwards from hour 8760 to hour 0, then read forwards from k_0 by following the stored minimising
+                move. The answer J* = V_0(k_0) is the least cost of the whole year, and the forward walk is the schedule
+                that achieves it.
+              </p>
+
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>An equivalent statement</div>
+                <div className={`mt-1 text-xs ${T.title}`}>
+                  The same problem is a shortest-path problem on a directed acyclic graph. Nodes are hour-and-level pairs,
+                  8760 × N of them. Arcs are the feasible moves out of each node, at most 2M + 1 per node. Arc weight is
+                  that hour's cost plus the wear on the move. The recursion above is the standard backward pass for
+                  shortest paths on a layered graph. Either description is exact; the graph one is often easier to defend
+                  in a meeting.
+                </div>
+              </div>
+
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Cost of the computation</div>
+                <div className={`mt-1 font-mono text-xs ${T.title}`}>{"8760 · N · (2M + 1) arc evaluations"}</div>
+                <div className={`text-xs ${T.faint}`}>
+                  Roughly 8 million for a four-hour battery at N = 41, which is why an optimised run takes seconds rather
+                  than milliseconds. The cost is linear in N and in M, not exponential in the number of hours — that is the
+                  whole point of the method. A naive search over 8760 hourly decisions is not enumerable at any scale.
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="This is a standard model, and it is not Monte Carlo" step="i.3" sub="what the method is called, and what it is not">
+              <div className={`rounded border p-2 ${T.soft.emerald}`}>
+                <div className={`text-xs font-semibold ${T.head}`}>What it is</div>
+                <div className={`mt-1 text-xs ${T.title}`}>
+                  Deterministic finite-horizon dynamic programming, solved by backward induction over a discretised state.
+                  Bellman, 1957. In power systems the same recursion is the classical storage and reservoir scheduling
+                  model, and it is the standard textbook treatment of a single storage device with one state variable and a
+                  known price series. Nothing here is novel; the model was chosen because it is well understood, auditable
+                  by hand on a short horizon, and exact for the discretisation used.
+                </div>
+              </div>
+
+              <div className={`mt-3 rounded border p-2 ${T.notice.info}`}>
+                <div className={`text-xs font-semibold ${T.head}`}>It is not a Monte Carlo method</div>
+                <div className="mt-1 text-xs">
+                  No random number is drawn anywhere in the optimisation. One deterministic input year produces one
+                  schedule, and running the same project twice returns identical figures to the last decimal. A Monte Carlo
+                  dispatch would sample many synthetic years of price, resource and load, dispatch each one, and report a
+                  distribution of outcomes — a P50 and a P90 rather than a single number. That is a legitimate and
+                  different exercise, and this tool does not do it.
+                </div>
+                <div className="mt-1 text-xs">
+                  The closest thing available is on the Reliability page: a single seeded perturbation of the input year,
+                  used to price the cost of forecast error. That is a one-draw sensitivity test, not a Monte Carlo
+                  distribution, and it should not be quoted as one. Turning it into one would need many draws and a stated
+                  correlation structure between price, wind and solar errors, neither of which exists here.
+                </div>
+              </div>
+
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Methods deliberately not used</div>
+                <ul className={`mt-1 space-y-1 text-xs ${T.title}`}>
+                  <li><span className="font-semibold">Mixed-integer linear programming.</span> The natural formulation for co-optimising storage and engine unit commitment, and what a commercial production-cost model would use. It needs a solver, and a solver is a dependency whose answer cannot be checked by hand. Auditability was preferred.</li>
+                  <li><span className="font-semibold">Stochastic dynamic programming and SDDP.</span> Would replace the known price series with a distribution and optimise the expectation. Correct if the object of interest is behaviour under uncertainty; unnecessary for a design-stage comparison against a stated reference year.</li>
+                  <li><span className="font-semibold">Model predictive control.</span> A rolling short horizon re-solved every hour, which is what a real plant controller does. The Reliability page approximates the gap between this and perfect foresight instead.</li>
+                  <li><span className="font-semibold">Metaheuristics — genetic algorithms, particle swarm, simulated annealing.</span> These return a good schedule with no bound on how far from the best it is. Dynamic programming returns the best one for the discretisation, so there is nothing to gain.</li>
+                </ul>
+              </div>
+            </Panel>
+
+            <Panel title="Demand charges are handled outside the recursion" step="i.4" sub="the one term that is not separable by hour">
+              <p className={`text-xs ${T.title}`}>
+                Dynamic programming requires the objective to break into a sum of per-hour terms. A capacity charge does
+                not: it is billed on each month's highest import, so the cost of an hour depends on every other hour in
+                that month.
+              </p>
+              <div className={`mt-2 rounded border p-2 ${T.soft.cyan}`}>
+                <div className={`font-mono text-xs ${T.title}`}>
+                  {"D = C · (1/12) · Σ over months of max over hours in month of import_i     €/yr"}
+                </div>
+                <div className={`mt-1 text-xs ${T.faint}`}>C is the capacity charge in €/kW/yr, taken from the location library.</div>
+              </div>
+              <p className={`mt-3 text-xs ${T.muted}`}>
+                This is handled by an outer search on a single scalar: an import ceiling P̄ applied uniformly across the
+                year. For each candidate ceiling the full recursion is solved again with the cap replaced by
+                min(cap, P̄), and the total of energy cost, fuel cost and demand charge is compared. The cheapest ceiling
+                wins. The uncapped case plus {CONSTANTS.OPT_CEILING_STEPS.length} fixed fractions of the connection cap are
+                tried, from {fmt(CONSTANTS.OPT_CEILING_STEPS[0] * 100, 0)} % down to {fmt(CONSTANTS.OPT_CEILING_STEPS[CONSTANTS.OPT_CEILING_STEPS.length - 1] * 100, 0)} %.
+              </p>
+              <div className={`mt-2 rounded border p-2 ${T.notice.warn}`}>
+                <div className="text-xs font-semibold">Known limitation</div>
+                <div className="mt-1 text-xs">
+                  This is a coarse grid over one number, not an optimisation. A single flat ceiling for the whole year is
+                  cruder than a per-month ceiling, the grid steps are {fmt((CONSTANTS.OPT_CEILING_STEPS[0] - CONSTANTS.OPT_CEILING_STEPS[1]) * 100, 0)} percentage points
+                  apart, and nothing below {fmt(CONSTANTS.OPT_CEILING_STEPS[CONSTANTS.OPT_CEILING_STEPS.length - 1] * 100, 0)} % of the cap is reachable.
+                  If the reported ceiling sits on the bottom of that range, the answer is a corner of the search and not an
+                  interior optimum, and it should be read as such.
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="What is optimised and what is not" step="i.5" sub="the boundary of the claim">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className={`rounded border p-2 ${T.soft.emerald}`}>
+                  <div className={`text-xs font-semibold ${T.head}`}>Inside the optimisation</div>
+                  <ul className={`mt-1 space-y-1 text-xs ${T.title}`}>
+                    <li>The battery schedule for all 8760 hours: when to charge, from grid or from surplus, and when to discharge.</li>
+                    <li>Whether to import cheaply now and displace an expensive hour later, against the real hourly price series.</li>
+                    <li>Whether a cycle is worth its wear.</li>
+                    <li>One flat import ceiling, chosen against the capacity charge.</li>
+                  </ul>
+                </div>
+                <div className={`rounded border p-2 ${T.soft.amber}`}>
+                  <div className={`text-xs font-semibold ${T.head}`}>Outside the optimisation</div>
+                  <ul className={`mt-1 space-y-1 text-xs ${T.title}`}>
+                    <li>Engine unit commitment. Which discrete units run in which hours, with minimum stable load and minimum up and down times, is an integer problem. Engines follow deterministic rules and every engine hour stays inspectable on the Dispatch page.</li>
+                    <li>Asset sizing. That is a separate search on the Auto-size page, which calls this optimisation as its inner evaluation.</li>
+                    <li>Anything sub-hourly. The model has one time resolution and it is the hour.</li>
+                  </ul>
+                </div>
+              </div>
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Where the merit order still sits</div>
+                <div className={`mt-1 text-xs ${T.title}`}>
+                  The optimisation produces a battery schedule and nothing else. That schedule is then executed by the same
+                  hour-by-hour plant model the merit order uses, which applies the engine rules, the renewable and
+                  curtailment accounting, the load-shedding tiers and every reason code. The two are not alternatives at
+                  the engine level: the merit order is how any schedule, optimised or not, becomes a result. It is also the
+                  comparator that gives the optimisation a number to beat, and the fast evaluation used when searching
+                  hundreds of candidate designs.
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="The optimality claim, stated precisely" step="i.6" sub="three qualifications, all of them material">
+              <p className={`text-xs ${T.title}`}>
+                The recursion returns the exact minimum of J over the discretised state space. That statement is true and
+                provable. It is narrower than "the optimum" in three ways, and each one should be understood before the
+                number is put in front of a client.
+              </p>
+              <ol className={`mt-2 space-y-2 text-xs ${T.title}`}>
+                <li>
+                  <span className="font-semibold">Discretisation.</span> The state is N levels, not a continuum. The true
+                  continuous optimum is at least as good. This is the only approximation inside the recursion, and it is
+                  the one you can test directly: raise N and see whether the answer moves. If it does not, the grid is fine
+                  enough.
+                </li>
+                <li>
+                  <span className="font-semibold">Perfect foresight.</span> The whole year's prices, resource and load are
+                  known when the schedule is built. No operator has that. The Reliability page prices this explicitly by
+                  building an outturn year, optimising it with full knowledge, and then executing the original schedule
+                  against it. The difference is the cost of the forecast.
+                </li>
+                <li>
+                  <span className="font-semibold">The objective is a relaxation of the plant.</span> The cost function
+                  above omits several things the plant model enforces: engine minimum stable load and commitment timing,
+                  battery auxiliary consumption, and any hour in which an engine would run ahead of grid import on economic
+                  grounds. When the resulting schedule is executed, the plant can also clip a move that is no longer
+                  feasible, and the recursion does not re-plan when that happens.
+                </li>
+              </ol>
+              <div className={`mt-3 rounded border p-2 ${T.notice.info}`}>
+                <div className="text-xs font-semibold">How to describe the result</div>
+                <div className="mt-1 text-xs">
+                  The cheapest battery schedule under a relaxed cost model, with perfect foresight, executed open-loop
+                  against the full plant model. Read it as a lower bound on what operations can capture, not as a forecast
+                  of what they will.
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="Checking the result" step="i.7" sub="what must hold, and where to see it">
+              <p className={`text-xs ${T.title}`}>Three inequalities have to hold on every project. All three are reported on the Reliability page.</p>
+              <div className={`mt-2 rounded border p-2 ${T.soft.cyan}`}>
+                <div className={`font-mono text-xs ${T.title}`}>{"relaxed lower bound  ≤  optimised cost  ≤  merit-order cost      €/yr"}</div>
+              </div>
+              <ul className={`mt-2 space-y-1 text-xs ${T.title}`}>
+                <li><span className="font-semibold">The lower bound</span> comes from relaxing everything at once: free lossless unlimited storage, perfect foresight, no engine constraints, energy bought in the cheapest hours the connection allows. No dispatch of any kind can beat it. If the optimised cost ever falls below it, something is wrong by construction and the run should not be used.</li>
+                <li><span className="font-semibold">The merit-order cost</span> is the same assets run by fixed priority. The optimisation cannot be worse; if it is, the schedule is being clipped on execution.</li>
+                <li><span className="font-semibold">The gap between the two</span> is the most that better dispatch logic could be worth on this design. A small gap says the sizing matters and the control does not.</li>
+              </ul>
+              <div className={`mt-3 rounded border p-2 ${T.tile}`}>
+                <div className={`text-xs font-semibold uppercase tracking-wide ${T.head}`}>Checks worth running by hand</div>
+                <ul className={`mt-1 space-y-1 text-xs ${T.muted}`}>
+                  <li>Raise the charge-step count and confirm the answer barely moves. If it moves a lot, the default grid is too coarse for this battery.</li>
+                  <li>Re-run with the wear cost at zero and again at full replacement amortisation. The cycle count should fall sharply as wear rises; if it does not, the battery is not being used for arbitrage at all.</li>
+                  <li>Set the battery energy to zero. The optimiser has no state to steer and the result must equal the merit order exactly.</li>
+                  <li>Compare the reported import ceiling against the connection cap. Equal means the capacity charge never bit.</li>
+                </ul>
+              </div>
+              <div className={`mt-3 flex justify-end`}>
+                <button onClick={() => setShowInfo(false)} className={`rounded border px-3 py-1 text-xs ${T.chip}`}>Back to the tool</button>
+              </div>
+            </Panel>
+          </>)}
+
           {/* HOW TO READ THIS TOOL */}
           {tab === 0 && (
             <Panel title="Conventions" step="—" sub="field colours and marks">
@@ -6300,8 +6650,9 @@ export default function MicrogridDesignTool() {
                   </p>
                   <div className="mt-2 grid grid-cols-2 gap-3 md:grid-cols-3">
                     <Field label="Charge steps in the search" source="library" unit="levels"
-                      explain="More steps is finer and slower. 41 is within a fraction of a percent on every case tested.">
-                      <Num value={res.optSocLevels} step={10} onChange={(v) => setRes((s2) => ({ ...s2, optSocLevels: v }))} />
+                      explain={`More steps is finer and slower. 41 is within a fraction of a percent on every case tested. Accepted range ${CONSTANTS.OPT_SOC_LEVELS_MIN}–${CONSTANTS.OPT_SOC_LEVELS_MAX}; values outside it are clamped.`}>
+                      <Num value={res.optSocLevels} step={10} min={CONSTANTS.OPT_SOC_LEVELS_MIN} max={CONSTANTS.OPT_SOC_LEVELS_MAX}
+                        onChange={(v) => setRes((s2) => ({ ...s2, optSocLevels: v }))} />
                     </Field>
                     <Field label="Battery wear cost" source="library" unit="€/MWh through"
                       explain="Charged on every kWh moved, so the optimiser will not cycle for a gain smaller than the damage.">
@@ -8113,6 +8464,7 @@ export default function MicrogridDesignTool() {
 
           {/* ================= CHECKS AND NOTES ================= */}
           {/* Step navigation */}
+          {!showInfo && (
           <div className={`flex items-center justify-between gap-3 rounded border p-2 ${T.panel}`}>
             <button disabled={tab === 0} onClick={() => setTab(tab - 1)}
               className={`rounded border px-3 py-1 text-xs ${tab === 0 ? T.chipIdle : T.btn}`}>
@@ -8124,6 +8476,7 @@ export default function MicrogridDesignTool() {
               {tab < TABS.length - 1 ? `Next: ${TABS[tab + 1].title}` : "End"} →
             </button>
           </div>
+          )}
 
           {/* Footer — authorship, build identity and where the data goes */}
           <footer className={`flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t pt-2 text-xs ${T.rule} ${T.faint}`}>
@@ -8135,6 +8488,12 @@ export default function MicrogridDesignTool() {
               Runs entirely in your browser. Project data, uploaded files and results stay on this computer
               and are never sent to a server.
             </span>
+            <button data-mgt-info="method" onClick={() => setShowInfo(true)}
+              title="Method note — the mathematics behind the dispatch optimisation"
+              className={`flex items-center gap-1.5 rounded border px-2 py-1 ${T.btn}`}>
+              <Icon name="info" className="h-3.5 w-3.5" />
+              <span>Method note — how the optimisation works</span>
+            </button>
           </footer>
 
 
